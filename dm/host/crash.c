@@ -261,6 +261,20 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
                     for (int i = -3; i <= 4; i++) fprintf(stderr, " %#llx", (unsigned long long)slot[i]);
                     fprintf(stderr, "]\n");
                 }
+                // np283：崩点 main+0xba5ac8 的 this 来自惰性单例取用（0x45f9bc 读 *(main+0x2273a18)），
+                // 而 main 里**写该槽的站点 0 处** ⇒ 槽由跨模块/全局初始化填，本次运行时为 0。
+                // np273 已定出 5 个同类单例的槽址；一次全打出来：
+                //   全 0      ⇒ 分配整段没跑（查哪次全局初始化该建它们）
+                //   部分有值  ⇒ 只差某一个，直接锁定是哪个类的单例
+                {
+                    static const unsigned long kSlots[] = { 0x2273a18, 0x2270c18, 0x2271308, 0x2272f48, 0x2272fe0, 0x2275f90 };
+                    fprintf(stderr, " [单例槽：");
+                    for (unsigned si = 0; si < sizeof kSlots / sizeof kSlots[0]; si++) {
+                        uint64_t v = *(volatile uint64_t *)(mm->base + kSlots[si]);
+                        fprintf(stderr, " %#lx=%#llx%s", kSlots[si], (unsigned long long)v, v ? "" : "(空)");
+                    }
+                    fprintf(stderr, " ]\n");
+                }
                 if (obj) {
                     uint64_t vt = *(volatile uint64_t *)(uintptr_t)obj;
                     if (vt) fprintf(stderr, " vt0=main+%#llx vt1=main+%#llx]\n",

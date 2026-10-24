@@ -688,14 +688,30 @@ static uint8_t *hostseg_take(void) {
     if (t == 1 || t % 256 == 0) LOG("[nvn] 游戏的命令内存池已空，宿主补段（累计 %u 次，帧 %llu）", t, (unsigned long long)f);
     return m;
 }
+// np283：命令缓冲区指针有效性探针。
+// 现场：客体反复传 x0=0x10 当命令缓冲区（真机三次都是这个值），随后崩在 main+0xba5ac8
+// （this=0，由 `add x0,x20,#0x10` 使 x0=0x10 反推 x20=0）。0x10 不是合法指针，
+// 说明某个图形对象的 +0x150 字段被写成了小整数。宿主这两个入口原来是空实现/不解引用，
+// 所以崩在后件，看不到是谁传的。这里在入口处把无效指针连调用点一起打出来。
+// （蹦床是尾调用 br x17，__builtin_return_address(0) 就是客体调用点。）
+static int cb_ptr_bad(const void *c) {
+    if (c && (uintptr_t)c > 0xffffUL) return 0;      // 看起来像指针就放过，其余一律报
+    static int n;
+    if (n++ < 4) LOG("【红】命令缓冲区指针无效 c=%p（调用点 %p）", c, __builtin_return_address(0));
+    return 1;
+}
 NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
     const pool_t *pl = (const pool_t *)p;
+    if (cb_ptr_bad(c)) return;
     if (!pl || n < 64) { if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.hostseg++; pthread_mutex_unlock(&g_cs_mu); } cmd_new_segment(CB(c), hostseg_take(), HOSTSEG_SZ); return; }
     if (!pl->mem) { LOG("【红】AddCommandMemory 池没有 CPU 存储"); return; }
     if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.grants++; g_cs.grant_bytes += n; if (!g_cs.grant_min || n < g_cs.grant_min) g_cs.grant_min = n; if (n > g_cs.grant_max) g_cs.grant_max = n; pthread_mutex_unlock(&g_cs_mu); }
     cmd_new_segment(CB(c), pl->mem + off, n);
 }
-NVN(nvnCommandBufferAddControlMemory, void, NVNcommandBuffer *c, void *m, size_t n) { (void)c; (void)m; (void)n; }
+NVN(nvnCommandBufferAddControlMemory, void, NVNcommandBuffer *c, void *m, size_t n) {
+    if (cb_ptr_bad(c)) return;
+    (void)c; (void)m; (void)n;
+}
 // 取一条记录的空间；不够则按 NVN 约定回调游戏补命令内存
 // Get space for one record; if not enough, call back into the game per the NVN convention to add command memory
 static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
