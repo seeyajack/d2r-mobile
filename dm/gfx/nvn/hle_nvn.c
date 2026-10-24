@@ -694,15 +694,30 @@ static uint8_t *hostseg_take(void) {
 // 说明某个图形对象的 +0x150 字段被写成了小整数。宿主这两个入口原来是空实现/不解引用，
 // 所以崩在后件，看不到是谁传的。这里在入口处把无效指针连调用点一起打出来。
 // （蹦床是尾调用 br x17，__builtin_return_address(0) 就是客体调用点。）
+// np287：连 memoryPool 一起查。真机实测 AddControlMemory 的 m 是宿主 .so 内的中文字符串地址
+// （0x5dc558a708 一类），而我们自己的函数从不返回 .so 内地址 ⇒ 说明客体从别处拿到了它。
+// 这里把"不在客体地址空间里的入参"连调用点一起打出来，一次定位是谁喂进来的。
+static int as_ok(const void *p) {
+    extern int dm_ptr_in_as(const void *);          // 客体 AS 判定（g_as..g_as+g_reserve）
+    return p == NULL || dm_ptr_in_as(p);
+}
 static int cb_ptr_bad(const void *c) {
     if (c && (uintptr_t)c > 0xffffUL) return 0;      // 看起来像指针就放过，其余一律报
     static int n;
     if (n++ < 4) LOG("【红】命令缓冲区指针无效 c=%p（调用点 %p）", c, __builtin_return_address(0));
     return 1;
 }
+static void cb_arg_check(const void *c, const void *m, size_t n) {
+    if (as_ok(c) && as_ok(m)) return;
+    static int w;
+    if (w++ < 4) LOG("【红】Add*Memory 入参越出客体 AS：c=%p(%s) m=%p(%s) n=%#zx（调用点 %p）",
+                     c, as_ok(c) ? "ok" : "**不在 AS**", m, as_ok(m) ? "ok" : "**不在 AS**", n,
+                     __builtin_return_address(0));
+}
 NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
     const pool_t *pl = (const pool_t *)p;
     if (cb_ptr_bad(c)) return;
+    cb_arg_check(c, p, n);
     if (!pl || n < 64) { if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.hostseg++; pthread_mutex_unlock(&g_cs_mu); } cmd_new_segment(CB(c), hostseg_take(), HOSTSEG_SZ); return; }
     if (!pl->mem) { LOG("【红】AddCommandMemory 池没有 CPU 存储"); return; }
     if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.grants++; g_cs.grant_bytes += n; if (!g_cs.grant_min || n < g_cs.grant_min) g_cs.grant_min = n; if (n > g_cs.grant_max) g_cs.grant_max = n; pthread_mutex_unlock(&g_cs_mu); }
@@ -710,6 +725,7 @@ NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemory
 }
 NVN(nvnCommandBufferAddControlMemory, void, NVNcommandBuffer *c, void *m, size_t n) {
     if (cb_ptr_bad(c)) return;
+    cb_arg_check(c, m, n);
     (void)c; (void)m; (void)n;
 }
 // 取一条记录的空间；不够则按 NVN 约定回调游戏补命令内存

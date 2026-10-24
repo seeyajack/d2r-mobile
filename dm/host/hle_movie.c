@@ -568,3 +568,29 @@ HLE_FORCE("_ZN5movie6Buffer18SetDataAndCapacityEPvm", "Movie: buffer storage", v
     b->data = data; b->cap = cap; b->off = b->size = 0;
 }
 #endif
+
+// ---------- np288：BotW 带的 movie 库与上游实现不是同一组重载 ----------
+// import_audit 报缺的 5 条强引用（其余 movie:: 都已实现）。共同点是：上游那版按 D2R 的
+// movie 库写的（Decoder 4 参、没有 Clear/Size/Offset/FindRect），BotW 这版签名不同。
+// 都在"空播协议"内，补齐而不是留给未实现桩（桩不碰 x0，会把入参当返回值递回去）。
+HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatE",
+          "过场空播：Decoder 两参重载（BotW 版）→ 转调已有四参版",
+          void, mv_Decoder2, void **self, int type, int fmt) {
+    mv_Decoder(self, type, fmt, 0, 0);       // mode / 优先级用缺省（四参版本身不读它们）
+}
+HLE_FORCE("_ZN5movie9MediaData5ClearEv", "过场空播：MediaData 清空（置空，等同析构后状态）",
+          void, mv_MediaDataClear, void **self) { if (self) *self = 0; }
+HLE_FORCE("_ZN5movie6Buffer4SizeEv", "过场空播：Buffer 大小（空播下恒 0）",
+          int, mv_BufferSize, const mvbuf *b) { return b ? b->size : 0; }
+HLE_FORCE("_ZN5movie6Buffer6OffsetEv", "过场空播：Buffer 偏移（空播下恒 0）",
+          int, mv_BufferOffset, const mvbuf *b) { return b ? b->off : 0; }
+HLE_FORCE("_ZNK5movie9MediaData8FindRectEPKcPiS3_S3_S3_",
+          "过场空播：找不到（返回 false，四个出参清零）",
+          int, mv_FindRect, const void *self, const char *key, int *x, int *y, int *w, int *h) {
+    (void)self; (void)key;
+    if (x) *x = 0;
+    if (y) *y = 0;
+    if (w) *w = 0;
+    if (h) *h = 0;
+    return 0;
+}

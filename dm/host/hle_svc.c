@@ -114,6 +114,13 @@ HLE_FORCE("_ZN2nn3mem17StandardAllocator8AllocateEmm", "照原版分配，只在
 // For memory accounting (memstat.m): the range of the whole guest address space block (base = NULL when not initialized)
 void svc_guest_range(uint8_t **base, size_t *size) { *base = g_as; *size = g_reserve; }
 
+// np287：指针是否落在客体地址空间里（排障用：宿主把自己 .so 内的地址递给了客体时，
+// 用它能一句话说清"这个入参不是客体内存"）。
+int dm_ptr_in_as(const void *p) {
+    uintptr_t a = (uintptr_t)p;
+    return g_as && a >= (uintptr_t)g_as && a < (uintptr_t)g_as + g_reserve;
+}
+
 
 enum { I_CoreMask=0, I_PriorityMask=1, I_AliasAddr=2, I_AliasSize=3, I_HeapAddr=4, I_HeapSize=5,
        I_TotalMem=6, I_UsedMem=7, I_DebuggerAttached=8, I_ResourceLimit=9, I_IdleTick=10, I_RandomEntropy=11,

@@ -277,6 +277,14 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
                 }
                 // np285：客体 AS 的已登记区间 —— 判定崩溃地址（如 0x340000ca）是未映射还是越界
                 { void svc_map_dump(void); svc_map_dump(); }
+                // np287：主堆读数 —— this=0 若是分配失败，这里能一句话说清（总量/余量/最大可分配块）
+                {
+                    void dm_guest_heap_last(unsigned long long *);
+                    unsigned long long h[3] = {0,0,0};
+                    dm_guest_heap_last(h);
+                    fprintf(stderr, " [主堆：总量 %llu MB、余量 %llu MB、最大可分配块 %llu KB]\n",
+                            h[0], h[1], h[2]);
+                }
                 if (obj) {
                     uint64_t vt = *(volatile uint64_t *)(uintptr_t)obj;
                     if (vt) fprintf(stderr, " vt0=main+%#llx vt1=main+%#llx]\n",
