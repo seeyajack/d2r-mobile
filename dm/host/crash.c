@@ -149,8 +149,16 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
             if (strcmp(m->name, "main") || m->size <= 0x22d7c40) continue;
             uint64_t a = *(volatile uint64_t *)(m->base + 0x227ff90);
             uint64_t b = *(volatile uint64_t *)(m->base + 0x22d7c30);
-            fprintf(stderr, " [glue main+0x227ff90=%#llx → main+0x22d7c30 内容=%#llx]",
+            // 宿主 .so 基址（取本文件里一个已知函数）—— 用它把 b 换算成 so+偏移，再 nm 查名字
+            fprintf(stderr, " [so=%p so+%#llx] [glue main+0x227ff90=%#llx → 0x22d7c30 内容=%#llx]",
+                    (void *)&dm_backtrace,
+                    (unsigned long long)(b - (uint64_t)(uintptr_t)&dm_backtrace),
                     (unsigned long long)a, (unsigned long long)b);
+            fprintf(stderr, " [周围: %#llx %#llx %#llx %#llx]",
+                    (unsigned long long)*(volatile uint64_t *)(m->base + 0x22d7c20),
+                    (unsigned long long)*(volatile uint64_t *)(m->base + 0x22d7c28),
+                    (unsigned long long)*(volatile uint64_t *)(m->base + 0x22d7c38),
+                    (unsigned long long)*(volatile uint64_t *)(m->base + 0x22d7c40));
             break;
         }
     }
@@ -179,6 +187,22 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
     off("addr", (uint64_t)si->si_addr); off("pc", UC_PC(uc)); off("lr", UC_LR(uc));
     fprintf(stderr, " sp=%#llx\n", UC_SP(uc));
     for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%#llx%s", i, UC_X(uc, i), i % 6 == 5 ? "\n" : " ");
+    // np260 临时探针（BotW 专属，定位完删）：崩点是 `ldr x0,[x19,#0x1b0]; ldr x8,[x0]`，
+    // x0 = 0。把 x19 这个对象的 vptr 和几个关键字段打出来 ——
+    // 有了 vptr 就能反查是哪个类、进而找到"本该构造它"的那个函数。
+    if (getenv("DM_DUMP_GLUE")) {
+        uint64_t o = UC_X(uc, 19);
+        if (o) {
+            volatile uint64_t *p = (volatile uint64_t *)(uintptr_t)o;
+            fprintf(stderr, " [obj x19=%#llx vptr=%#llx +0x150=%#llx +0x158=%#llx +0x1b0=%#llx"
+                            " +0x1d0=%#llx +0x208=%#x +0x198=%#llx +0xf8=%#llx]\n",
+                    (unsigned long long)o, (unsigned long long)p[0],
+                    (unsigned long long)p[0x150/8], (unsigned long long)p[0x158/8],
+                    (unsigned long long)p[0x1b0/8], (unsigned long long)p[0x1d0/8],
+                    (unsigned)*(volatile uint32_t *)(p + 0x208/8),
+                    (unsigned long long)p[0x198/8], (unsigned long long)p[0xf8/8]);
+        }
+    }
     fprintf(stderr, "\n");
     dm_backtrace(UC_FP(uc));
     if (g_dump_hook) g_dump_hook();
