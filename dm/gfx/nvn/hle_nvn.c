@@ -180,8 +180,14 @@ NVN(nvnDeviceGetInteger, void, const NVNdevice *d, NVNdeviceInfo what, int *out)
     // 0x5F 分离采样器绑定数、0x60/0x61 在 SMO 实测表里没有：0x5F 按采样器池上限给 4096 未核，0x60/0x61 报红给 0
     // 0x5F separate sampler binding count and 0x60/0x61 are not in the table measured on SMO: 0x5F is given 4096 per the sampler pool limit, unverified; 0x60/0x61 report a failure and return 0
     if (w >= sizeof g_devinfo / sizeof *g_devinfo) { LOG("【红】nvnDeviceGetInteger 未知项 %#x，给 0", w); *out = 0; return; }
+    // np274：把 out 指针一起打出来。动机（np273 离线定谳）：
+    // 崩点 x20 = 0x340000ca = (52<<32)|202，而 52 正是我们答的 API 主版本；
+    // 二进制里没有任何运算能拼出这个值 ⇒ 怀疑是"相邻两个 u32 被一条 ldr 当成 64 位指针读"。
+    // 若 out 指向某个"后来被当指针用"的结构体字段，一眼就能证实。
     *out = g_devinfo[w];
-    OLOG("DeviceGetInteger %#x -> %d", w, *out);
+    // np270：蹦床是尾调用（br x17），LR 仍是**客体调用点** —— 直接取回来打出来，
+    // 就知道是哪个站点在问、以及 0x340000ca 里那个 52/202 是谁喂的。
+    OLOG("DeviceGetInteger what=%#x out=%p -> %d  (调用点 %p)", w, (void *)out, *out, __builtin_return_address(0));
 }
 NVN(nvnDeviceGetImageHandle, NVNimageHandle, const NVNdevice *d, int id) { (void)d; return (NVNimageHandle)id; }
 // 分离贴图 / 采样器句柄：值 = 描述符号（采样器号放 20 位以上，与组合句柄的位布局一致）
