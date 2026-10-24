@@ -315,3 +315,70 @@ HLE_FORCE("_ZN2nn2os18AttachSharedMemoryEPNS0_16SharedMemoryTypeEmjb",
     g_shm[i].mem = g_shm[src].mem; g_shm[i].size = size ? size : g_shm[src].size; g_shm[i].handle = handle;
     return 0;
 }
+
+// ---------- np284：nn::os TLS 槽族（宿主原来一个都没实现）----------
+// Background: 0xa0e2f8 (the "get the default allocator" helper) reads a TlsSlot out of an object at
+// +0x88 and calls nn::os::GetTlsValue(slot) to fetch the calling thread's allocator. With
+// GetTlsValue unimplemented the stub returns the slot number itself (it does not touch x0), so the
+// helper ends up treating garbage as an allocator -- which is how the "this = 0" crash at
+// main+0xba5ac8 is reached (main+0x634fa0 &c: operator-new-ish helper -> forwarder -> base ctor).
+//
+// Semantics: a TlsSlot is a small guest-side index; values are per-thread. We back each slot with a
+// pthread key created on demand -- the host already has this machinery for its own keys, this is a
+// separate namespace so nothing collides.
+#define TLS_MAX 128
+static pthread_key_t g_tls_key[TLS_MAX];
+static uint8_t g_tls_ok[TLS_MAX];      // pthread key 已建
+static uint8_t g_tls_alloc[TLS_MAX];   // 已通过 AllocateTlsSlot 交给客体
+static pthread_mutex_t g_tls_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static pthread_key_t tls_key(unsigned slot) {
+    if (slot >= TLS_MAX) return (pthread_key_t)-1;
+    pthread_mutex_lock(&g_tls_mu);
+    if (!g_tls_ok[slot]) {
+        if (pthread_key_create(&g_tls_key[slot], NULL) == 0) g_tls_ok[slot] = 1;
+    }
+    pthread_key_t k = g_tls_key[slot];
+    pthread_mutex_unlock(&g_tls_mu);
+    return k;
+}
+HLE_FORCE("_ZN2nn2os11GetTlsValueENS0_7TlsSlotE",
+          "取线程本地值：按槽号取 pthread 特定值（未建过就是 0）",
+          uint64_t, h_os_GetTls, unsigned slot) {
+    pthread_key_t k = tls_key(slot);
+    if (k == (pthread_key_t)-1) return 0;
+    return (uint64_t)(uintptr_t)pthread_getspecific(k);
+}
+HLE_FORCE("_ZN2nn2os11SetTlsValueENS0_7TlsSlotEm",
+          "设线程本地值", void, h_os_SetTls, unsigned slot, uint64_t v) {
+    pthread_key_t k = tls_key(slot);
+    if (k != (pthread_key_t)-1) pthread_setspecific(k, (void *)(uintptr_t)v);
+}
+HLE_FORCE("_ZN2nn2os15AllocateTlsSlotEPNS0_7TlsSlotEPFvmE",
+          "分配一个 TLS 槽：惰性建 pthread key，槽号就是下标（客体当 TlsSlot 枚举用）",
+          Result, h_os_AllocTls, unsigned *out, void (*dtor)(unsigned long)) {
+    (void)dtor;                                    // 线程退出时的析构：客体很少用，先不接
+    if (!out) return 1;
+    for (unsigned s = 0; s < TLS_MAX; s++) {
+        if (tls_key(s) == (pthread_key_t)-1) continue;
+        pthread_mutex_lock(&g_tls_mu);
+        int free_slot = !g_tls_alloc[s];
+        if (free_slot) g_tls_alloc[s] = 1;
+        pthread_mutex_unlock(&g_tls_mu);
+        if (free_slot) { *out = s; return 0; }
+    }
+    return 1;
+}
+HLE_FORCE("_ZN2nn2os18SdkAllocateTlsSlotEPNS0_7TlsSlotEPFvmE",
+          "SDK 版分配 TLS 槽（与上面同一套）", Result, h_os_SdkAllocTls, unsigned *out, void (*dtor)(unsigned long)) {
+    return h_os_AllocTls(out, dtor);
+}
+HLE_FORCE("_ZN2nn2os11FreeTlsSlotENS0_7TlsSlotE", "释放 TLS 槽", void, h_os_FreeTls, unsigned slot) { (void)slot; }
+HLE_FORCE("_ZN2nn2os19GetUsedTlsSlotCountEv", "已用 TLS 槽数", int, h_os_TlsCount, void) {
+    int n = 0; for (unsigned s = 0; s < TLS_MAX; s++) if (g_tls_ok[s]) n++;
+    return n;
+}
+// libc++ 内部入口（std::__1::__nx_get_tls_value）：与 nn::os::GetTlsValue 同义
+HLE_FORCE("_ZNSt3__118__nx_get_tls_valueEN2nn2os7TlsSlotE",
+          "libc++ 的 TLS 取值入口（与 nn::os::GetTlsValue 同义）",
+          uint64_t, h_nx_GetTls, unsigned slot) { return h_os_GetTls(slot); }
