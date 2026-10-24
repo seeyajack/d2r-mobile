@@ -149,6 +149,17 @@ NVN(nvnDeviceGetProcAddress, PFNNVNGENERICFUNCPTRPROC, const NVNdevice *d, const
 
 // 设备属性：Tegra X1 实测值（nnheaders nvn_DeviceConstantsNX.h，在 SMO 上逐项调 nvnDeviceGetInteger 得到）
 // Device properties: values measured on Tegra X1 (nnheaders nvn_DeviceConstantsNX.h, obtained by calling nvnDeviceGetInteger item by item on SMO)
+// np275：NVN API 主版本 —— 唯一"因游戏而异"的数值，改成可配置（见下方 g_devinfo 注释）
+static int nvn_api_major(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = 52;                                   // 缺省：BotW 真机实测要求值
+        const char *e = getenv("DM_NVN_API_MAJOR");
+        if (e && *e) { int x = atoi(e); if (x > 0 && x < 256) v = x; }
+    }
+    return v;
+}
+
 static const int g_devinfo[] = {
     // np262 ★ 关键修正：API 主版本必须是 **52**，不是 53。
     // 依据（真机 + 离线反汇编）：BotW 的图形设备构造函数（main+0x9fc328）里
@@ -160,7 +171,12 @@ static const int g_devinfo[] = {
     //   9fc668  b.lt 0x9fcd84
     // 上游注释写"游戏读了不比较"——那只对暗黑2 成立；BotW 是真比较的。
     // 就因为这里是 53，构造函数提前返回，命令缓冲与图形子对象全是 NULL。
-    [0x00] = 52, [0x01] = 311,   // API 版本：游戏读了不比较（main 0x173cbd8），此值未核 | API version: the game reads it without comparing (main 0x173cbd8); this value is unverified
+    // np275 ★ 通用化：API 主版本改成**可配置**，不再硬编码。
+    // 这是本轮全部改动里**唯一一个游戏专属数值**（BotW 要 52、暗黑2 原来用 53），
+    // 硬编码在通用文件里就意味着"换游戏要改通用代码" —— 那正是要避免的。
+    // 现在：环境变量 DM_NVN_API_MAJOR 覆盖，缺省 52（BotW 实测值）。
+    // 换游戏只改配置、不改代码；profile 化时把这个值搬进 dm/games/<titleid>/ 即可。
+    [0x00] = 52, [0x01] = 311,   // 注：[0x00] 会被 nvnDeviceGetInteger 里的 nvn_api_major() 覆盖（可配置）
     [0x02] = 14, [0x03] = 65536, [0x04] = 256, [0x05] = 8, [0x06] = 16, [0x07] = 4, [0x08] = 16, [0x09] = 32,
     [0x0A] = 16, [0x0B] = 4, [0x0C] = 4, [0x0D] = 4, [0x0E] = 16, [0x0F] = 32, [0x10] = 32, [0x11] = 256, [0x12] = 256,
     [0x13] = 4, [0x14] = 8, [0x15] = 512, [0x16] = 256, [0x17] = 2, [0x18] = 256, [0x19] = 4096, [0x1A] = 131072,
@@ -184,6 +200,8 @@ NVN(nvnDeviceGetInteger, void, const NVNdevice *d, NVNdeviceInfo what, int *out)
     // 崩点 x20 = 0x340000ca = (52<<32)|202，而 52 正是我们答的 API 主版本；
     // 二进制里没有任何运算能拼出这个值 ⇒ 怀疑是"相邻两个 u32 被一条 ldr 当成 64 位指针读"。
     // 若 out 指向某个"后来被当指针用"的结构体字段，一眼就能证实。
+    // np275：what==0（API 主版本）走可配置路径 —— 这是唯一"因游戏而异"的数值
+    if (w == 0) { *out = nvn_api_major(); OLOG("DeviceGetInteger what=0 out=%p -> %d (可配置)", (void *)out, *out); return; }
     *out = g_devinfo[w];
     // np270：蹦床是尾调用（br x17），LR 仍是**客体调用点** —— 直接取回来打出来，
     // 就知道是哪个站点在问、以及 0x340000ca 里那个 52/202 是谁喂的。
