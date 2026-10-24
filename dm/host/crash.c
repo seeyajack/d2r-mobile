@@ -279,11 +279,16 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
                 { void svc_map_dump(void); svc_map_dump(); }
                 // np287：主堆读数 —— this=0 若是分配失败，这里能一句话说清（总量/余量/最大可分配块）
                 {
+                    // np289：先**主动去问**分配器（dm_guest_heap_stat 会调 sdk 的 GetFreeSize /
+                    // GetMaxAllocatable 并刷新 g_gheap_last），失败才退回上次读数。
+                    // np287 那版只读 g_gheap_last，而它从没被采集过，打出来全是 0，判不了内存。
+                    int dm_guest_heap_stat(unsigned long long *, unsigned long long *, unsigned long long *);
                     void dm_guest_heap_last(unsigned long long *);
                     unsigned long long h[3] = {0,0,0};
-                    dm_guest_heap_last(h);
-                    fprintf(stderr, " [主堆：总量 %llu MB、余量 %llu MB、最大可分配块 %llu KB]\n",
-                            h[0], h[1], h[2]);
+                    int fresh = dm_guest_heap_stat(&h[0], &h[1], &h[2]);
+                    if (!fresh) dm_guest_heap_last(h);
+                    fprintf(stderr, " [主堆%s：总量 %llu MB、余量 %llu MB、最大可分配块 %llu KB]\n",
+                            fresh ? "（实时）" : "（上次读数）", h[0], h[1], h[2]);
                 }
                 if (obj) {
                     uint64_t vt = *(volatile uint64_t *)(uintptr_t)obj;
