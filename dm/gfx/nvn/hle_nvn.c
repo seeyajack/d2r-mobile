@@ -95,7 +95,16 @@ static void nvn_init_slots(void) {
     for (unsigned k = 0; k < nim; k++) {
         unsigned i = 0;
         while (i < NVN_NFUNC && strcmp(nvn_names[i], im[k].name)) i++;
-        if (i == NVN_NFUNC) die("NVN 实现 %s 不在 main 的名字表里", im[k].name);
+        // np276 ★ 框架级修复：原来这里名字表没有就 **die()** —— 进程当场退出、且 die 走 stderr
+        // 在鸿蒙上什么痕迹都不留（真机现象：打开应用几秒内退出、一条 [dm] 日志都没有）。
+        // 触发条件很简单：往 hle_nvn.c 里加一个 NVN_NOPROTO(...) 实现，而那个名字不在 names.txt 里。
+        // 这只是"有个实现没挂上"，完全不该杀进程 ⇒ 改成报警并跳过。
+        if (i == NVN_NFUNC) {
+            static int warned;
+            if (warned++ < 8) LOG("【红】NVN 实现 %s 不在 names.txt 的名字表里 ⇒ 本次跳过（不会生效）；"
+                                  "要启用它请把名字加进 dm/gfx/nvn/names.txt 并用 gen_protos.py 重新生成", im[k].name);
+            continue;
+        }
         nvn_slot[i].fn = im[k].fn; hit++;
     }
     g_nsem = hit;

@@ -286,10 +286,27 @@ static Result err_res(const char *op, const char *path) {
 
 // ---------- 挂载 ----------
 // ---------- Mount ----------
-HLE_FORCE("_ZN2nn2fs22QueryMountRomCacheSizeEPm", "fsp-srv；rom 直读宿主目录，缓存只给最小值", Result, h_fs_QueryRomCache, size_t *out) { *out = 0x1000; return RES_OK; }
+HLE_FORCE("_ZN2nn2fs22QueryMountRomCacheSizeEPm", "fsp-srv；rom 直读宿主目录，缓存只给最小值", Result, h_fs_QueryRomCache, size_t *out) {
+    *out = 0x1000;
+    if (g_flag.imports) LOG("fs QueryMountRomCacheSize -> %#zx", *out);   // np278: confirm whether the guest takes the legacy rom entry
+    return RES_OK;
+}
 HLE_FORCE("_ZN2nn2fs8MountRomEPKcPvm", "fsp-srv；rom → 宿主 RomFS 目录", Result, h_fs_MountRom, const char *name, void *cache, size_t sz) {
     (void)cache; (void)sz; char b[1024];
-    Result r = mount(name, envdir("DM_ROMFS", "data/switch/3.3.94012/Update/RomFS", b, sizeof b), 1);
+    envdir("DM_ROMFS", "data/switch/3.3.94012/Update/RomFS", b, sizeof b);
+    // np278: MountRom succeeding does NOT mean the romfs content was delivered. mount() runs with txn=0,
+    // which never checks whether the directory exists, so a missing $DM_ROMFS still returns RES_OK and
+    // every subsequent guest OpenFile fails -- this plausibly explains the "virtual call on an empty object"
+    // crashes chased in earlier rounds (this=0x10 / x20=0x340000ca).
+    // Say it out loud here: is the directory there, and how many top-level entries does it hold.
+    if (access(b, F_OK) != 0)
+        LOG("[RED] fs MountRom(%s) -> %s, but **that directory does not exist**: romfs content was never delivered, every rom:/ open that follows will fail", name, b);
+    else if (g_flag.imports) {
+        int n = 0; DIR *d = opendir(b);
+        if (d) { struct dirent *e; while ((e = readdir(d))) if (e->d_name[0] != '.') n++; closedir(d); }
+        LOG("fs MountRom(%s) -> %s (exists, %d top-level entries)", name, b, n);
+    }
+    Result r = mount(name, b, 1);
     if (r == RES_OK && getenv("DM_ROMFS_OVERLAY")) {
         PATH_LOCK();
         for (int i = 0; i < g_nmnt; i++) if (!strcmp(g_mnt[i].name, name)) {
@@ -405,22 +422,20 @@ static int json_int_set(char *buf, size_t cap, const char *key, int val) {   // 
     if (e == v || atoi(v) == val) return 0; size_t nl = strlen(num); if (strlen(buf) + nl + 1 >= cap) return 0;
     memmove(v + nl, e, strlen(e) + 1); memcpy(v, num, nl); return 1; }
 static void settings_lang_apply(const char *save_dir) {
-    int dm_custom_lang_explicit(void); int sel = dm_custom_lang_explicit(); if (sel > 4) sel = -1;
-    int dm_custom_voice_explicit(void); int vsel = dm_custom_voice_explicit(); if (vsel > 1) vsel = -1;   // 单独配音（只有编进过场解码的包才有这一行，缺省包恒为 -1）
-    if (sel < 0 && vsel < 0) return;
+    int dm_custom_lang_explicit(void); int sel = dm_custom_lang_explicit(); if (sel < 0 || sel > 4) return;
     char path[1200]; snprintf(path, sizeof path, "%s/Settings/Settings.json", save_dir); static char buf[66000]; FILE *f = fopen(path, "rb"); if (!f) return;
     size_t n = fread(buf, 1, 65535, f); fclose(f); if (n == 65535) return; buf[n] = 0;
     const char *k = strstr(buf, "\"Language\""), *c = k ? strchr(k + 10, ':') : NULL; int cur = c ? atoi(c + 1) : 8;   // 没写 = 游戏缺省（宿主报简中） | Not written = game default (the host reports Simplified Chinese)
     int in = sel == 0 ? (cur == 8 || cur == 9) : sel == 1 ? cur == 0 : sel == 3 ? cur == 7 : sel == 4 ? cur == 5 : (cur == 2 || cur == 10);   // 文字语言已落在选中的那一项里 | The text language already falls within the selected option
-    int dm_sys_lang(void); int want = sel < 0 || in ? cur : sel == 0 ? 8 : sel == 1 ? 0 : sel == 3 ? 7 : sel == 4 ? 5 : (dm_sys_lang() == 10 ? 10 : 2);
+    int dm_sys_lang(void); int want = in ? cur : sel == 0 ? 8 : sel == 1 ? 0 : sel == 3 ? 7 : sel == 4 ? 5 : (dm_sys_lang() == 10 ? 10 : 2);
     const char *vk = strstr(buf, "\"VoiceLanguage\""), *vc = vk ? strchr(vk + 15, ':') : NULL; int vcur = vc ? atoi(vc + 1) : -1;
-    int voice = vsel == 0 ? 8 : vsel == 1 ? 0 : in && sel == 0 && vcur > 0 ? vcur : voice_for(want);   // 明确选了配音就用它；没选时维持原来的跟随规则
+    int voice = in && sel == 0 && vcur > 0 ? vcur : voice_for(want);   // 文字已在中文项里：语音只要不是英文就不动（玩家在原版里选的繁中语音照旧）；其余按 voice_for | Text is already within the Chinese option: leave voice alone as long as it is not English (Traditional Chinese voice chosen by the player in the original game stays); otherwise follow voice_for
     int ch = json_int_set(buf, sizeof buf, "\"Language\"", want) | json_int_set(buf, sizeof buf, "\"VoiceLanguage\"", voice); if (!ch) return;
     char tmp[1300]; snprintf(tmp, sizeof tmp, "%s.lang", path); f = fopen(tmp, "wb"); size_t m = strlen(buf);
     if (!f || fwrite(buf, 1, m, f) != m) { if (f) fclose(f); LOG("【红】语言开关：写 %s 失败", tmp); return; }
     fclose(f); if (rename(tmp, path)) { LOG("【红】语言开关：改名到 %s 失败", path); return; }
     static const char *const nm[5] = { "中文", "English", "Español", "Русский", "한국어" };
-    LOG("语言开关：设置文件的 Language / VoiceLanguage 改成 %d / %d（%s；单独配音 %s；原文字语言 %d）", want, voice, sel < 0 ? "不改文字" : nm[sel], vsel < 0 ? "跟随语言" : vsel ? "English" : "中文", cur);
+    LOG("语言开关：设置文件的 Language / VoiceLanguage 改成 %d / %d（%s；原文字语言 %d）", want, voice, nm[sel], cur);
 }
 // 事务式存档当前的工作目录（游戏读写的那份；宿主自己的旁路文件写在这里才会随 Commit 进已提交版）。没挂载存档时返回 NULL
 // The current working directory of the transactional save (the copy the game reads and writes; the host's own side files must be written here to enter the committed version with Commit). Returns NULL when no save is mounted
