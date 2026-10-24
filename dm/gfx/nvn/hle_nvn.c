@@ -99,12 +99,24 @@ static void nvn_init_slots(void) {
     g_nsem = hit;
 }
 
+// np261：未知 NVN 名字**不再返回 NULL**，给一个通用空实现。
+// 为什么改：真机长期出现 `【红】NVN 取址未知名字：nvnDeviceWaitForError`。返回 NULL 会传染 ——
+// 游戏只要有一次"取不到就跳过创建子对象"，后面就是满盘空指针（我们这几轮追的
+// [x19+0x150]/[x19+0x1b0] 全是空，很可能就是这么来的），而崩溃点离真正原因已经很远。
+// 给一个"什么也不做、返回 0"的通用蹦床，让取址这一步不再失败，问题会显露在更靠近源头的地方。
+static uint64_t nvn_generic_stub(uint64_t a, uint64_t b, uint64_t c, uint64_t d,
+                                 uint64_t e, uint64_t f, uint64_t g, uint64_t h) {
+    (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)h;
+    static int n;
+    if (n++ < 24) LOG("【黄】NVN 未知接口被调用（通用空实现，返回 0）");
+    return 0;
+}
 static void *nvn_lookup(const char *name) {
     nvn_init_slots();
     for (unsigned i = 0; i < NVN_NFUNC; i++)
         if (!strcmp(nvn_names[i], name)) return nvn_thunk[i];
-    LOG("【红】NVN 取址未知名字：%s", name ? name : "(null)");
-    return NULL;
+    LOG("【红】NVN 取址未知名字：%s → 给通用空实现（不再返 NULL）", name ? name : "(null)");
+    return (void *)nvn_generic_stub;
 }
 
 // nvnBootstrapLoader 由 main 导入（sdk 定义）；强制接管后 sdk 的 NVN 驱动不再被引用
