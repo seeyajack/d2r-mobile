@@ -81,7 +81,9 @@ typedef struct { const char *name; void *fn; } nvn_impl;
 static int g_log;
 uint64_t nvn_new_serial(void) { static _Atomic uint64_t n; return ++n; }
 static unsigned g_nsem;                          // 语义实现个数（nvn_init_slots 填） | Number of semantic implementations (filled by nvn_init_slots)
-#define OLOG(...) do { if (g_log) LOG("[nvn] " __VA_ARGS__); } while (0)
+// np269：OLOG 原来只认 DM_NVN_LOG，而真机上 g_log 常为 false ⇒ DeviceGetInteger 这类
+// 关键调用序列被吞掉，白白浪费好几轮。改成 DM_NVN_LOG **或** DM_IMPORTS 都输出。
+#define OLOG(...) do { if (g_log || g_flag.imports) LOG("[nvn] " __VA_ARGS__); } while (0)
 
 static void nvn_init_slots(void) {
     static int done; if (done) return; done = 1;
