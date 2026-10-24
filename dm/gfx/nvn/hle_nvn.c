@@ -601,12 +601,21 @@ NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *in
 // 只加这一个：另两个（IsTextureReady/ReleaseTexture）一加进来就**启动即崩**（真机踩过，
 // 现象是打开应用几秒内退出、且一条 [dm] 日志都没有），怀疑是 NVN_NOPROTO 走 swnnv 段注册时
 // 与构建期生成的 names/thunks 表不一致。等定位到那个问题再补。
-static uint32_t g_next_texid = 1;
-NVN(nvnQueueAcquireTexture, uint32_t, NVNqueue *q, const NVNtexture *t, const NVNsync *sy) {
-    (void)q; (void)t; (void)sy;
-    uint32_t id = g_next_texid++;
-    if (g_flag.imports) LOG("nvnQueueAcquireTexture -> id=%u", id);
-    return id;
+// np281 ★ 按 NVN 真形重写（np263 那版参数形猜错了）。
+// 真形（nvn.h 原文）：
+//   typedef NVNqueueAcquireTextureResult (*PFNNVNQUEUEACQUIRETEXTUREPROC)(NVNqueue*, NVNwindow*, int*);
+//   ⇒ nvnQueueAcquireTexture(queue, window, int *textureId)
+// np263 猜成 (queue, texture, sync) 并直接返回递增 id 当 textureId —— 两个错：
+//   ① textureId 是**出参**，我们没写 *tid，客体读到的是未初始化栈内存；
+//   ② 返回值只是状态码（NVN_QUEUE_ACQUIRE_TEXTURE_RESULT_SUCCESS = 0），我们却把 id 当返回值。
+// 后果：客体拿到的 textureId 是垃圾，一路当对象指针用 ⇒ main+0xba5ac8 写 vptr 时 this 非法
+//（真机 addr 在 0 / 0x340000ca 之间跳，正是未初始化槽的特征）。
+static int g_next_texid = 1;
+NVN(nvnQueueAcquireTexture, NVNqueueAcquireTextureResult, NVNqueue *q, NVNwindow *w, int *tid) {
+    (void)q; (void)w;
+    if (tid) *tid = g_next_texid++;
+    if (g_flag.imports) LOG("nvnQueueAcquireTexture(window=%p) → textureId=%d", (void *)w, tid ? *tid : -1);
+    return NVN_QUEUE_ACQUIRE_TEXTURE_RESULT_SUCCESS;
 }
 NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; }
 NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; x_drain(); mtl_finish(); }

@@ -293,20 +293,31 @@ HLE_FORCE("_ZN2nn2fs22QueryMountRomCacheSizeEPm", "fsp-srv；rom 直读宿主目
 }
 HLE_FORCE("_ZN2nn2fs8MountRomEPKcPvm", "fsp-srv；rom → 宿主 RomFS 目录", Result, h_fs_MountRom, const char *name, void *cache, size_t sz) {
     (void)cache; (void)sz; char b[1024];
-    envdir("DM_ROMFS", "data/switch/3.3.94012/Update/RomFS", b, sizeof b);
+    // np280 ★ 真 bug：原来这里写成 `envdir("DM_ROMFS", ..., b, sizeof b);` —— **返回值被丢掉**。
+    // envdir 在"环境变量存在"时返回 getenv 的指针、**不写 buf**（缺省分支才 snprintf 进 buf），
+    // 于是 b 是未初始化的栈内存 ⇒ DM_ROMFS 没设时 b 反而是对的（走 snprintf 分支），
+    // DM_ROMFS 一旦设对，b 就变成栈垃圾（真机上就是空串）⇒ 挂载到空路径。
+    // 拿返回值，别拿 buf。
+    const char *rf = envdir("DM_ROMFS", "data/switch/3.3.94012/Update/RomFS", b, sizeof b);
+    // np280: print the raw getenv value in quotes -- an empty string and NULL look identical in the
+    // log otherwise, and that distinction is exactly what bit us here.
+    {
+        const char *e = getenv("DM_ROMFS");
+        LOG("fs MountRom(%s): DM_ROMFS=%p [%s] => target %s", name, (void *)e, e ? e : "(null)", rf);
+    }
     // np278: MountRom succeeding does NOT mean the romfs content was delivered. mount() runs with txn=0,
     // which never checks whether the directory exists, so a missing $DM_ROMFS still returns RES_OK and
     // every subsequent guest OpenFile fails -- this plausibly explains the "virtual call on an empty object"
     // crashes chased in earlier rounds (this=0x10 / x20=0x340000ca).
     // Say it out loud here: is the directory there, and how many top-level entries does it hold.
-    if (access(b, F_OK) != 0)
-        LOG("[RED] fs MountRom(%s) -> %s, but **that directory does not exist**: romfs content was never delivered, every rom:/ open that follows will fail", name, b);
+    if (access(rf, F_OK) != 0)
+        LOG("[RED] fs MountRom(%s) -> %s, but **that directory does not exist**: romfs content was never delivered, every rom:/ open that follows will fail", name, rf);
     else if (g_flag.imports) {
-        int n = 0; DIR *d = opendir(b);
+        int n = 0; DIR *d = opendir(rf);
         if (d) { struct dirent *e; while ((e = readdir(d))) if (e->d_name[0] != '.') n++; closedir(d); }
-        LOG("fs MountRom(%s) -> %s (exists, %d top-level entries)", name, b, n);
+        LOG("fs MountRom(%s) -> %s (exists, %d top-level entries)", name, rf, n);
     }
-    Result r = mount(name, b, 1);
+    Result r = mount(name, rf, 1);
     if (r == RES_OK && getenv("DM_ROMFS_OVERLAY")) {
         PATH_LOCK();
         for (int i = 0; i < g_nmnt; i++) if (!strcmp(g_mnt[i].name, name)) {

@@ -243,3 +243,75 @@ HLE_FORCE("_ZN2nn2sm16GetServiceHandleEPNS_3svc6HandleEPKcm",
         (int)(len > 63 ? 63 : (int)len), name ? name : "?", h);
     return 0;
 }
+
+// ---------- np282：nn::os 共享内存族（宿主原来一个都没实现）----------
+// Background: these went to the unimplemented stub, which leaves x0 untouched. For
+// MapSharedMemory(&type, perm) that means the caller's own &type comes back as the "mapped
+// address", so the guest memsets its own 48-byte descriptor for 8192 bytes and runs off the end
+// (real device: pc=sdk+0x32790c inside memset, addr=0x5e1b401fff, reached from subsdk0+0x320c
+// right after CreateSharedMemory(type, 0x2000, perm, perm)).
+//
+// nn::os::SharedMemoryType is an opaque guest structure whose layout we do not know, so we never
+// write into it: the guest pointer is used purely as a key into a host-side table (same
+// side-table approach as the NVNbuffer family). That keeps us from guessing field offsets.
+#define SHM_MAX 64
+static struct { const void *key; void *mem; size_t size; uint32_t handle; } g_shm[SHM_MAX];
+static int g_nshm;
+
+static int shm_find(const void *key) {
+    for (int i = 0; i < g_nshm; i++) if (g_shm[i].key == key) return i;
+    return -1;
+}
+static void *shm_alloc(size_t n) {          // 客体堆：宿主 malloc 就在客体地址空间内 | Guest heap: host malloc already lives in the guest address space
+    return malloc(n ? n : 1);
+}
+HLE_FORCE("_ZN2nn2os18CreateSharedMemoryEPNS0_16SharedMemoryTypeEmNS0_16MemoryPermissionES3_",
+          "建一块共享内存：宿主 malloc 一块，按 type 指针记进边表（不写客体结构）",
+          Result, h_os_CreateShm, void *type, size_t size, uint32_t perm, uint32_t perm2) {
+    (void)perm; (void)perm2;
+    if (!type || size > (256u << 20)) return 1;                  // 非 0 即失败，客体按 Result 判 | Non-zero means failure; the guest checks the Result
+    int i = shm_find(type);
+    if (i < 0 && g_nshm < SHM_MAX) { i = g_nshm++; g_shm[i].key = type; }
+    if (i < 0) return 1;
+    free(g_shm[i].mem);
+    g_shm[i].mem = shm_alloc(size); g_shm[i].size = size; g_shm[i].handle = 0x6000 + (uint32_t)i;
+    if (!g_shm[i].mem) { g_shm[i].key = NULL; g_nshm--; return 1; }
+    if (g_flag.imports) LOG("os CreateSharedMemory(%p, %#zx) -> %p (handle %#x)", type, size, g_shm[i].mem, g_shm[i].handle);
+    return 0;
+}
+HLE_FORCE("_ZN2nn2os15MapSharedMemoryEPNS0_16SharedMemoryTypeENS0_16MemoryPermissionE",
+          "映射共享内存：返回边表里记的地址（**不能原样返回 &type**，见上方说明）",
+          void *, h_os_MapShm, const void *type, uint32_t perm) {
+    (void)perm;
+    int i = shm_find(type);
+    void *p = (i >= 0) ? g_shm[i].mem : NULL;
+    if (g_flag.imports) LOG("os MapSharedMemory(%p) -> %p%s", type, p, i >= 0 ? "" : "（边表里没有，返回 NULL）");
+    return p;
+}
+HLE_FORCE("_ZN2nn2os22GetSharedMemoryAddressEPKNS0_16SharedMemoryTypeE",
+          "取共享内存地址（与 MapSharedMemory 同一份）", void *, h_os_ShmAddr, const void *type) {
+    int i = shm_find(type); return (i >= 0) ? g_shm[i].mem : NULL;
+}
+HLE_FORCE("_ZN2nn2os21GetSharedMemoryHandleEPKNS0_16SharedMemoryTypeE",
+          "取共享内存句柄：给一个稳定假句柄（对端 Attach 用）", uint32_t, h_os_ShmHandle, const void *type) {
+    int i = shm_find(type); return (i >= 0) ? g_shm[i].handle : 0;
+}
+HLE_FORCE("_ZN2nn2os17UnmapSharedMemoryEPNS0_16SharedMemoryTypeE",
+          "解除映射：内存仍归 Create 的所有者，这里只记账", void, h_os_UnmapShm, const void *type) { (void)type; }
+HLE_FORCE("_ZN2nn2os19DestroySharedMemoryEPNS0_16SharedMemoryTypeE",
+          "销毁共享内存：释放并移出边表", void, h_os_DestroyShm, const void *type) {
+    int i = shm_find(type);
+    if (i >= 0) { free(g_shm[i].mem); g_shm[i] = g_shm[--g_nshm]; }
+}
+HLE_FORCE("_ZN2nn2os18AttachSharedMemoryEPNS0_16SharedMemoryTypeEmjb",
+          "对端附加：按 handle 找到已建的那块，登记到本端 type 上",
+          Result, h_os_AttachShm, void *type, size_t size, uint32_t handle, uint8_t) {
+    int src = -1;
+    for (int i = 0; i < g_nshm; i++) if (g_shm[i].handle == handle) { src = i; break; }
+    if (src < 0 || !type) return 1;
+    int i = shm_find(type);
+    if (i < 0 && g_nshm < SHM_MAX) { i = g_nshm++; g_shm[i].key = type; }
+    if (i < 0) return 1;
+    g_shm[i].mem = g_shm[src].mem; g_shm[i].size = size ? size : g_shm[src].size; g_shm[i].handle = handle;
+    return 0;
+}

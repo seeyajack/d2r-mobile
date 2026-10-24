@@ -210,14 +210,20 @@ __attribute__((weak)) int dm_derived_reload(void);
 // start(files, ext, src, lang) → number of linked resource files (>0) or a negative error code (as Android nativeStart)
 static napi_value js_start(napi_env env, napi_callback_info info) {
     ARGS(4); static int started; if (started) return ret_int(env, 0);
-    char lg[64] = {0};
-    get_str(env, argv[0], g_files, sizeof g_files); get_str(env, argv[1], g_ext, sizeof g_ext); get_str(env, argv[2], g_src, sizeof g_src); get_str(env, argv[3], lg, sizeof lg);
+    // np280：第四个参数按调用方约定就是「空格分隔 KEY=VALUE」（Index.ets 用它传
+    // DM_IMPORTS / DM_DUMP_GLUE / DM_NVN_LOG / DM_ROMFS / DM_TEMP）。
+    // 原来只读进 lg[64] 且仅用于 DM_LANG ⇒ **这些开关一个都没生效**：
+    // 真机后果是 DM_ROMFS 传不进去，宿主退回缺省路径，romfs 内容递不上，
+    // 客体每次 rom:/ 打开都失败（真机日志：`MountRom(content) -> ` 路径为空）。
+    // 这里真正解析它。整串不含 '=' 时按老用法当系统语言（兼容旧调用方）。
+    char envs[2048] = {0};
+    get_str(env, argv[0], g_files, sizeof g_files); get_str(env, argv[1], g_ext, sizeof g_ext); get_str(env, argv[2], g_src, sizeof g_src); get_str(env, argv[3], envs, sizeof envs);
     // 挂存档与选择覆盖层之前提供设置目录，使语言选择在本次启动生效。
     // Make saved preferences available before save mount and overlay selection.
     dm_custom_init(g_files);
     snprintf(g_runtime, sizeof g_runtime, "%s/dm", g_files); mkdirs(g_runtime);
     log_init();
-    LOG("boot: 鸿蒙 内部目录 %s，资源 %s，系统语言 %s", g_files, g_src, lg);
+    LOG("boot: 鸿蒙 内部目录 %s，资源 %s，系统语言 %s", g_files, g_src, envs);
     {   // 诊断：各核最高主频（找大核，供翻译线程绑核用）| Diagnostics: max frequency of each core (to find the big cores for pinning the translation thread)
         char line[512] = {0}; int at = 0;
         for (int c = 0; c < 16; c++) { char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c); FILE *f = fopen(p, "r"); if (!f) continue;
@@ -254,6 +260,23 @@ static napi_value js_start(napi_env env, napi_callback_info info) {
     }
     if (n <= 0) n = link_romfs(romfs);
     LOG("boot: 资源链接 %d 个文件", n);
+    // np280：先解析调用方传来的 KEY=VALUE（覆盖式），再设下面那些"只在环境里没有时"的缺省值 ——
+    // 这样 DM_ROMFS / DM_TEMP 这类由 ArkTS 算出来的路径能真正到达宿主。
+    // 整串不含 '=' 时按老用法当系统语言（兼容早期只传 lang 的调用方）。
+    {
+        int has_kv = 0;
+        for (const char *p = envs; *p; p++) if (*p == '=') { has_kv = 1; break; }
+        if (has_kv) {
+            char work[2048]; snprintf(work, sizeof work, "%s", envs);
+            for (char *tok = strtok(work, " \t"); tok; tok = strtok(NULL, " \t")) {
+                char *eq = strchr(tok, '=');
+                if (!eq || eq == tok) continue;
+                *eq = 0;
+                setenv(tok, eq + 1, 1);
+                LOG("boot: arg env %s=%s", tok, eq + 1);
+            }
+        } else if (!getenv("DM_LANG") && *envs) setenv("DM_LANG", envs, 0);
+    }
     setenv("DM_ROMFS", romfs, 0); setenv("DM_SAVE", save, 0); setenv("DM_TEMP", temp, 0);
     // 调试：dm/env 每行 KEY=VALUE，先于下面的缺省值生效（不重编就能开 DM_SLOWFRAME 之类的测试开关）| Debug: dm/env, one KEY=VALUE per line, applied before the defaults below (test switches such as DM_SLOWFRAME without a rebuild)
     { char ef[1200], ln[512]; snprintf(ef, sizeof ef, "%s/env", g_runtime); FILE *f = fopen(ef, "rb");
@@ -275,7 +298,7 @@ static napi_value js_start(napi_env env, napi_callback_info info) {
     // 完成通知（xbg_game.cpp completion_wait）与不持引擎锁等栅栏（gfx-legacy-waitall=0）在鸿蒙上是引擎缺省 | completion notification (xbg_game.cpp completion_wait)
     // and fence waits without the engine lock (gfx-legacy-waitall = 0) are the engine's defaults on HarmonyOS
     { char mk[1200]; snprintf(mk, sizeof mk, "%s/nvn-async", g_runtime); FILE *f = fopen(mk, "rb"); if (f) { setenv("DM_NVN_SYNC", fgetc(f) == '0' ? "1" : "0", 1); fclose(f); } }
-    if (!getenv("DM_LANG") && *lg) setenv("DM_LANG", lg, 0);
+    // np280：DM_LANG 已在上面的 arg env 解析里一并处理（envs 不含 = 时当 lang）
     if (chdir(g_files)) LOG("【红】chdir %s 失败 errno %d", g_files, errno);
     if (n <= 0) return ret_int(env, -2);
     char required[1300];
