@@ -212,6 +212,22 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
                 fprintf(stderr, " [query-obj=%#llx (main+%#llx) vptr=%#llx", (unsigned long long)obj,
                         (unsigned long long)(obj - (uint64_t)(uintptr_t)mm->base),
                         obj ? (unsigned long long)*(volatile uint64_t *)(uintptr_t)obj : 0ULL);
+                // np272：帧链在这里断了（x29 链到 0xffffffff），改**扫栈内存**找返回地址。
+                // 把 sp 起 128 个 qword 里落在 main 代码段范围内的值打出来 —— 那就是真实调用链。
+                {
+                    uint64_t spv = UC_SP(uc);
+                    volatile uint64_t *st = (volatile uint64_t *)(uintptr_t)spv;
+                    int shown = 0;
+                    fprintf(stderr, " [栈扫描 sp=%#llx：", (unsigned long long)spv);
+                    for (int i = 0; i < 128 && shown < 12; i++) {
+                        uint64_t v = st[i];
+                        if (v >= (uint64_t)(uintptr_t)mm->base && v < (uint64_t)(uintptr_t)mm->base + mm->size) {
+                            uint64_t off = v - (uint64_t)(uintptr_t)mm->base;
+                            if (off < mm->size) { fprintf(stderr, " main+%#llx", (unsigned long long)off); shown++; }
+                        }
+                    }
+                    fprintf(stderr, " ]\n");
+                }
                 // np271：崩点 main+0x9a4dc8 依赖的那张表。
                 //   *(main+0x22655a0) → holder（.bss）
                 //   *holder           → 表对象（计数在 +0x28、表体在 +0x30）

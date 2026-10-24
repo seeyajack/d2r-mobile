@@ -88,7 +88,10 @@ static void guest_main(void) {
     // Copy Start step by step: _init_libc1 = __nnmusl_init_locks (initializes the stdio etc. locks as recursive locks; skipping it self-deadlocks on nested locking in putc) + __init_ssp.
     // The three callbacks passed in by rtld: A only sets an rtld flag (skipped), B = each module's DT_INIT (before nnMain), C = destructors (not done)
     ((fn0)req("_init_libc0"))();
-    install_botw_fakelock();   // np251：补游戏没建的锁单例（见函数注释）
+    // np272：**临时撤掉** np251 的假锁对象。理由：栈扫描发现 main+0x22d9198 出现在调用链里，
+    // 而 F_wait 真正读的槽是 main+0x227ff98（RELATIVE → base+0x22d7c30），不是这个地址 ——
+    // 当年很可能写错了槽，把宿主指针塞进了游戏自己的数据。先撤掉验证是不是它引起的崩。
+    // install_botw_fakelock();
     LOG(">>> nnosInitialize"); ((fn2)req("nnosInitialize"))(hmain, 0);
     ((fn0)req("_init_libc1"))();
     LOG(">>> nninitInitializeSdkModule"); ((fn0)req("nninitInitializeSdkModule"))();
