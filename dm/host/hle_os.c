@@ -327,6 +327,7 @@ HLE_FORCE("_ZN2nn2os18AttachSharedMemoryEPNS0_16SharedMemoryTypeEmjb",
 // pthread key created on demand -- the host already has this machinery for its own keys, this is a
 // separate namespace so nothing collides.
 #define TLS_MAX 128
+static __thread uint64_t g_tlsval[TLS_MAX];   // np286：线程局部值（每线程一份）
 static pthread_key_t g_tls_key[TLS_MAX];
 static uint8_t g_tls_ok[TLS_MAX];      // pthread key 已建
 static uint8_t g_tls_alloc[TLS_MAX];   // 已通过 AllocateTlsSlot 交给客体
@@ -345,17 +346,18 @@ static pthread_key_t tls_key(unsigned slot) {
 HLE_FORCE("_ZN2nn2os11GetTlsValueENS0_7TlsSlotE",
           "取线程本地值：按槽号取 pthread 特定值（未建过就是 0）",
           uint64_t, h_os_GetTls, unsigned slot) {
-    pthread_key_t k = tls_key(slot);
-    if (k == (pthread_key_t)-1) return 0;
-    uint64_t v = (uint64_t)(uintptr_t)pthread_getspecific(k);
+    // np286：用线程局部独立数组。
+    // 曾经改成读客体 tsd，但真机显示 tsd[36] 被系统别的 key 占着（Set 进去的指针读出来变成 0x1），
+    // 于是 0xa0e360 `ldr x8,[x0,#0xb0]` 拿到 0x1+0xb0 = 0xb1 野指针崩掉。
+    // 客体这条路径走的是我们的 HLE（真机日志为证），用独立数组读写必然一致，也不踩任何系统键。
+    uint64_t v = (slot < TLS_MAX) ? g_tlsval[slot] : 0;
     // np285：这条链是 this=0 的源头（0xa0e2f8 用它取默认分配器），必须看清谁在设/取
     if (g_flag.imports) { static int n; if (n++ < 24) LOG("os GetTlsValue(slot=%u) -> %#llx", slot, (unsigned long long)v); }
     return v;
 }
 HLE_FORCE("_ZN2nn2os11SetTlsValueENS0_7TlsSlotEm",
           "设线程本地值", void, h_os_SetTls, unsigned slot, uint64_t v) {
-    pthread_key_t k = tls_key(slot);
-    if (k != (pthread_key_t)-1) pthread_setspecific(k, (void *)(uintptr_t)v);
+    if (slot < TLS_MAX) g_tlsval[slot] = v;
     if (g_flag.imports) { static int n; if (n++ < 24) LOG("os SetTlsValue(slot=%u, %#llx)", slot, (unsigned long long)v); }
 }
 HLE_FORCE("_ZN2nn2os15AllocateTlsSlotEPNS0_7TlsSlotEPFvmE",

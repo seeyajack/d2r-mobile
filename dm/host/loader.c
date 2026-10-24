@@ -99,6 +99,20 @@ static uint8_t *tsd_base(void) { uint64_t b; __asm__ volatile("mrs %0, tpidrro_e
 static uint64_t slot_off(pthread_key_t k) { return (uint64_t)k * 8; }
 static void tsd_probe(void) {}
 #endif
+
+// np286：把 musl/bionic 的线程特定数据区开放给 nn::os TLS 族用。
+// 客体线程就是宿主 pthread，客体代码里的 TLS 访问已被 patch_nso.py emit_tp 改写成读同一片 tsd，
+// 所以 nn::os::GetTlsValue/SetTlsValue 也必须落在这里 —— 另起一套 pthread key 的话两边看到
+// 的不是同一份存储（np285 真机实测：客体只调 AllocateTlsSlot，从不调我们的 Get/SetTlsValue）。
+// 这里只做"按键号读/写 tsd 槽"，与客体 emit_tp 的算法保持一致。
+// np286：nn::os 的 TlsSlot 与宿主自己的 pthread key **共用同一片 tsd**，而客体从 0 开始编号
+// （真机实测 slot=0/4），正好盖住宿主的 K18/KTLS/… 那几个键 —— 上一轮就这么把宿主内部踩坏，
+// 崩在 libc 里（addr=0x351）。musl 的 tsd 有 128 槽、宿主只用前 8 个，
+// 所以给 nn::os 开一段独立区间：下标 DM_TLS_BASE 起，永不与宿主 key 相撞。
+#define DM_TLS_BASE 32
+void *dm_tsd_base(void) { return tsd_base(); }
+uint64_t dm_tsd_read(unsigned key) { return *(volatile uint64_t *)(tsd_base() + slot_off((pthread_key_t)(DM_TLS_BASE + key))); }
+void dm_tsd_write(unsigned key, uint64_t v) { *(volatile uint64_t *)(tsd_base() + slot_off((pthread_key_t)(DM_TLS_BASE + key))) = v; }
 // K 槽校验：经键页取到的槽与 pthread_setspecific 写的是同一格
 // K slot check: the slot reached through the key page is the same cell that pthread_setspecific writes
 static void tsd_check(void) {
