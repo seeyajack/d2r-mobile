@@ -234,18 +234,72 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         regs[0] = 0; regs[1] = 0; return 0;
     }
     case 0x21: {   // SendSyncRequest(handle)：宿主没有 IPC 服务端 ⇒ 回一个"成功、无出参"的 CMIF 响应
-        // 真机现场：`SVC 0x21 x0=0x5000 x1=0x5efa51b000`（0x5000 = 我们在 sm::GetServiceHandle 发的假句柄）。
-        // 原先只在 default 里"占位返回成功"，但没写出站头 ⇒ 客体的 hipc 解析响应失败 ⇒
-        // 断言 `QueryPointerBufferSize(&pointerBufferSize, m_ClientHandle)`（sf_HipcClientMessage.h）。
-        // 这里按 CMIF 的出站头写：{ u32 magic='SFCO', u32 result=0 }，出参区清零。
-        // ⚠ 只在缓冲区**确实是 CMIF 请求**（首 4 字节 'SFCI'）时才写，避免误伤别的内存。
+        // 真机：`SVC 0x21 x0=0x5000 x1=0x5efa51b000`（0x5000 = sm::GetServiceHandle 发出去的假句柄）。
+        // 客体随后的断言（从 subsdk0 里读出的原话）：
+        //   QueryPointerBufferSize(&pointerBufferSize, m_ClientHandle)
+        //   at nn/sf/hipc/client/sf_HipcClientMessage.h
+        // ⇒ 它在用这个假句柄做 CMIF 握手，而我们既没服务端也没写出站头。
+        //
+        // 找请求缓冲的两条路（都试，谁先命中用谁）：
+        //   ① x1 直接就是缓冲（上一轮真机看到的值），且首 4 字节 = 'SFCI'；
+        //   ② Horizon 的 hipc 把请求缓冲放在**线程本地区**里 —— 扫 TLR 前 0x40 字节的指针，
+        //      找首 4 字节 = 'SFCI' 的那个（这样不依赖寄存器约定）。
+        // 命中后按 CMIF 写：{ u32 magic='SFCO', u32 result=0 } + 出参区清零。
         uint8_t *msg = (uint8_t *)regs[1];
-        if (msg && msg >= g_as && msg < g_as + g_reserve && !memcmp(msg, "SFCI", 4)) {
+        uint8_t *tlr = (uint8_t *)pthread_getspecific(g_keytlr);
+        uint8_t *from = NULL;
+        // ★ 真机实测（np259）：CMIF 请求头**内联在 TLR 里**，但偏移会变 ——
+        //   第一发在 +0x10（TLR[0]=0x800000005），第二发在 +0x20（TLR[0]=0x8000000900000004）。
+        //   所以不写死偏移：在 TLR 前 0x100 字节里按 4 字节对齐扫 'SFCI'，扫到哪儿就写哪儿。
+        if (tlr) {
+            for (int i = 0; i < 0x100; i += 4)
+                if (!memcmp(tlr + i, "SFCI", 4)) { from = tlr + i; break; }
+        }
+        if (!from && msg && msg >= g_as && msg < g_as + g_reserve && !memcmp(msg, "SFCI", 4)) { from = msg; }
+        if (!from && tlr) {
+            for (int i = 0; i < 0x40; i += 8) {
+                uint8_t *q = (uint8_t *)(uintptr_t)*(volatile uint64_t *)(tlr + i);
+                if (q >= g_as && q < g_as + g_reserve && !memcmp(q, "SFCI", 4)) { from = q; break; }
+            }
+        }
+        if (from) {
             uint32_t magic = 0x4F434653u;              // 'SFCO'
             uint32_t res = 0;
-            memcpy(msg, &magic, 4); memcpy(msg + 4, &res, 4);
-            memset(msg + 8, 0, 0x40);                  // 出参（QueryPointerBufferSize 等从这里读）
-            if (g_flag.imports) { static int once; if (!once++) LOG("SendSyncRequest(handle=%#llx)：已写出站头 'SFCO' + result=0", (unsigned long long)regs[0]); }
+            memcpy(from, &magic, 4); memcpy(from + 4, &res, 4);
+            memset(from + 8, 0, 0x40);                  // 出参（QueryPointerBufferSize 等从这儿读）
+        }
+        if (g_flag.imports) {
+            static int n;
+            if (from) { static int ok; if (ok++ < 3) LOG("SendSyncRequest h=%#llx 已回 'SFCO' @ %p", (unsigned long long)regs[0], (void *)from); }
+            else if (tlr) {
+                // 没命中也把 TLR 头 0x40 字节打出来 —— 第二发 IPC 的请求头不在 +0x10 了，
+                // 得看它到底长什么样（也许换成了 WithUserBuffer 或者已被我们上一发覆写成 SFCO）。
+                static int bad;
+                if (bad++ < 3) {
+                    LOG("SendSyncRequest h=%#llx 未命中：x0..x3=%#llx %#llx %#llx %#llx", (unsigned long long)regs[0],
+                        (unsigned long long)regs[1], (unsigned long long)regs[2], (unsigned long long)regs[3], (unsigned long long)regs[4]);
+                    for (int i = 0; i < 0x40; i += 8)
+                        LOG("    TLR[%#x] = %#llx", i, (unsigned long long)*(volatile uint64_t *)(tlr + i));
+                }
+            }
+            if (n++ < 2 && tlr) {
+                // 一次把 TLR 里所有非零 8 字节槽打出来 —— hipc 的请求缓冲指针就在这里面（真机 x1 就是 TLR 本身，
+                // 说明 svc 只传了 handle，缓冲地址由内核从 TLS 取）。看到首 4 字节 'SFCI' 的那个就是它。
+                LOG("SendSyncRequest h=%#llx 缓冲=%p%s；TLR 非零槽：", (unsigned long long)regs[0],
+                    (void *)from, from ? "（已回 SFCO）" : "（未命中）");
+                for (int i = 0; i < 0x200; i += 8) {
+                    uint64_t v = *(volatile uint64_t *)(tlr + i);
+                    if (!v) continue;
+                    const char *tag = "";
+                    uint8_t *q = (uint8_t *)(uintptr_t)v;
+                    if (q >= g_as && q < g_as + g_reserve) {
+                        if (!memcmp(q, "SFCI", 4)) tag = " ← 'SFCI' 请求缓冲";
+                        else if (!memcmp(q, "SFCO", 4)) tag = " ← 'SFCO'";
+                        else tag = " ← 客体地址";
+                    }
+                    LOG("  TLR[%#x] = %#llx%s", i, (unsigned long long)v, tag);
+                }
+            }
         }
         regs[0] = 0; return 0;
     }
