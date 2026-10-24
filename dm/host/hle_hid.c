@@ -428,6 +428,20 @@ HLE_FORCE("_ZN2nn3hid14InitializeNpadEv", "连 hid 服务；宿主从 dm_input �
 // （真机 bt: sdk+0x23e920 / 0x229688 / 0x220a94）。debug pad 只用于开发调试，空转即可。
 HLE_FORCE("_ZN2nn3hid18InitializeDebugPadEv", "debug pad：开发调试用，宿主空转（不走 hid IPC）", void, h_hid_InitDpad, void) {}
 HLE_FORCE("_ZN2nn3hid16FinalizeDebugPadEv", "同上", void, h_hid_FinDpad, void) {}
+// np262 续：debug pad 的**读取**入口也要接管。
+// 真机现场：图形初始化跑通之后（日志出现 `WindowInitialize 交换链 2 张…`），
+// 崩点变成 `nn::hid::GetDebugPadStates(DebugPadState*, int)`（sdk+0x2325ec）
+// —— InitializeDebugPad 被我们空转了，它自己的实现拿不到 debug pad 会话。
+// debug pad 只用于开发调试，宿主一律报"没有状态"（返回 0 个）。
+HLE_FORCE("_ZN2nn3hid17GetDebugPadStatesEPNS0_13DebugPadStateEi",
+          "debug pad：开发调试用，宿主报 0 个状态", int, h_hid_GetDpadS, void *st, int n) { (void)st; (void)n; return 0; }
+HLE_FORCE("_ZN2nn3hid16GetDebugPadStateEPNS0_13DebugPadStateE", "同上", int, h_hid_GetDpad1, void *st) { (void)st; return 0; }
+// detail 变体（有些构建走的是这层）：第二个签名带 int* 前缀
+HLE_FORCE("_ZN2nn3hid6detail16GetDebugPadStateEPNS0_13DebugPadStateE", "同上", int, h_hid_dGetDpad1, void *st) { (void)st; return 0; }
+HLE_FORCE("_ZN2nn3hid6detail17GetDebugPadStatesEPiPNS0_13DebugPadStateEi",
+          "同上", int, h_hid_dGetDpadS, int *cnt, void *st, int n) { (void)st; (void)n; if (cnt) *cnt = 0; return 0; }
+HLE_FORCE("_ZN2nn3hid6detail18InitializeDebugPadEv", "debug pad 空转（detail 层）", void, h_hid_dInitDpad, void) {}
+HLE_FORCE("_ZN2nn3hid6detail16FinalizeDebugPadEv", "同上", void, h_hid_dFinDpad, void) {}
 HLE_FORCE("_ZN2nn3hid21InitializeTouchScreenEv", "连 hid 服务；触屏输入由前端另接", void, h_hid_InitTouch, void) {}
 HLE_FORCE("_ZN2nn3hid22SetSupportedNpadIdTypeEPKjm", "支持的手柄号；宿主固定", void, h_hid_SetIds, const uint32_t *ids, uint64_t n) { (void)ids; (void)n; }
 // BitFlagSet<32> 按值传在 w 寄存器

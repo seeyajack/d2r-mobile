@@ -201,6 +201,26 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
                     (unsigned long long)p[0x1b0/8], (unsigned long long)p[0x1d0/8],
                     (unsigned)*(volatile uint32_t *)(p + 0x208/8),
                     (unsigned long long)p[0x198/8], (unsigned long long)p[0xf8/8]);
+        // np262：构造函数 0x9fc624 从 *(main+0x227f5e0) 取一个单例，调它的 vt[0](this, idx, &out)，
+        // 要求 out(idx=0)==0x34 且 out(idx=1)>=0x20，不满足就**提前 return**（什么都不建）。
+        // 把那个单例、它的 vptr、vt[0] 打出来 —— 就能定位是哪个查询在答这个值。
+        {
+            module_t *mm = NULL;
+            for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mm = &g_mod[i]; break; }
+            if (mm && mm->size > 0x2280000) {
+                uint64_t obj = *(volatile uint64_t *)(mm->base + 0x227f5e0);
+                fprintf(stderr, " [query-obj=%#llx (main+%#llx) vptr=%#llx", (unsigned long long)obj,
+                        (unsigned long long)(obj - (uint64_t)(uintptr_t)mm->base),
+                        obj ? (unsigned long long)*(volatile uint64_t *)(uintptr_t)obj : 0ULL);
+                if (obj) {
+                    uint64_t vt = *(volatile uint64_t *)(uintptr_t)obj;
+                    if (vt) fprintf(stderr, " vt0=main+%#llx vt1=main+%#llx]\n",
+                        (unsigned long long)(*(volatile uint64_t *)(uintptr_t)vt) - (uint64_t)(uintptr_t)mm->base,
+                        (unsigned long long)(*(volatile uint64_t *)(uintptr_t)(vt + 8)) - (uint64_t)(uintptr_t)mm->base);
+                    else fprintf(stderr, "]\n");
+                } else fprintf(stderr, "]\n");
+            }
+        }
         }
     }
     fprintf(stderr, "\n");

@@ -148,7 +148,17 @@ NVN(nvnDeviceGetProcAddress, PFNNVNGENERICFUNCPTRPROC, const NVNdevice *d, const
 // 设备属性：Tegra X1 实测值（nnheaders nvn_DeviceConstantsNX.h，在 SMO 上逐项调 nvnDeviceGetInteger 得到）
 // Device properties: values measured on Tegra X1 (nnheaders nvn_DeviceConstantsNX.h, obtained by calling nvnDeviceGetInteger item by item on SMO)
 static const int g_devinfo[] = {
-    [0x00] = 53, [0x01] = 311,   // API 版本：游戏读了不比较（main 0x173cbd8），此值未核 | API version: the game reads it without comparing (main 0x173cbd8); this value is unverified
+    // np262 ★ 关键修正：API 主版本必须是 **52**，不是 53。
+    // 依据（真机 + 离线反汇编）：BotW 的图形设备构造函数（main+0x9fc328）里
+    //   9fc638  blr  ; nvnDeviceGetInteger(dev, 0, &out1)
+    //   9fc650  blr  ; nvnDeviceGetInteger(dev, 1, &out2)
+    //   9fc658  cmp  w8,#0x34      ; out1 必须 == 52
+    //   9fc65c  b.ne 0x9fcd84      ; ★ 不等就直接返回，什么都不建
+    //   9fc664  cmp  w8,#0x20      ; out2 必须 >= 32
+    //   9fc668  b.lt 0x9fcd84
+    // 上游注释写"游戏读了不比较"——那只对暗黑2 成立；BotW 是真比较的。
+    // 就因为这里是 53，构造函数提前返回，命令缓冲与图形子对象全是 NULL。
+    [0x00] = 52, [0x01] = 311,   // API 版本：游戏读了不比较（main 0x173cbd8），此值未核 | API version: the game reads it without comparing (main 0x173cbd8); this value is unverified
     [0x02] = 14, [0x03] = 65536, [0x04] = 256, [0x05] = 8, [0x06] = 16, [0x07] = 4, [0x08] = 16, [0x09] = 32,
     [0x0A] = 16, [0x0B] = 4, [0x0C] = 4, [0x0D] = 4, [0x0E] = 16, [0x0F] = 32, [0x10] = 32, [0x11] = 256, [0x12] = 256,
     [0x13] = 4, [0x14] = 8, [0x15] = 512, [0x16] = 256, [0x17] = 2, [0x18] = 256, [0x19] = 4096, [0x1A] = 131072,
@@ -550,6 +560,18 @@ NVN(nvnQueueInitialize, NVNboolean, NVNqueue *q, const NVNqueueBuilder *b) {
 NVN(nvnQueueFinalize, void, NVNqueue *q) { ((queue_t *)q)->magic = 0; }
 NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *info) {
     (void)q; if (info) memset(info, 0, sizeof *info); return NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR;
+}
+// np263：`nvnQueueAcquireTexture` 宿主原来**没实现**（未实现函数返回 0），
+// 而游戏把 0 当 textureId 一路传下去 ⇒ 最后在 main+0xba5ac8 `str x8,[x20]` 拿到 this=0x10 崩。
+// 只加这一个：另两个（IsTextureReady/ReleaseTexture）一加进来就**启动即崩**（真机踩过，
+// 现象是打开应用几秒内退出、且一条 [dm] 日志都没有），怀疑是 NVN_NOPROTO 走 swnnv 段注册时
+// 与构建期生成的 names/thunks 表不一致。等定位到那个问题再补。
+static uint32_t g_next_texid = 1;
+NVN(nvnQueueAcquireTexture, uint32_t, NVNqueue *q, const NVNtexture *t, const NVNsync *sy) {
+    (void)q; (void)t; (void)sy;
+    uint32_t id = g_next_texid++;
+    if (g_flag.imports) LOG("nvnQueueAcquireTexture -> id=%u", id);
+    return id;
 }
 NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; }
 NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; x_drain(); mtl_finish(); }
