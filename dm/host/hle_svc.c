@@ -233,6 +233,22 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         if (mi) { uint64_t *m=(uint64_t*)mi; m[0]=base; m[1]=size; ((uint32_t*)mi)[4]=state; ((uint32_t*)mi)[5]=0; ((uint32_t*)mi)[6]=perm; ((uint32_t*)mi)[7]=0; ((uint32_t*)mi)[8]=0; }
         regs[0] = 0; regs[1] = 0; return 0;
     }
+    case 0x21: {   // SendSyncRequest(handle)：宿主没有 IPC 服务端 ⇒ 回一个"成功、无出参"的 CMIF 响应
+        // 真机现场：`SVC 0x21 x0=0x5000 x1=0x5efa51b000`（0x5000 = 我们在 sm::GetServiceHandle 发的假句柄）。
+        // 原先只在 default 里"占位返回成功"，但没写出站头 ⇒ 客体的 hipc 解析响应失败 ⇒
+        // 断言 `QueryPointerBufferSize(&pointerBufferSize, m_ClientHandle)`（sf_HipcClientMessage.h）。
+        // 这里按 CMIF 的出站头写：{ u32 magic='SFCO', u32 result=0 }，出参区清零。
+        // ⚠ 只在缓冲区**确实是 CMIF 请求**（首 4 字节 'SFCI'）时才写，避免误伤别的内存。
+        uint8_t *msg = (uint8_t *)regs[1];
+        if (msg && msg >= g_as && msg < g_as + g_reserve && !memcmp(msg, "SFCI", 4)) {
+            uint32_t magic = 0x4F434653u;              // 'SFCO'
+            uint32_t res = 0;
+            memcpy(msg, &magic, 4); memcpy(msg + 4, &res, 4);
+            memset(msg + 8, 0, 0x40);                  // 出参（QueryPointerBufferSize 等从这里读）
+            if (g_flag.imports) { static int once; if (!once++) LOG("SendSyncRequest(handle=%#llx)：已写出站头 'SFCO' + result=0", (unsigned long long)regs[0]); }
+        }
+        regs[0] = 0; return 0;
+    }
     case 0x2C: case 0x2D: {  // MapPhysicalMemory / UnmapPhysicalMemory(addr, size)：只许在 alias 区内（SDK 的 VammManager 用） | MapPhysicalMemory / UnmapPhysicalMemory(addr, size): only allowed inside the alias region (used by the SDK's VammManager)
         uint8_t *a = (uint8_t *)regs[0]; size_t size = regs[1];
         if (a < g_alias || a + size > g_alias + g_alias_cap) { LOG("SVC %#x 越出 alias 区 %p+%#zx", num, a, size); regs[0] = 0xD401; return 0; }
