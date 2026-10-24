@@ -212,6 +212,39 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
                 fprintf(stderr, " [query-obj=%#llx (main+%#llx) vptr=%#llx", (unsigned long long)obj,
                         (unsigned long long)(obj - (uint64_t)(uintptr_t)mm->base),
                         obj ? (unsigned long long)*(volatile uint64_t *)(uintptr_t)obj : 0ULL);
+                // np271：崩点 main+0x9a4dc8 依赖的那张表。
+                //   *(main+0x22655a0) → holder（.bss）
+                //   *holder           → 表对象（计数在 +0x28、表体在 +0x30）
+                // 离线已确认 main+0x22655a0 全二进制只有读没有写 ⇒ 只能上机看它运行时是什么。
+                {
+                    uint64_t holder = *(volatile uint64_t *)(mm->base + 0x22655a0);
+                    fprintf(stderr, " [表 holder=%#llx", (unsigned long long)holder);
+                    if (holder) {
+                        uint64_t tobj = *(volatile uint64_t *)(uintptr_t)holder;
+                        fprintf(stderr, " 表对象=%#llx", (unsigned long long)tobj);
+                        if (tobj) {
+                            uint32_t cnt = *(volatile uint32_t *)(uintptr_t)(tobj + 0x28);
+                            uint64_t body = *(volatile uint64_t *)(uintptr_t)(tobj + 0x30);
+                            fprintf(stderr, " 计数=%u 表体=%#llx", cnt, (unsigned long long)body);
+                            if (body) {
+                                volatile uint64_t *bp = (volatile uint64_t *)(uintptr_t)body;
+                                fprintf(stderr, " 表体[0..3]=%#llx %#llx %#llx %#llx",
+                                        (unsigned long long)bp[0], (unsigned long long)bp[1],
+                                        (unsigned long long)bp[2], (unsigned long long)bp[3]);
+                            }
+                        }
+                    }
+                    fprintf(stderr, "]\n");
+                }
+                // np267：静态对象槽 *(main+0x2273a18) 及邻近 8 格。
+                // 现场：崩点 main+0xba5ac8 的 this = 0x10，而该槽里正是 0x10。
+                // 邻近全 0/垃圾 ⇒ 从没写过；只有这格异常 ⇒ 写了一半。两种修法不同。
+                {
+                    uint64_t *slot = (uint64_t *)(mm->base + 0x2273a18);
+                    fprintf(stderr, " [静态对象槽 main+0x2273a18 = %#llx；邻近：", (unsigned long long)*slot);
+                    for (int i = -3; i <= 4; i++) fprintf(stderr, " %#llx", (unsigned long long)slot[i]);
+                    fprintf(stderr, "]\n");
+                }
                 if (obj) {
                     uint64_t vt = *(volatile uint64_t *)(uintptr_t)obj;
                     if (vt) fprintf(stderr, " vt0=main+%#llx vt1=main+%#llx]\n",
