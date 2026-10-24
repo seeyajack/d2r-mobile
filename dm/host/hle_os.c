@@ -347,18 +347,23 @@ HLE_FORCE("_ZN2nn2os11GetTlsValueENS0_7TlsSlotE",
           uint64_t, h_os_GetTls, unsigned slot) {
     pthread_key_t k = tls_key(slot);
     if (k == (pthread_key_t)-1) return 0;
-    return (uint64_t)(uintptr_t)pthread_getspecific(k);
+    uint64_t v = (uint64_t)(uintptr_t)pthread_getspecific(k);
+    // np285：这条链是 this=0 的源头（0xa0e2f8 用它取默认分配器），必须看清谁在设/取
+    if (g_flag.imports) { static int n; if (n++ < 24) LOG("os GetTlsValue(slot=%u) -> %#llx", slot, (unsigned long long)v); }
+    return v;
 }
 HLE_FORCE("_ZN2nn2os11SetTlsValueENS0_7TlsSlotEm",
           "设线程本地值", void, h_os_SetTls, unsigned slot, uint64_t v) {
     pthread_key_t k = tls_key(slot);
     if (k != (pthread_key_t)-1) pthread_setspecific(k, (void *)(uintptr_t)v);
+    if (g_flag.imports) { static int n; if (n++ < 24) LOG("os SetTlsValue(slot=%u, %#llx)", slot, (unsigned long long)v); }
 }
 HLE_FORCE("_ZN2nn2os15AllocateTlsSlotEPNS0_7TlsSlotEPFvmE",
           "分配一个 TLS 槽：惰性建 pthread key，槽号就是下标（客体当 TlsSlot 枚举用）",
           Result, h_os_AllocTls, unsigned *out, void (*dtor)(unsigned long)) {
     (void)dtor;                                    // 线程退出时的析构：客体很少用，先不接
     if (!out) return 1;
+    if (g_flag.imports) LOG("os AllocateTlsSlot()");
     for (unsigned s = 0; s < TLS_MAX; s++) {
         if (tls_key(s) == (pthread_key_t)-1) continue;
         pthread_mutex_lock(&g_tls_mu);

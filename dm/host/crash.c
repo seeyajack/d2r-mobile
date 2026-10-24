@@ -275,6 +275,8 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
                     }
                     fprintf(stderr, " ]\n");
                 }
+                // np285：客体 AS 的已登记区间 —— 判定崩溃地址（如 0x340000ca）是未映射还是越界
+                { void svc_map_dump(void); svc_map_dump(); }
                 if (obj) {
                     uint64_t vt = *(volatile uint64_t *)(uintptr_t)obj;
                     if (vt) fprintf(stderr, " vt0=main+%#llx vt1=main+%#llx]\n",

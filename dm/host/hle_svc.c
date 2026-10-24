@@ -114,6 +114,7 @@ HLE_FORCE("_ZN2nn3mem17StandardAllocator8AllocateEmm", "照原版分配，只在
 // For memory accounting (memstat.m): the range of the whole guest address space block (base = NULL when not initialized)
 void svc_guest_range(uint8_t **base, size_t *size) { *base = g_as; *size = g_reserve; }
 
+
 enum { I_CoreMask=0, I_PriorityMask=1, I_AliasAddr=2, I_AliasSize=3, I_HeapAddr=4, I_HeapSize=5,
        I_TotalMem=6, I_UsedMem=7, I_DebuggerAttached=8, I_ResourceLimit=9, I_IdleTick=10, I_RandomEntropy=11,
        I_AslrAddr=12, I_AslrSize=13, I_StackAddr=14, I_StackSize=15, I_SysResTotal=16, I_SysResUsed=17,
@@ -126,6 +127,13 @@ static uint8_t g_seen[256];
 #define MAX_MAP 4096
 static struct { uint64_t base, size, src; uint32_t state; } g_map[MAX_MAP];
 static int g_nmap;
+// np285：崩时把客体 AS 的已登记区间打出来 —— 判定崩溃地址是"该映射却没映射"还是"越界"。
+void svc_map_dump(void) {
+    fprintf(stderr, " [客体 AS base=%p size=%#zx，已登记 %d 段：", (void *)g_as, (size_t)g_reserve, g_nmap);
+    for (int i = 0; i < g_nmap && i < 20; i++)
+        fprintf(stderr, " [%#llx,+%#llx)", (unsigned long long)g_map[i].base, (unsigned long long)g_map[i].size);
+    fprintf(stderr, " ]\n");
+}
 static pthread_mutex_t g_map_lock = PTHREAD_MUTEX_INITIALIZER;
 static int map_find(uint64_t a, uint64_t n) {       // 返回 1 基下标，0 = 无重叠 | returns a 1-based index, 0 = no overlap
     for (int i = 0; i < g_nmap; i++) if (a < g_map[i].base + g_map[i].size && g_map[i].base < a + n) return i + 1;
