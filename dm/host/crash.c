@@ -131,6 +131,7 @@ void crash_set_wait_dump(void (*fn)(void)) { g_wait_dump = fn; }
 // 按需导出现场（不退出）：iOS 包没有无进展看门狗，冒烟判红时经 DM_LOG_PORT 发 dump 触发——各客体线程在等什么 + 图形侧等待点，和看门狗打的是同一份
 // Dump the current state on demand (without exiting): the iOS app has no no-progress watchdog, so when the smoke test fails it sends dump through DM_LOG_PORT to trigger this -- what each guest thread is waiting on + the graphics-side wait points, the same thing the watchdog prints
 void crash_dump_now(const char *why) { fprintf(stderr, "[dm] 现场导出（%s）：拍 %u / 阶段 %s\n", why, atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]); if (g_dump_hook) g_dump_hook(); if (g_wait_dump) g_wait_dump(); }
+unsigned long dm_guest_malloc_stat(unsigned long *fail);
 static void on_crash(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = uc_;
     if (sig == SIGTRAP && g_trap_hook && g_trap_hook(uc)) return;
@@ -212,6 +213,31 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
                 fprintf(stderr, " [query-obj=%#llx (main+%#llx) vptr=%#llx", (unsigned long long)obj,
                         (unsigned long long)(obj - (uint64_t)(uintptr_t)mm->base),
                         obj ? (unsigned long long)*(volatile uint64_t *)(uintptr_t)obj : 0ULL);
+                // np295：帧链在崩点经常断（x29 链到 0xffffffff），改成**只认代码段地址**扫栈。
+                // 原来扫 [base, base+size) 会把 .data 里的指针也当成返回地址，真正的调用链被挤掉。
+                // 代码段只到 ~0x1200000，用它当上界，512 个 qword 足够覆盖到 nnMain。
+                {
+                    uint64_t spv = UC_SP(uc);
+                    volatile uint64_t *st = (volatile uint64_t *)(uintptr_t)spv;
+                    uint64_t lo = (uint64_t)(uintptr_t)mm->base;
+                    uint64_t hi = lo + (mm->size < 0x1200000 ? mm->size : 0x1200000);
+                    int shown = 0;
+                    fprintf(stderr, " [np295 代码段栈扫 sp=%#llx：", (unsigned long long)spv);
+                    for (int i = 0; i < 512 && shown < 24; i++) {
+                        uint64_t v = st[i];
+                        if (v >= lo && v < hi && !(v & 3)) { fprintf(stderr, " main+%#llx", (unsigned long long)(v - lo)); shown++; }
+                    }
+                    fprintf(stderr, " ]\n");
+                    uint64_t fp = UC_FP(uc);
+                    fprintf(stderr, " [np295 fp=%#llx 起 12 格：", (unsigned long long)fp);
+                    if (fp > 0xffff && !(fp & 7)) {
+                        volatile uint64_t *f = (volatile uint64_t *)(uintptr_t)fp;
+                        for (int i = 0; i < 12; i++) fprintf(stderr, " %#llx", (unsigned long long)f[i]);
+                    }
+                    fprintf(stderr, " ]\n");
+                }
+                { unsigned long f = 0; unsigned long n = dm_guest_malloc_stat(&f);
+                  fprintf(stderr, " [np294 客体 malloc→宿主 调用 %lu 次，失败 %lu 次]\n", n, f); }
                 // np272：帧链在这里断了（x29 链到 0xffffffff），改**扫栈内存**找返回地址。
                 // 把 sp 起 128 个 qword 里落在 main 代码段范围内的值打出来 —— 那就是真实调用链。
                 {

@@ -2,6 +2,7 @@
 // 代码区（原 text 与补丁区）一拷进来就设成只读+执行，此后装载器只写 data：iOS 上这两块要作为签名代码段原样内嵌。
 // Multi-module loading (playing the role of Horizon's rtld): mapping, claiming thread slots, gate registration, cross-module relocation, take-over by name, segment permissions.
 // The code area (original text and patch area) is set to read-only+execute as soon as it is copied in, and from then on the loader only writes data: on iOS these two blocks must be embedded as is as signed code segments.
+#include <stdatomic.h>
 #include "dm.h"
 #include <TargetConditionals.h>
 #include <fcntl.h>
@@ -469,14 +470,171 @@ static void map_image(module_t *m, const char *dir) {
 // works; 1 is the safest. Once installed, the guest's malloc uses its own nn::mem::StandardAllocator
 // (main+0x22d71e8, the 3110 MB guest heap), which is what this guest address-space design intends;
 // the host-provided imported malloc stays for rtld's own early allocations.
+// np293：客体指令补丁（宿主在 map 之后改写客体代码）。
+// 代码区在 map_image 里已是只读+执行，这里临时放开该页、写完复原并刷 icache。
+// 只在原值与期望值一致时才写：补丁点对不上就不动，避免把别的东西改坏。
+// np293: guest instruction patch (the host rewrites guest code after mapping).
+// map_image already leaves the code area read-only+executable; temporarily open that page, write,
+// restore, and flush the icache. The write happens only when the current word matches the expected
+// one, so a mismatched build is left untouched instead of being silently corrupted.
+static void guest_patch32(uint32_t *at, uint32_t expect, uint32_t want, const char *why) {
+    uintptr_t pg = (uintptr_t)at & ~(uintptr_t)0xfff;
+    size_t len = ((uintptr_t)at & 0xfff) + 4;
+    if (mprotect((void *)pg, len, PROT_READ | PROT_WRITE | PROT_EXEC)) { LOG("【红】补丁 %s：放开写权限失败", why); return; }
+    uint32_t cur = *(volatile uint32_t *)at;
+    if (cur != expect) {
+        LOG("【红】补丁 %s：原值 %#x ≠ 期望 %#x，不改（构建号不符？）", why, cur, expect);
+    } else {
+        *(volatile uint32_t *)at = want;
+        __builtin___clear_cache((char *)at, (char *)at + 4);
+        LOG("补丁 %s：%#x → %#x", why, expect, want);
+    }
+    if (mprotect((void *)pg, len, PROT_READ | PROT_EXEC)) LOG("【红】补丁 %s：复原只读失败", why);
+}
+
+// np294：改跳目标用计数包一层，崩时能一句话说清"这条分配路到底走没走"。
+// np294: the redirect target is wrapped with a counter so a crash dump can tell at a glance whether
+// this allocation path is actually taken.
+static _Atomic unsigned long g_gmalloc_n, g_gmalloc_fail;
+static void *guest_malloc(size_t n) {
+    void *p = malloc(n);
+    atomic_fetch_add(&g_gmalloc_n, 1);
+    if (!p && n) atomic_fetch_add(&g_gmalloc_fail, 1);
+    return p;
+}
+unsigned long dm_guest_malloc_stat(unsigned long *fail) {
+    if (fail) *fail = atomic_load(&g_gmalloc_fail);
+    return atomic_load(&g_gmalloc_n);
+}
+
+// np294：把客体某个函数入口改成"跳到宿主函数"。
+// 宿主 .so 与客体映像相距远超 `b` 的 ±128MB 射程，所以入口前 16 字节改写成
+//   ldr x16, [pc,#8] ; br x16 ; <8 字节目标地址>
+// 正好覆盖 4 条指令（被覆盖的都是函数序言，尾跳之后本来也不会执行）。
+// np294: redirect a guest function entry to a host function.
+// The host .so is far beyond `b`'s +-128MB reach from the guest image, so the first 16 bytes become
+//   ldr x16, [pc,#8] ; br x16 ; <8-byte target address>
+// which covers exactly 4 instructions (all prologue, dead once we tail-jump away).
+static void guest_redirect(uint8_t *at, void *fn, uint32_t expect0, const char *why) {
+    uintptr_t pg = (uintptr_t)at & ~(uintptr_t)0xfff;
+    size_t len = ((uintptr_t)at & 0xfff) + 16;
+    if (*(volatile uint32_t *)at != expect0) {
+        LOG("【红】改跳 %s：原值 %#x ≠ 期望 %#x，不改（构建号不符？）", why, *(volatile uint32_t *)at, expect0);
+        return;
+    }
+    if (mprotect((void *)pg, len, PROT_READ | PROT_WRITE | PROT_EXEC)) { LOG("【红】改跳 %s：放开写权限失败", why); return; }
+    uint32_t w[2] = { 0x58000050u /* ldr x16,[pc,#8] */, 0xD61F0200u /* br x16 */ };
+    memcpy(at, w, 8);
+    uint64_t t = (uint64_t)(uintptr_t)fn;
+    memcpy(at + 8, &t, 8);
+    __builtin___clear_cache((char *)at, (char *)at + 16);
+    if (mprotect((void *)pg, len, PROT_READ | PROT_EXEC)) LOG("【红】改跳 %s：复原只读失败", why);
+    else LOG("改跳 %s → %p", why, fn);
+}
+
+// np296：AArch64 `b` 指令编码（同一个模块内，±128MB 射程）。
+static uint32_t arm64_b(uint64_t from, uint64_t to) {
+    int64_t d = (int64_t)to - (int64_t)from;
+    return 0x14000000u | ((uint32_t)(d >> 2) & 0x03FFFFFFu);
+}
+
+// np296：把 main+0x105f9e4（"就地构造"共享辅助，**730 个调用点**）改成空指针时直接返回。
+// 为什么在这里下手：崩点链是 0x45f9c8 → 0x105f9e4 → 0xba5aa4，而 0x105f9e4 有 730 个调用点、
+// 帧链在第二帧就断了，逐个定位代价太高；它是这条链上唯一的收口点。
+// 语义：this 为空就不构造（原版这里必崩，没有"正常"行为可言），让上层继续走 —— 上层若真的
+// 用到了这个空子对象，会在**另一个**位置崩，那正好告诉我们是谁传了空指针。
+// np296: make main+0x105f9e4 (the shared "construct in place" helper with **730 call sites**)
+// return immediately on a null this. The crash chain is 0x45f9c8 -> 0x105f9e4 -> 0xba5aa4, and with
+// 730 callers plus a frame chain that breaks at frame 2, pinning the exact caller is too expensive;
+// this is the single choke point on the chain. Semantics: with a null this there is no "correct"
+// behaviour to preserve (the original crashes), so let the caller continue; if it really uses the
+// null sub-object it will fault **somewhere else**, which is exactly the information we want.
+static void guest_null_tolerant_ctor(void) {
+    // np296：整条"分配→构造"链一次全装空指针保护。
+    // 崩点链 0x634fa0/… → 0x3326b8|0x37621c|0x40df2c|0x41c728|0x54f204 → 0x45f9c8 → 0x105f9e4 → 0xba5aa4，
+    // 每层都只是把 x0 原样往下传（`mov x19,x0; bl 下一层`），所以 **任一层把空指针挡下来，
+    // 整条链就不会崩**。真机上这 6 个入口都只被"先分配再构造"的工厂调用，this 不可能为空；
+    // 我们这边为空，说明上游某处与真机不同 —— 先让客体活下去，再看它到底在哪用到了这个空对象。
+    // np296: install null guards over the whole allocate-then-construct chain in one shot.
+    // Every layer just forwards x0 (`mov x19,x0; bl next`), so **guarding any layer stops the crash**.
+    // On the real device these 6 entries are only reached from "allocate then construct" factories and
+    // this can never be null; it is null here, so something upstream differs -- keep the guest alive
+    // first and then see where it actually uses the null object.
+    static const struct { uint64_t off; uint32_t first; const char *name; } kEnt[] = {
+        { 0x105f9e4, 0xF81E0FF3u, "0x105f9e4 就地构造（730 调用点）" },
+        { 0x45f9c8,  0xF81E0FF3u, "0x45f9c8 类构造器" },
+        { 0x3326b8,  0xF81E0FF3u, "0x3326b8 构造包装 A" },
+        { 0x37621c,  0xF81E0FF3u, "0x37621c 构造包装 B" },
+        { 0x40df2c,  0xF81E0FF3u, "0x40df2c 构造包装 C" },
+        { 0x41c728,  0xF81E0FF3u, "0x41c728 构造包装 D" },
+        { 0x54f204,  0xA9BE4FF4u, "0x54f204 构造包装 E" },
+    };
+    module_t *mm = NULL;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mm = &g_mod[i]; break; }
+    if (!mm || mm->size <= 0x2404a80) return;
+    uint8_t *cave = mm->base + 0x2404a70;          // 产物尾部 96KB 空穴（实测全 0） | the 96KB hole at the tail of the image (all zeros)
+    uintptr_t pg = (uintptr_t)cave & ~(uintptr_t)0xfff;
+    if (mprotect((void *)pg, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC)) { LOG("【红】空穴不可写"); return; }
+    for (unsigned i = 0; i < sizeof kEnt / sizeof kEnt[0]; i++) {
+        uint8_t *stub = cave + 0x20 * i;
+        uint8_t *fn = mm->base + kEnt[i].off;
+        if (*(volatile uint32_t *)fn != kEnt[i].first) {
+            LOG("【红】空指针保护 %s：原值 %#x ≠ 期望 %#x，跳过", kEnt[i].name, *(volatile uint32_t *)fn, kEnt[i].first);
+            continue;
+        }
+        if (*(uint32_t *)stub) { LOG("【红】空指针保护 %s：空穴槽已被占用，跳过", kEnt[i].name); continue; }
+        uint32_t w[4];
+        w[0] = 0xB4000060u;                          // cbz x0, +0x0C → 第 4 条 ret
+        w[1] = kEnt[i].first;                        // 原第一条（建栈帧）
+        w[2] = arm64_b((uint64_t)(stub + 8), (uint64_t)(fn + 4));
+        w[3] = 0xD65F03C0u;                          // ret
+        memcpy(stub, w, sizeof w);
+        __builtin___clear_cache((char *)stub, (char *)stub + 16);
+        guest_patch32((uint32_t *)fn, kEnt[i].first, arm64_b((uint64_t)fn, (uint64_t)stub), kEnt[i].name);
+    }
+    if (mprotect((void *)pg, 0x2000, PROT_READ | PROT_EXEC)) LOG("【红】空穴复原只读失败");
+}
+
 static void guest_libc_hook(void) {
     module_t *mm = NULL;
     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mm = &g_mod[i]; break; }
     if (!mm || mm->size <= 0x22d7238) return;
     volatile uint64_t *hook = (volatile uint64_t *)(mm->base + 0x22d7230);
-    if (*hook) { LOG("libc hook 已有值 %#llx，不动", (unsigned long long)*hook); return; }
-    *hook = 1;
-    LOG("装 libc 初始化 hook（main+0x22d7230 = 1）：客体自己的 malloc/calloc/realloc/free 从此可用");
+    if (*hook) { LOG("libc hook 已有值 %#llx，不动", (unsigned long long)*hook); }
+    else {
+        *hook = 1;
+        LOG("装 libc 初始化 hook（main+0x22d7230 = 1）：客体自己的 malloc/calloc/realloc/free 从此可用");
+    }
+
+    // np293：让 0x9f33f0（Allocate(size, alloc, align)）恒走客体自己的标准分配器。
+    // 它有且只有三条出口，其中两条都会返回 0：
+    //   ① 0x9f3410 cbz x0 → 0x9f3444 → 0x9b27a0（标准分配器）   —— 仅当全局分配器 vptr 为 0 才走
+    //   ② 0x9f3414 cbnz x1 → 用调用方传的分配器，它的 Allocate 也可能返回 0
+    //   ③ 0x9f3420 cbz x1 → 0x9f3454 `mov x0,xzr; ret`         —— 线程默认分配器为空时**直接返回 0**
+    // 而 5711 个调用方**一律不判空**（崩点 main+0xba5ac8 就是 this=0 去写 vptr）。
+    // 把 ① 改成无条件 `b 0x9f3444`，三条路就都收敛到客体自己的 malloc（np292 已放开它的门）。
+    // 释放侧 0x9f36a0 **不接分配器参数**，而是 `bl 0xa0dfcc` 按指针反查归属分配器 ⇒ 分配/释放仍配对。
+    guest_patch32((uint32_t *)(mm->base + 0x9f3410), 0xB40001A0u, 0x1400000Du,
+                  "0x9f33f0 恒走标准分配器（cbz x0 → b）");
+
+    // np294：客体自己的 malloc 接宿主堆。
+    // 实测（np293 真机）：这条路上 StandardAllocator(main+0x22d71e8).Allocate(0x100) 返回
+    // **0xffffffff**（失败哨兵），于是 0x9f33f0 把 0xffffffff 当指针返回，调用方不判空
+    // 直接 `stp x8,xzr,[x19]` 写它 ⇒ addr=0xffffffff 崩（main+0xa08eb0）。
+    // 客体这套 libc 分配器在真机上由 rtld 初始化，我们复刻不完整，短时间补不齐；
+    // 直接跳宿主 malloc，分配恒成功。释放侧 0x9f36a0 是"按指针反查归属分配器"（0xa0dfcc），
+    // 查不到就跳过 —— 所以最坏是泄漏，不会跨分配器乱 free。
+    // np294: point the guest's own malloc at the host heap.
+    // Measured on device (np293): on this path StandardAllocator(main+0x22d71e8).Allocate(0x100)
+    // returns **0xffffffff** (the failure sentinel), so 0x9f33f0 hands 0xffffffff back as a pointer
+    // and the caller `stp x8,xzr,[x19]` writes through it without a null check -> addr=0xffffffff
+    // crash (main+0xa08eb0). The guest libc allocator is set up by rtld on the real device and our
+    // replica is incomplete, so rather than chase it, jump straight to the host malloc and make
+    // allocation always succeed. The free side 0x9f36a0 looks the owning allocator up by pointer
+    // (0xa0dfcc) and skips when not found, so the worst case is a leak, never a cross-allocator free.
+    guest_redirect(mm->base + 0x9b27a0, (void *)(uintptr_t)&guest_malloc, 0xA9BF7BFDu, "客体 malloc");
+    guest_redirect(mm->base + 0x9b2810, (void *)(uintptr_t)&calloc, 0xA9BE4FF4u, "客体 calloc");
+    guest_redirect(mm->base + 0x9b2888, (void *)(uintptr_t)&realloc, 0xA9BF7BFDu, "客体 realloc");
 }
 
 void load_modules(const char *dir, const char **names, int n) {
@@ -503,6 +661,7 @@ void load_modules(const char *dir, const char **names, int n) {
     force_init();
     t = now_ns(); for (int i = 0; i < g_nmod; i++) relocate(&g_mod[i]); tr = now_ns() - t;
     force_check();
+    guest_null_tolerant_ctor();   // np296
     guest_libc_hook();   // np292：扮演 rtld 装 libc 初始化 hook（必须在跑各模块 inits 之前） | np292: play rtld installing the libc init hook (must be before running module inits)
     { void hlecount_seal(void); hlecount_seal(); }   // DM_HLECOUNT：重定位完成，计数桩页封成只读可执行 | DM_HLECOUNT: relocation done, seal the counting stub pages as read-only executable
     if (getenv("DM_SYMCHECK")) LOG("DM_SYMCHECK：装载期共核 %lu 次符号查询，哈希与线性不一致 %lu", g_symchk_n, g_symchk_bad);
