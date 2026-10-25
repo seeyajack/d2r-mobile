@@ -549,7 +549,7 @@ static uint32_t arm64_b(uint64_t from, uint64_t to) {
 // this is the single choke point on the chain. Semantics: with a null this there is no "correct"
 // behaviour to preserve (the original crashes), so let the caller continue; if it really uses the
 // null sub-object it will fault **somewhere else**, which is exactly the information we want.
-static void guest_null_tolerant_ctor(void) {
+__attribute__((unused)) static void guest_null_tolerant_ctor(void) {
     // np296：整条"分配→构造"链一次全装空指针保护。
     // 崩点链 0x634fa0/… → 0x3326b8|0x37621c|0x40df2c|0x41c728|0x54f204 → 0x45f9c8 → 0x105f9e4 → 0xba5aa4，
     // 每层都只是把 x0 原样往下传（`mov x19,x0; bl 下一层`），所以 **任一层把空指针挡下来，
@@ -560,14 +560,14 @@ static void guest_null_tolerant_ctor(void) {
     // On the real device these 6 entries are only reached from "allocate then construct" factories and
     // this can never be null; it is null here, so something upstream differs -- keep the guest alive
     // first and then see where it actually uses the null object.
-    static const struct { uint64_t off; uint32_t first; const char *name; } kEnt[] = {
-        { 0x105f9e4, 0xF81E0FF3u, "0x105f9e4 就地构造（730 调用点）" },
-        { 0x45f9c8,  0xF81E0FF3u, "0x45f9c8 类构造器" },
-        { 0x3326b8,  0xF81E0FF3u, "0x3326b8 构造包装 A" },
-        { 0x37621c,  0xF81E0FF3u, "0x37621c 构造包装 B" },
-        { 0x40df2c,  0xF81E0FF3u, "0x40df2c 构造包装 C" },
-        { 0x41c728,  0xF81E0FF3u, "0x41c728 构造包装 D" },
-        { 0x54f204,  0xA9BE4FF4u, "0x54f204 构造包装 E" },
+    static const struct { uint64_t off; uint32_t first; int mode; const char *name; } kEnt[] = {
+        { 0x105f9e4, 0xF81E0FF3u, 1, "0x105f9e4 就地构造【np299 对照：无条件 ret】" },
+        { 0x45f9c8,  0xF81E0FF3u, 0, "0x45f9c8 类构造器" },
+        { 0x3326b8,  0xF81E0FF3u, 0, "0x3326b8 构造包装 A" },
+        { 0x37621c,  0xF81E0FF3u, 0, "0x37621c 构造包装 B" },
+        { 0x40df2c,  0xF81E0FF3u, 0, "0x40df2c 构造包装 C" },
+        { 0x41c728,  0xF81E0FF3u, 0, "0x41c728 构造包装 D" },
+        { 0x54f204,  0xA9BE4FF4u, 0, "0x54f204 构造包装 E" },
     };
     module_t *mm = NULL;
     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mm = &g_mod[i]; break; }
@@ -580,6 +580,10 @@ static void guest_null_tolerant_ctor(void) {
         uint8_t *fn = mm->base + kEnt[i].off;
         if (*(volatile uint32_t *)fn != kEnt[i].first) {
             LOG("【红】空指针保护 %s：原值 %#x ≠ 期望 %#x，跳过", kEnt[i].name, *(volatile uint32_t *)fn, kEnt[i].first);
+            continue;
+        }
+        if (kEnt[i].mode == 1) {   // np297 对照实验：无条件 ret（不占空穴）
+            guest_patch32((uint32_t *)fn, kEnt[i].first, 0xD65F03C0u, kEnt[i].name);
             continue;
         }
         if (*(uint32_t *)stub) { LOG("【红】空指针保护 %s：空穴槽已被占用，跳过", kEnt[i].name); continue; }
@@ -614,8 +618,8 @@ static void guest_libc_hook(void) {
     // 而 5711 个调用方**一律不判空**（崩点 main+0xba5ac8 就是 this=0 去写 vptr）。
     // 把 ① 改成无条件 `b 0x9f3444`，三条路就都收敛到客体自己的 malloc（np292 已放开它的门）。
     // 释放侧 0x9f36a0 **不接分配器参数**，而是 `bl 0xa0dfcc` 按指针反查归属分配器 ⇒ 分配/释放仍配对。
-    guest_patch32((uint32_t *)(mm->base + 0x9f3410), 0xB40001A0u, 0x1400000Du,
-                  "0x9f33f0 恒走标准分配器（cbz x0 → b）");
+    // np300：`0x9f3410` 的补丁已改为离线（vk-spike/s3/fixup.py），运行时不再重复打。
+    // 运行时只保留一类补丁：需要**宿主函数地址**的改跳（装载期才知道地址）。
 
     // np294：客体自己的 malloc 接宿主堆。
     // 实测（np293 真机）：这条路上 StandardAllocator(main+0x22d71e8).Allocate(0x100) 返回
@@ -661,7 +665,7 @@ void load_modules(const char *dir, const char **names, int n) {
     force_init();
     t = now_ns(); for (int i = 0; i < g_nmod; i++) relocate(&g_mod[i]); tr = now_ns() - t;
     force_check();
-    guest_null_tolerant_ctor();   // np296
+    // np300：空指针保护已改为**离线**写进产物（vk-spike/s3/fixup.py），运行时不再重复打。
     guest_libc_hook();   // np292：扮演 rtld 装 libc 初始化 hook（必须在跑各模块 inits 之前） | np292: play rtld installing the libc init hook (must be before running module inits)
     { void hlecount_seal(void); hlecount_seal(); }   // DM_HLECOUNT：重定位完成，计数桩页封成只读可执行 | DM_HLECOUNT: relocation done, seal the counting stub pages as read-only executable
     if (getenv("DM_SYMCHECK")) LOG("DM_SYMCHECK：装载期共核 %lu 次符号查询，哈希与线性不一致 %lu", g_symchk_n, g_symchk_bad);

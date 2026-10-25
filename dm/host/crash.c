@@ -384,6 +384,29 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
         }
     }
     fprintf(stderr, "\n");
+    // np298：**无条件**把空穴桩与被打补丁的入口读回来。
+    // 为什么放顶层：原来塞在 `if (mm && mm->size > 0x2280000)` 里，实测那个分支没进
+    // （日志里连 np295/np294 都没打），所以先无条件把 size 与内容一起打出来。
+    {
+        module_t *mm2 = NULL;
+        for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mm2 = &g_mod[i]; break; }
+        fprintf(stderr, " [np298 nmod=%d mm=%p size=%#zx]", g_nmod, (void *)mm2,
+                mm2 ? (size_t)mm2->size : (size_t)0);
+        if (mm2) {
+            uint64_t cave = (uint64_t)(uintptr_t)(mm2->base + 0x2404a70);
+            fprintf(stderr, " 空穴=");
+            for (int i = 0; i < 12; i++) fprintf(stderr, " %08x", *(volatile uint32_t *)(uintptr_t)(cave + i * 4));
+            fprintf(stderr, " | 入口 45f9c8=%08x 45f9cc=%08x 105f9e4=%08x",
+                    *(volatile uint32_t *)(uintptr_t)(mm2->base + 0x45f9c8),
+                    *(volatile uint32_t *)(uintptr_t)(mm2->base + 0x45f9cc),
+                    *(volatile uint32_t *)(uintptr_t)(mm2->base + 0x105f9e4));
+        }
+        fprintf(stderr, " | 原始 pc=%#llx 该处指令=%08x lr=%#llx",
+                (unsigned long long)UC_PC(uc),
+                *(volatile uint32_t *)(uintptr_t)UC_PC(uc),
+                (unsigned long long)UC_LR(uc));
+        fprintf(stderr, "\n");
+    }
     dm_backtrace(UC_FP(uc));
     if (g_dump_hook) g_dump_hook();
     _exit(128 + sig);
