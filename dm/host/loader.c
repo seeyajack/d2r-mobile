@@ -446,6 +446,39 @@ static void map_image(module_t *m, const char *dir) {
 }
 #endif
 
+// ---------- 扮演 rtld：装 libc 初始化 hook（np292） ----------
+// 客体自己的 malloc / calloc / realloc / free（main+0x9b27a0 / 0x9b2810 / 0x9b2888 / 0x9b28e4）
+// 第一步都是同一个门：`ldr x9,[main+0x22d7230]` → `cbz x9` 就直接返回 NULL。
+// 这 8 字节本该由 rtld / libc 初始化写好（真机上 rtld 在跑各模块 inits **之前**就做了），
+// 而宿主只调了 DT_INIT、没复刻那一步 ⇒ 客体自己的 malloc 族恒返回 NULL（np242 首次记下）。
+// np242 当时用「宿主顶替**导入**的 malloc」绕过，但客体内部**直接 bl 0x9b27a0** 的路径绕不过去
+// —— np291 的 this=0 崩点正是从这里来的：分配返回 0、调用方不判空直接写。
+// 四处读者全部只 `cbz` 判空、从不把它的值当函数指针用 ⇒ 写任意非零即可，写 1 最安全。
+// 装好之后客体 malloc 走它自己的 nn::mem::StandardAllocator（main+0x22d71e8，3110 MB 客堆），
+// 这才是这套客体地址空间设计本来的样子；宿主顶替的导入版留给 rtld 自己的早期分配。
+// ---------- Playing rtld: install the libc init hook (np292) ----------
+// The guest's own malloc / calloc / realloc / free (main+0x9b27a0 / 0x9b2810 / 0x9b2888 / 0x9b28e4)
+// all start with the same gate: `ldr x9,[main+0x22d7230]` -> `cbz x9` returns NULL right away.
+// Those 8 bytes are supposed to be written by rtld / libc init (on the real device rtld does it
+// **before** running each module's inits), but the host only calls DT_INIT and never replicated that
+// step, so the guest's own malloc family always returns NULL (first recorded in np242).
+// np242 worked around it by having the host provide the **imported** malloc, but paths that
+// **bl 0x9b27a0 directly** inside the guest cannot be bypassed that way -- and that is exactly where
+// np291's this=0 crash comes from: the allocation returns 0 and the caller writes through it unchecked.
+// All four readers only `cbz`-test it and never use its value as a function pointer, so any non-zero
+// works; 1 is the safest. Once installed, the guest's malloc uses its own nn::mem::StandardAllocator
+// (main+0x22d71e8, the 3110 MB guest heap), which is what this guest address-space design intends;
+// the host-provided imported malloc stays for rtld's own early allocations.
+static void guest_libc_hook(void) {
+    module_t *mm = NULL;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mm = &g_mod[i]; break; }
+    if (!mm || mm->size <= 0x22d7238) return;
+    volatile uint64_t *hook = (volatile uint64_t *)(mm->base + 0x22d7230);
+    if (*hook) { LOG("libc hook 已有值 %#llx，不动", (unsigned long long)*hook); return; }
+    *hook = 1;
+    LOG("装 libc 初始化 hook（main+0x22d7230 = 1）：客体自己的 malloc/calloc/realloc/free 从此可用");
+}
+
 void load_modules(const char *dir, const char **names, int n) {
     // 先全部映射并解析符号表，再统一重定位（跨模块符号要先都在位）
     // DM_BOOTPROF：① 宿主装载细分（毫秒），定 ③ 预重定位 / mmap 的上限
@@ -470,6 +503,7 @@ void load_modules(const char *dir, const char **names, int n) {
     force_init();
     t = now_ns(); for (int i = 0; i < g_nmod; i++) relocate(&g_mod[i]); tr = now_ns() - t;
     force_check();
+    guest_libc_hook();   // np292：扮演 rtld 装 libc 初始化 hook（必须在跑各模块 inits 之前） | np292: play rtld installing the libc init hook (must be before running module inits)
     { void hlecount_seal(void); hlecount_seal(); }   // DM_HLECOUNT：重定位完成，计数桩页封成只读可执行 | DM_HLECOUNT: relocation done, seal the counting stub pages as read-only executable
     if (getenv("DM_SYMCHECK")) LOG("DM_SYMCHECK：装载期共核 %lu 次符号查询，哈希与线性不一致 %lu", g_symchk_n, g_symchk_bad);
     if (g_flag.bootprof) LOG("① 细分：映射（读 + 拷 + 封页）%.1f ms、解析动态段 %.1f ms、门注册 %.1f ms、重定位 + 强制接管 %.1f ms，合计 %.1f ms",

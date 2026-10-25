@@ -290,6 +290,62 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
                     fprintf(stderr, " [主堆%s：总量 %llu MB、余量 %llu MB、最大可分配块 %llu KB]\n",
                             fresh ? "（实时）" : "（上次读数）", h[0], h[1], h[2]);
                 }
+                // np290：崩点链 0x634fa0 → 0x9f33f0 → … → 0xba5aa4 里，0x9f33f0 走的是
+                // "用调用方传进来的分配器"（np289 已排除另两条）。分配器疑似就是最后设进
+                // TLS slot=4 的那个指针，把它指向的对象前 0x40 字节打出来，
+                // 和日志里的 MemoryPool 地址比对：是池 ⇒ 类型/生命周期问题；不是 ⇒ 另一类对象。
+                {
+                    uint64_t dm_last_tls4(void);
+                    uint64_t a = dm_last_tls4();
+                    fprintf(stderr, " [TLS slot=4 最后值 = %#llx", (unsigned long long)a);
+                    if (a > 0xffff) {
+                        volatile uint64_t *q = (volatile uint64_t *)(uintptr_t)a;
+                        fprintf(stderr, "，对象前 0x100 字节：");
+                        for (int i = 0; i < 32; i++) fprintf(stderr, " %#llx", (unsigned long long)q[i]);
+                    }
+                    fprintf(stderr, " ]\n");
+                }
+                // np291：把客体 0xa0e2f8「取线程默认分配器」整条复刻一遍，再看分配器的虚表。
+                // 0x9f33f0 的判据是 `cbnz x1`：x1==0（默认参数）才走这里，取到的分配器再被
+                // `ldr x8,[x1]; ldr x3,[x8,#0x30]; br x3` 调它的第 7 个虚函数。this=0 只能是
+                // 这条返回 0 —— 所以必须看清它取到了什么、那张表的 +0x30 是什么。
+                //   0xa0e2f8: x8 = *(main+0x22783d8); x8 = *(x8); slot = *(u32*)(x8+0x88)
+                //             tls = GetTlsValue(slot)
+                //             alloc = tls ? *(tls+0xb0) : *(*(main+0x226f0a0) + 8)
+                {
+                    uint64_t dm_tlsval(unsigned slot);
+                    uint64_t desc = *(volatile uint64_t *)(mm->base + 0x22783d8);
+                    fprintf(stderr, " [np291 分配器链：desc=%#llx", (unsigned long long)desc);
+                    unsigned slot = 0xffffffffu;
+                    uint64_t tls = 0;
+                    if (desc > 0xffff) {
+                        uint64_t o = *(volatile uint64_t *)(uintptr_t)desc;
+                        if (o > 0xffff) {
+                            slot = *(volatile uint32_t *)(uintptr_t)(o + 0x88);
+                            tls = dm_tlsval(slot);
+                            fprintf(stderr, " tlsobj=%#llx slot=%u tls=%#llx", (unsigned long long)o, slot,
+                                    (unsigned long long)tls);
+                        }
+                    }
+                    uint64_t gv = *(volatile uint64_t *)(mm->base + 0x226f0a0);
+                    uint64_t gvptr = gv > 0xffff ? *(volatile uint64_t *)(uintptr_t)gv : 0;
+                    uint64_t alloc = 0;
+                    if (tls > 0xffff) alloc = *(volatile uint64_t *)(uintptr_t)(tls + 0xb0);
+                    else if (gvptr > 0xffff) alloc = *(volatile uint64_t *)(uintptr_t)(gvptr + 8);
+                    fprintf(stderr, " gv=%#llx gvptr=%#llx => alloc=%#llx",
+                            (unsigned long long)gv, (unsigned long long)gvptr, (unsigned long long)alloc);
+                    if (alloc > 0xffff) {
+                        uint64_t vt = *(volatile uint64_t *)(uintptr_t)alloc;
+                        fprintf(stderr, " vt=%#llx(main+%#llx)", (unsigned long long)vt,
+                                (unsigned long long)(vt - (uint64_t)(uintptr_t)mm->base));
+                        if (vt > 0xffff) {
+                            volatile uint64_t *v = (volatile uint64_t *)(uintptr_t)vt;
+                            fprintf(stderr, " vt[0..7]=");
+                            for (int i = 0; i < 8; i++) fprintf(stderr, " %#llx", (unsigned long long)v[i]);
+                        }
+                    }
+                    fprintf(stderr, " ]\n");
+                }
                 if (obj) {
                     uint64_t vt = *(volatile uint64_t *)(uintptr_t)obj;
                     if (vt) fprintf(stderr, " vt0=main+%#llx vt1=main+%#llx]\n",

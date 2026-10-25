@@ -328,6 +328,7 @@ HLE_FORCE("_ZN2nn2os18AttachSharedMemoryEPNS0_16SharedMemoryTypeEmjb",
 // separate namespace so nothing collides.
 #define TLS_MAX 128
 static __thread uint64_t g_tlsval[TLS_MAX];   // np286：线程局部值（每线程一份）
+static _Atomic uint64_t g_last_tls4;     // np290：最后设进 slot=4 的值（分配器），崩时诊断用
 static pthread_key_t g_tls_key[TLS_MAX];
 static uint8_t g_tls_ok[TLS_MAX];      // pthread key 已建
 static uint8_t g_tls_alloc[TLS_MAX];   // 已通过 AllocateTlsSlot 交给客体
@@ -352,13 +353,15 @@ HLE_FORCE("_ZN2nn2os11GetTlsValueENS0_7TlsSlotE",
     // 客体这条路径走的是我们的 HLE（真机日志为证），用独立数组读写必然一致，也不踩任何系统键。
     uint64_t v = (slot < TLS_MAX) ? g_tlsval[slot] : 0;
     // np285：这条链是 this=0 的源头（0xa0e2f8 用它取默认分配器），必须看清谁在设/取
-    if (g_flag.imports) { static int n; if (n++ < 24) LOG("os GetTlsValue(slot=%u) -> %#llx", slot, (unsigned long long)v); }
+    if (g_flag.imports) { static int n; if (n++ < 2000) LOG("os GetTlsValue(slot=%u) -> %#llx", slot, (unsigned long long)v); }
     return v;
 }
 HLE_FORCE("_ZN2nn2os11SetTlsValueENS0_7TlsSlotEm",
           "设线程本地值", void, h_os_SetTls, unsigned slot, uint64_t v) {
     if (slot < TLS_MAX) g_tlsval[slot] = v;
-    if (g_flag.imports) { static int n; if (n++ < 24) LOG("os SetTlsValue(slot=%u, %#llx)", slot, (unsigned long long)v); }
+    // np290：记下最后设进 TLS 的指针（slot=4 实测是"当前分配器"），崩时打它的对象内容用
+    if (slot == 4) g_last_tls4 = v;
+    if (g_flag.imports) { static int n; if (n++ < 2000) LOG("os SetTlsValue(slot=%u, %#llx)", slot, (unsigned long long)v); }
 }
 HLE_FORCE("_ZN2nn2os15AllocateTlsSlotEPNS0_7TlsSlotEPFvmE",
           "分配一个 TLS 槽：惰性建 pthread key，槽号就是下标（客体当 TlsSlot 枚举用）",
@@ -389,3 +392,10 @@ HLE_FORCE("_ZN2nn2os19GetUsedTlsSlotCountEv", "已用 TLS 槽数", int, h_os_Tls
 HLE_FORCE("_ZNSt3__118__nx_get_tls_valueEN2nn2os7TlsSlotE",
           "libc++ 的 TLS 取值入口（与 nn::os::GetTlsValue 同义）",
           uint64_t, h_nx_GetTls, unsigned slot) { return h_os_GetTls(slot); }
+
+// np290：崩时诊断用 —— 最后设进 TLS slot=4 的值（实测是"当前分配器"）
+uint64_t dm_last_tls4(void) { return atomic_load(&g_last_tls4); }
+
+// np291：崩时复刻客体 0xa0e2f8「取线程默认分配器」用。崩溃发生在客体主线程（= 跑 dm_main 的
+// 宿主线程），所以直接读本线程的 g_tlsval 与客体看到的是同一份。
+uint64_t dm_tlsval(unsigned slot) { return slot < TLS_MAX ? g_tlsval[slot] : 0; }
