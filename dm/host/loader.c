@@ -641,6 +641,31 @@ static void guest_libc_hook(void) {
     guest_redirect(mm->base + 0x9b2888, (void *)(uintptr_t)&realloc, 0xA9BF7BFDu, "客体 realloc");
 }
 
+// np301：装载后**主动清 icache**。
+// 现象（真机四次对照）：补丁已写进产物文件、运行时读内存也是补丁后的值（`0x45f9c8 = d65f03c0`），
+// 但执行流照样按**旧指令**走（`pc` 落在只有顺序流入才能到达的 `0x45f9dc`，而入口已是 `ret`；
+// 全模块扫过 b/b.cond/cbz/tbz，没有任何分支跳进中段）。
+// 唯一自洽解释：**icache 里还是上一次运行的旧条目** —— 客体代码每次都 mmap 到同一虚拟地址，
+// aarch64 允许 munmap 后重新映射同 VA 时 icache 残留，软件必须自己清。
+// 这也解释了"有的补丁生效、有的不生效"：取决于那些 cache line 上次有没有被取过。
+// 所以：**装载完成后，对所有离线补丁点所在的 cache line 各刷一次**（只刷补丁点，不刷整段，
+// 避免 23MB text 全刷带来的启动开销）。
+static void guest_flush_icache(void) {
+    static const uint64_t kOff[] = {
+        0x9f3410,   // np293 0x9f33f0 收敛
+        0x105f9e4, 0x45f9c8, 0x3326b8, 0x37621c, 0x40df2c, 0x41c728, 0x54f204,   // np296 空指针保护
+    };
+    module_t *mm = NULL;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mm = &g_mod[i]; break; }
+    if (!mm) return;
+    for (unsigned i = 0; i < sizeof kOff / sizeof kOff[0]; i++) {
+        uint8_t *a = mm->base + kOff[i];
+        uint8_t *lo = (uint8_t *)((uintptr_t)a & ~(uintptr_t)63);   // cache line 对齐（aarch64 通常 64B）
+        __builtin___clear_cache((char *)lo, (char *)lo + 64);
+    }
+    LOG("已清 %u 个补丁点的 icache（np301）", (unsigned)(sizeof kOff / sizeof kOff[0]));
+}
+
 void load_modules(const char *dir, const char **names, int n) {
     // 先全部映射并解析符号表，再统一重定位（跨模块符号要先都在位）
     // DM_BOOTPROF：① 宿主装载细分（毫秒），定 ③ 预重定位 / mmap 的上限
@@ -669,6 +694,7 @@ void load_modules(const char *dir, const char **names, int n) {
     guest_libc_hook();   // np292：扮演 rtld 装 libc 初始化 hook（必须在跑各模块 inits 之前） | np292: play rtld installing the libc init hook (must be before running module inits)
     { void hlecount_seal(void); hlecount_seal(); }   // DM_HLECOUNT：重定位完成，计数桩页封成只读可执行 | DM_HLECOUNT: relocation done, seal the counting stub pages as read-only executable
     if (getenv("DM_SYMCHECK")) LOG("DM_SYMCHECK：装载期共核 %lu 次符号查询，哈希与线性不一致 %lu", g_symchk_n, g_symchk_bad);
+    guest_flush_icache();   // np301：离线补丁写进产物后，装载完必须清 icache（否则可能执行旧指令）
     if (g_flag.bootprof) LOG("① 细分：映射（读 + 拷 + 封页）%.1f ms、解析动态段 %.1f ms、门注册 %.1f ms、重定位 + 强制接管 %.1f ms，合计 %.1f ms",
                              tm / 1e6, tp / 1e6, tg / 1e6, tr / 1e6, (now_ns() - t0) / 1e6);
 }
