@@ -135,7 +135,10 @@ HLE("setlocale", char *, h_setlocale, int category, const char *locale) {
 // newlocale / uselocale / freelocale：同一族，一并接上（掩码同样换算）
 HLE("newlocale", void *, h_newlocale, int mask, const char *name, void *base) {
     if ((unsigned)mask == 0x7fffffff) mask = LC_ALL_MASK;
-    return newlocale(mask, name, base);
+    void *r = newlocale(mask, name, base);
+    // np302：locale 句柄为 0 时客体不一定判空（np240 曾在同族上栽过：把 -1 当 locale 指针 memset）
+    if (!r) LOG("【红】newlocale(%#x, %s)：宿主 libc 返回 NULL（客体若不判空必崩）", mask, name ? name : "(null)");
+    return r;
 }
 HLE("uselocale", void *, h_uselocale, void *l) { return uselocale(l); }
 HLE("freelocale", void, h_freelocale, void *l) { freelocale(l); }
@@ -285,12 +288,17 @@ HLE_FORCE("_ZN2nn2os15MapSharedMemoryEPNS0_16SharedMemoryTypeENS0_16MemoryPermis
     (void)perm;
     int i = shm_find(type);
     void *p = (i >= 0) ? g_shm[i].mem : NULL;
-    if (g_flag.imports) LOG("os MapSharedMemory(%p) -> %p%s", type, p, i >= 0 ? "" : "（边表里没有，返回 NULL）");
+    // np302：返回 NULL 时**无条件报红** —— 客体拿到 0 会直接当映射基址用（普遍不判空），
+    // 崩在几百毫秒后的别处，现场与原因隔着十几层。这一句是把"沉默"变"当场带名字"。
+    if (!p) LOG("【红】os MapSharedMemory(%p)：边表里没有这块 ⇒ 返回 NULL（客体若不判空必崩）", type);
+    else if (g_flag.imports) LOG("os MapSharedMemory(%p) -> %p", type, p);
     return p;
 }
 HLE_FORCE("_ZN2nn2os22GetSharedMemoryAddressEPKNS0_16SharedMemoryTypeE",
           "取共享内存地址（与 MapSharedMemory 同一份）", void *, h_os_ShmAddr, const void *type) {
-    int i = shm_find(type); return (i >= 0) ? g_shm[i].mem : NULL;
+    int i = shm_find(type);
+    if (i < 0) { LOG("【红】os GetSharedMemoryAddress(%p)：边表里没有 ⇒ 返回 NULL", type); return NULL; }
+    return g_shm[i].mem;
 }
 HLE_FORCE("_ZN2nn2os21GetSharedMemoryHandleEPKNS0_16SharedMemoryTypeE",
           "取共享内存句柄：给一个稳定假句柄（对端 Attach 用）", uint32_t, h_os_ShmHandle, const void *type) {
