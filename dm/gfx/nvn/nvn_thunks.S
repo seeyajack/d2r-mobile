@@ -13,6 +13,9 @@ _nvnth_0:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #0]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_1
@@ -23,6 +26,9 @@ _nvnth_1:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #8]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_2
@@ -33,6 +39,9 @@ _nvnth_2:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #16]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_3
@@ -43,6 +52,9 @@ _nvnth_3:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #24]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_4
@@ -53,6 +65,9 @@ _nvnth_4:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #32]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_5
@@ -63,6 +78,9 @@ _nvnth_5:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #40]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_6
@@ -73,6 +91,9 @@ _nvnth_6:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #48]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_7
@@ -83,6 +104,9 @@ _nvnth_7:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #56]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_8
@@ -93,6 +117,9 @@ _nvnth_8:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #64]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_9
@@ -103,6 +130,9 @@ _nvnth_9:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #72]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_10
@@ -113,6 +143,9 @@ _nvnth_10:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #80]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_11
@@ -123,6 +156,9 @@ _nvnth_11:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #88]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_12
@@ -133,6 +169,9 @@ _nvnth_12:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #96]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_13
@@ -143,6 +182,9 @@ _nvnth_13:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #104]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_14
@@ -153,6 +195,9 @@ _nvnth_14:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #112]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_15
@@ -163,6 +208,9 @@ _nvnth_15:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #120]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_16
@@ -173,6 +221,9 @@ _nvnth_16:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #128]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_17
@@ -183,6 +234,9 @@ _nvnth_17:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #136]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_18
@@ -193,6 +247,9 @@ _nvnth_18:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #144]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_19
@@ -203,6 +260,9 @@ _nvnth_19:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #152]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_20
@@ -213,6 +273,9 @@ _nvnth_20:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #160]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_21
@@ -223,6 +286,9 @@ _nvnth_21:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #168]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_22
@@ -233,6 +299,9 @@ _nvnth_22:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #176]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_23
@@ -243,6 +312,9 @@ _nvnth_23:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #184]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_24
@@ -253,6 +325,9 @@ _nvnth_24:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #192]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_25
@@ -263,6 +338,9 @@ _nvnth_25:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #200]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_26
@@ -273,6 +351,9 @@ _nvnth_26:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #208]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_27
@@ -283,6 +364,9 @@ _nvnth_27:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #216]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_28
@@ -293,6 +377,9 @@ _nvnth_28:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #224]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_29
@@ -303,6 +390,9 @@ _nvnth_29:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #232]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_30
@@ -313,6 +403,9 @@ _nvnth_30:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #240]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_31
@@ -323,6 +416,9 @@ _nvnth_31:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #248]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_32
@@ -333,6 +429,9 @@ _nvnth_32:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #256]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_33
@@ -343,6 +442,9 @@ _nvnth_33:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #264]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_34
@@ -353,6 +455,9 @@ _nvnth_34:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #272]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_35
@@ -363,6 +468,9 @@ _nvnth_35:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #280]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_36
@@ -373,6 +481,9 @@ _nvnth_36:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #288]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_37
@@ -383,6 +494,9 @@ _nvnth_37:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #296]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_38
@@ -393,6 +507,9 @@ _nvnth_38:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #304]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_39
@@ -403,6 +520,9 @@ _nvnth_39:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #312]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_40
@@ -413,6 +533,9 @@ _nvnth_40:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #320]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_41
@@ -423,6 +546,9 @@ _nvnth_41:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #328]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_42
@@ -433,6 +559,9 @@ _nvnth_42:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #336]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_43
@@ -443,6 +572,9 @@ _nvnth_43:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #344]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_44
@@ -453,6 +585,9 @@ _nvnth_44:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #352]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_45
@@ -463,6 +598,9 @@ _nvnth_45:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #360]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_46
@@ -473,6 +611,9 @@ _nvnth_46:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #368]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_47
@@ -483,6 +624,9 @@ _nvnth_47:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #376]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_48
@@ -493,6 +637,9 @@ _nvnth_48:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #384]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_49
@@ -503,6 +650,9 @@ _nvnth_49:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #392]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_50
@@ -513,6 +663,9 @@ _nvnth_50:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #400]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_51
@@ -523,6 +676,9 @@ _nvnth_51:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #408]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_52
@@ -533,6 +689,9 @@ _nvnth_52:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #416]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_53
@@ -543,6 +702,9 @@ _nvnth_53:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #424]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_54
@@ -553,6 +715,9 @@ _nvnth_54:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #432]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_55
@@ -563,6 +728,9 @@ _nvnth_55:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #440]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_56
@@ -573,6 +741,9 @@ _nvnth_56:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #448]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_57
@@ -583,6 +754,9 @@ _nvnth_57:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #456]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_58
@@ -593,6 +767,9 @@ _nvnth_58:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #464]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_59
@@ -603,6 +780,9 @@ _nvnth_59:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #472]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_60
@@ -613,6 +793,9 @@ _nvnth_60:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #480]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_61
@@ -623,6 +806,9 @@ _nvnth_61:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #488]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_62
@@ -633,6 +819,9 @@ _nvnth_62:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #496]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_63
@@ -643,6 +832,9 @@ _nvnth_63:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #504]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_64
@@ -653,6 +845,9 @@ _nvnth_64:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #512]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_65
@@ -663,6 +858,9 @@ _nvnth_65:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #520]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_66
@@ -673,6 +871,9 @@ _nvnth_66:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #528]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_67
@@ -683,6 +884,9 @@ _nvnth_67:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #536]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_68
@@ -693,6 +897,9 @@ _nvnth_68:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #544]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_69
@@ -703,6 +910,9 @@ _nvnth_69:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #552]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_70
@@ -713,6 +923,9 @@ _nvnth_70:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #560]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_71
@@ -723,6 +936,9 @@ _nvnth_71:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #568]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_72
@@ -733,6 +949,9 @@ _nvnth_72:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #576]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_73
@@ -743,6 +962,9 @@ _nvnth_73:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #584]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_74
@@ -753,6 +975,9 @@ _nvnth_74:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #592]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_75
@@ -763,6 +988,9 @@ _nvnth_75:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #600]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_76
@@ -773,6 +1001,9 @@ _nvnth_76:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #608]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_77
@@ -783,6 +1014,9 @@ _nvnth_77:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #616]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_78
@@ -793,6 +1027,9 @@ _nvnth_78:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #624]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_79
@@ -803,6 +1040,9 @@ _nvnth_79:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #632]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_80
@@ -813,6 +1053,9 @@ _nvnth_80:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #640]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_81
@@ -823,6 +1066,9 @@ _nvnth_81:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #648]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_82
@@ -833,6 +1079,9 @@ _nvnth_82:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #656]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_83
@@ -843,6 +1092,9 @@ _nvnth_83:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #664]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_84
@@ -853,6 +1105,9 @@ _nvnth_84:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #672]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_85
@@ -863,6 +1118,9 @@ _nvnth_85:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #680]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_86
@@ -873,6 +1131,9 @@ _nvnth_86:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #688]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_87
@@ -883,6 +1144,9 @@ _nvnth_87:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #696]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_88
@@ -893,6 +1157,9 @@ _nvnth_88:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #704]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_89
@@ -903,6 +1170,9 @@ _nvnth_89:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #712]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_90
@@ -913,6 +1183,9 @@ _nvnth_90:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #720]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_91
@@ -923,6 +1196,9 @@ _nvnth_91:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #728]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_92
@@ -933,6 +1209,9 @@ _nvnth_92:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #736]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_93
@@ -943,6 +1222,9 @@ _nvnth_93:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #744]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_94
@@ -953,6 +1235,9 @@ _nvnth_94:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #752]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_95
@@ -963,6 +1248,9 @@ _nvnth_95:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #760]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_96
@@ -973,6 +1261,9 @@ _nvnth_96:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #768]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_97
@@ -983,6 +1274,9 @@ _nvnth_97:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #776]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_98
@@ -993,6 +1287,9 @@ _nvnth_98:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #784]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_99
@@ -1003,6 +1300,9 @@ _nvnth_99:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #792]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_100
@@ -1013,6 +1313,9 @@ _nvnth_100:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #800]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_101
@@ -1023,6 +1326,9 @@ _nvnth_101:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #808]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_102
@@ -1033,6 +1339,9 @@ _nvnth_102:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #816]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_103
@@ -1043,6 +1352,9 @@ _nvnth_103:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #824]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_104
@@ -1053,6 +1365,9 @@ _nvnth_104:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #832]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_105
@@ -1063,6 +1378,9 @@ _nvnth_105:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #840]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_106
@@ -1073,6 +1391,9 @@ _nvnth_106:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #848]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_107
@@ -1083,6 +1404,9 @@ _nvnth_107:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #856]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_108
@@ -1093,6 +1417,9 @@ _nvnth_108:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #864]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_109
@@ -1103,6 +1430,9 @@ _nvnth_109:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #872]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_110
@@ -1113,6 +1443,9 @@ _nvnth_110:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #880]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_111
@@ -1123,6 +1456,9 @@ _nvnth_111:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #888]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_112
@@ -1133,6 +1469,9 @@ _nvnth_112:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #896]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_113
@@ -1143,6 +1482,9 @@ _nvnth_113:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #904]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_114
@@ -1153,6 +1495,9 @@ _nvnth_114:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #912]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_115
@@ -1163,6 +1508,9 @@ _nvnth_115:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #920]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_116
@@ -1173,6 +1521,9 @@ _nvnth_116:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #928]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_117
@@ -1183,6 +1534,9 @@ _nvnth_117:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #936]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_118
@@ -1193,6 +1547,9 @@ _nvnth_118:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #944]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_119
@@ -1203,6 +1560,9 @@ _nvnth_119:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #952]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_120
@@ -1213,6 +1573,9 @@ _nvnth_120:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #960]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_121
@@ -1223,6 +1586,9 @@ _nvnth_121:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #968]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_122
@@ -1233,6 +1599,9 @@ _nvnth_122:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #976]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_123
@@ -1243,6 +1612,9 @@ _nvnth_123:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #984]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_124
@@ -1253,6 +1625,9 @@ _nvnth_124:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #992]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_125
@@ -1263,6 +1638,9 @@ _nvnth_125:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1000]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_126
@@ -1273,6 +1651,9 @@ _nvnth_126:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1008]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_127
@@ -1283,6 +1664,9 @@ _nvnth_127:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1016]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_128
@@ -1293,6 +1677,9 @@ _nvnth_128:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1024]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_129
@@ -1303,6 +1690,9 @@ _nvnth_129:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1032]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_130
@@ -1313,6 +1703,9 @@ _nvnth_130:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1040]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_131
@@ -1323,6 +1716,9 @@ _nvnth_131:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1048]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_132
@@ -1333,6 +1729,9 @@ _nvnth_132:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1056]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_133
@@ -1343,6 +1742,9 @@ _nvnth_133:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1064]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_134
@@ -1353,6 +1755,9 @@ _nvnth_134:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1072]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_135
@@ -1363,6 +1768,9 @@ _nvnth_135:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1080]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_136
@@ -1373,6 +1781,9 @@ _nvnth_136:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1088]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_137
@@ -1383,6 +1794,9 @@ _nvnth_137:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1096]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_138
@@ -1393,6 +1807,9 @@ _nvnth_138:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1104]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_139
@@ -1403,6 +1820,9 @@ _nvnth_139:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1112]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_140
@@ -1413,6 +1833,9 @@ _nvnth_140:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1120]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_141
@@ -1423,6 +1846,9 @@ _nvnth_141:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1128]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_142
@@ -1433,6 +1859,9 @@ _nvnth_142:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1136]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_143
@@ -1443,6 +1872,9 @@ _nvnth_143:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1144]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_144
@@ -1453,6 +1885,9 @@ _nvnth_144:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1152]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_145
@@ -1463,6 +1898,9 @@ _nvnth_145:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1160]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_146
@@ -1473,6 +1911,9 @@ _nvnth_146:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1168]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_147
@@ -1483,6 +1924,9 @@ _nvnth_147:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1176]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_148
@@ -1493,6 +1937,9 @@ _nvnth_148:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1184]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_149
@@ -1503,6 +1950,9 @@ _nvnth_149:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1192]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_150
@@ -1513,6 +1963,9 @@ _nvnth_150:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1200]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_151
@@ -1523,6 +1976,9 @@ _nvnth_151:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1208]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_152
@@ -1533,6 +1989,9 @@ _nvnth_152:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1216]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_153
@@ -1543,6 +2002,9 @@ _nvnth_153:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1224]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_154
@@ -1553,6 +2015,9 @@ _nvnth_154:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1232]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_155
@@ -1563,6 +2028,9 @@ _nvnth_155:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1240]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_156
@@ -1573,6 +2041,9 @@ _nvnth_156:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1248]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_157
@@ -1583,6 +2054,9 @@ _nvnth_157:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1256]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_158
@@ -1593,6 +2067,9 @@ _nvnth_158:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1264]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_159
@@ -1603,6 +2080,9 @@ _nvnth_159:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1272]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_160
@@ -1613,6 +2093,9 @@ _nvnth_160:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1280]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_161
@@ -1623,6 +2106,9 @@ _nvnth_161:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1288]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_162
@@ -1633,6 +2119,9 @@ _nvnth_162:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1296]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_163
@@ -1643,6 +2132,9 @@ _nvnth_163:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1304]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_164
@@ -1653,6 +2145,9 @@ _nvnth_164:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1312]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_165
@@ -1663,6 +2158,9 @@ _nvnth_165:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1320]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_166
@@ -1673,6 +2171,9 @@ _nvnth_166:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1328]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_167
@@ -1683,6 +2184,9 @@ _nvnth_167:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1336]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_168
@@ -1693,6 +2197,9 @@ _nvnth_168:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1344]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_169
@@ -1703,6 +2210,9 @@ _nvnth_169:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1352]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_170
@@ -1713,6 +2223,9 @@ _nvnth_170:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1360]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_171
@@ -1723,6 +2236,9 @@ _nvnth_171:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1368]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_172
@@ -1733,6 +2249,9 @@ _nvnth_172:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1376]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_173
@@ -1743,6 +2262,9 @@ _nvnth_173:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1384]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_174
@@ -1753,6 +2275,9 @@ _nvnth_174:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1392]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_175
@@ -1763,6 +2288,9 @@ _nvnth_175:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1400]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_176
@@ -1773,6 +2301,9 @@ _nvnth_176:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1408]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_177
@@ -1783,6 +2314,9 @@ _nvnth_177:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1416]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_178
@@ -1793,6 +2327,9 @@ _nvnth_178:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1424]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_179
@@ -1803,6 +2340,9 @@ _nvnth_179:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1432]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_180
@@ -1813,6 +2353,9 @@ _nvnth_180:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1440]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_181
@@ -1823,6 +2366,9 @@ _nvnth_181:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1448]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_182
@@ -1833,6 +2379,9 @@ _nvnth_182:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1456]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_183
@@ -1843,6 +2392,9 @@ _nvnth_183:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1464]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_184
@@ -1853,6 +2405,9 @@ _nvnth_184:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1472]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_185
@@ -1863,6 +2418,9 @@ _nvnth_185:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1480]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_186
@@ -1873,6 +2431,9 @@ _nvnth_186:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1488]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_187
@@ -1883,6 +2444,9 @@ _nvnth_187:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1496]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_188
@@ -1893,6 +2457,9 @@ _nvnth_188:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1504]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_189
@@ -1903,6 +2470,9 @@ _nvnth_189:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1512]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_190
@@ -1913,6 +2483,9 @@ _nvnth_190:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1520]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_191
@@ -1923,6 +2496,9 @@ _nvnth_191:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1528]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_192
@@ -1933,6 +2509,9 @@ _nvnth_192:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1536]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_193
@@ -1943,6 +2522,9 @@ _nvnth_193:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1544]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_194
@@ -1953,6 +2535,9 @@ _nvnth_194:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1552]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_195
@@ -1963,6 +2548,9 @@ _nvnth_195:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1560]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_196
@@ -1973,6 +2561,9 @@ _nvnth_196:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1568]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_197
@@ -1983,6 +2574,9 @@ _nvnth_197:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1576]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_198
@@ -1993,6 +2587,9 @@ _nvnth_198:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1584]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_199
@@ -2003,6 +2600,9 @@ _nvnth_199:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1592]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_200
@@ -2013,6 +2613,9 @@ _nvnth_200:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1600]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_201
@@ -2023,6 +2626,9 @@ _nvnth_201:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1608]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_202
@@ -2033,6 +2639,9 @@ _nvnth_202:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1616]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_203
@@ -2043,6 +2652,9 @@ _nvnth_203:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1624]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_204
@@ -2053,6 +2665,9 @@ _nvnth_204:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1632]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_205
@@ -2063,6 +2678,9 @@ _nvnth_205:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1640]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_206
@@ -2073,6 +2691,9 @@ _nvnth_206:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1648]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_207
@@ -2083,6 +2704,9 @@ _nvnth_207:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1656]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_208
@@ -2093,6 +2717,9 @@ _nvnth_208:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1664]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_209
@@ -2103,6 +2730,9 @@ _nvnth_209:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1672]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_210
@@ -2113,6 +2743,9 @@ _nvnth_210:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1680]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_211
@@ -2123,6 +2756,9 @@ _nvnth_211:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1688]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_212
@@ -2133,6 +2769,9 @@ _nvnth_212:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1696]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_213
@@ -2143,6 +2782,9 @@ _nvnth_213:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1704]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_214
@@ -2153,6 +2795,9 @@ _nvnth_214:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1712]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_215
@@ -2163,6 +2808,9 @@ _nvnth_215:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1720]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_216
@@ -2173,6 +2821,9 @@ _nvnth_216:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1728]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_217
@@ -2183,6 +2834,9 @@ _nvnth_217:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1736]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_218
@@ -2193,6 +2847,9 @@ _nvnth_218:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1744]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_219
@@ -2203,6 +2860,9 @@ _nvnth_219:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1752]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_220
@@ -2213,6 +2873,9 @@ _nvnth_220:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1760]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_221
@@ -2223,6 +2886,9 @@ _nvnth_221:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1768]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_222
@@ -2233,6 +2899,9 @@ _nvnth_222:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1776]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_223
@@ -2243,6 +2912,9 @@ _nvnth_223:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1784]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_224
@@ -2253,6 +2925,9 @@ _nvnth_224:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1792]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_225
@@ -2263,6 +2938,9 @@ _nvnth_225:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1800]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_226
@@ -2273,6 +2951,9 @@ _nvnth_226:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1808]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_227
@@ -2283,6 +2964,9 @@ _nvnth_227:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1816]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_228
@@ -2293,6 +2977,9 @@ _nvnth_228:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1824]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_229
@@ -2303,6 +2990,9 @@ _nvnth_229:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1832]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_230
@@ -2313,6 +3003,9 @@ _nvnth_230:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1840]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_231
@@ -2323,6 +3016,9 @@ _nvnth_231:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1848]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_232
@@ -2333,6 +3029,9 @@ _nvnth_232:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1856]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_233
@@ -2343,6 +3042,9 @@ _nvnth_233:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1864]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_234
@@ -2353,6 +3055,9 @@ _nvnth_234:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1872]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_235
@@ -2363,6 +3068,9 @@ _nvnth_235:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1880]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_236
@@ -2373,6 +3081,9 @@ _nvnth_236:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1888]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_237
@@ -2383,6 +3094,9 @@ _nvnth_237:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1896]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_238
@@ -2393,6 +3107,9 @@ _nvnth_238:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1904]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_239
@@ -2403,6 +3120,9 @@ _nvnth_239:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1912]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_240
@@ -2413,6 +3133,9 @@ _nvnth_240:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1920]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_241
@@ -2423,6 +3146,9 @@ _nvnth_241:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1928]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_242
@@ -2433,6 +3159,9 @@ _nvnth_242:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1936]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_243
@@ -2443,6 +3172,9 @@ _nvnth_243:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1944]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_244
@@ -2453,6 +3185,9 @@ _nvnth_244:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1952]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_245
@@ -2463,6 +3198,9 @@ _nvnth_245:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1960]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_246
@@ -2473,6 +3211,9 @@ _nvnth_246:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1968]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_247
@@ -2483,6 +3224,9 @@ _nvnth_247:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1976]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_248
@@ -2493,6 +3237,9 @@ _nvnth_248:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1984]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_249
@@ -2503,6 +3250,9 @@ _nvnth_249:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #1992]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_250
@@ -2513,6 +3263,9 @@ _nvnth_250:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2000]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_251
@@ -2523,6 +3276,9 @@ _nvnth_251:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2008]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_252
@@ -2533,6 +3289,9 @@ _nvnth_252:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2016]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_253
@@ -2543,6 +3302,9 @@ _nvnth_253:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2024]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_254
@@ -2553,6 +3315,9 @@ _nvnth_254:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2032]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_255
@@ -2563,6 +3328,9 @@ _nvnth_255:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2040]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_256
@@ -2573,6 +3341,9 @@ _nvnth_256:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2048]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_257
@@ -2583,6 +3354,9 @@ _nvnth_257:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2056]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_258
@@ -2593,6 +3367,9 @@ _nvnth_258:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2064]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_259
@@ -2603,6 +3380,9 @@ _nvnth_259:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2072]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_260
@@ -2613,6 +3393,9 @@ _nvnth_260:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2080]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_261
@@ -2623,6 +3406,9 @@ _nvnth_261:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2088]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_262
@@ -2633,6 +3419,9 @@ _nvnth_262:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2096]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_263
@@ -2643,6 +3432,9 @@ _nvnth_263:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2104]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_264
@@ -2653,6 +3445,9 @@ _nvnth_264:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2112]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_265
@@ -2663,6 +3458,9 @@ _nvnth_265:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2120]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_266
@@ -2673,6 +3471,9 @@ _nvnth_266:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2128]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_267
@@ -2683,6 +3484,9 @@ _nvnth_267:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2136]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_268
@@ -2693,6 +3497,9 @@ _nvnth_268:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2144]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_269
@@ -2703,6 +3510,9 @@ _nvnth_269:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2152]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_270
@@ -2713,6 +3523,9 @@ _nvnth_270:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2160]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_271
@@ -2723,6 +3536,9 @@ _nvnth_271:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2168]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_272
@@ -2733,6 +3549,9 @@ _nvnth_272:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2176]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_273
@@ -2743,6 +3562,9 @@ _nvnth_273:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2184]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_274
@@ -2753,6 +3575,9 @@ _nvnth_274:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2192]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_275
@@ -2763,6 +3588,9 @@ _nvnth_275:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2200]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_276
@@ -2773,6 +3601,9 @@ _nvnth_276:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2208]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_277
@@ -2783,6 +3614,9 @@ _nvnth_277:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2216]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_278
@@ -2793,6 +3627,9 @@ _nvnth_278:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2224]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_279
@@ -2803,6 +3640,9 @@ _nvnth_279:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2232]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_280
@@ -2813,6 +3653,9 @@ _nvnth_280:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2240]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_281
@@ -2823,6 +3666,9 @@ _nvnth_281:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2248]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_282
@@ -2833,6 +3679,9 @@ _nvnth_282:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2256]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_283
@@ -2843,6 +3692,9 @@ _nvnth_283:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2264]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_284
@@ -2853,6 +3705,9 @@ _nvnth_284:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2272]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_285
@@ -2863,6 +3718,9 @@ _nvnth_285:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2280]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_286
@@ -2873,6 +3731,9 @@ _nvnth_286:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2288]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_287
@@ -2883,6 +3744,9 @@ _nvnth_287:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2296]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_288
@@ -2893,6 +3757,9 @@ _nvnth_288:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2304]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_289
@@ -2903,6 +3770,9 @@ _nvnth_289:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2312]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_290
@@ -2913,6 +3783,9 @@ _nvnth_290:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2320]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_291
@@ -2923,6 +3796,9 @@ _nvnth_291:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2328]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_292
@@ -2933,6 +3809,9 @@ _nvnth_292:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2336]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_293
@@ -2943,6 +3822,9 @@ _nvnth_293:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2344]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_294
@@ -2953,6 +3835,9 @@ _nvnth_294:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2352]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_295
@@ -2963,6 +3848,9 @@ _nvnth_295:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2360]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_296
@@ -2973,6 +3861,9 @@ _nvnth_296:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2368]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_297
@@ -2983,6 +3874,9 @@ _nvnth_297:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2376]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_298
@@ -2993,6 +3887,9 @@ _nvnth_298:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2384]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_299
@@ -3003,6 +3900,9 @@ _nvnth_299:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2392]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_300
@@ -3013,6 +3913,9 @@ _nvnth_300:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2400]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_301
@@ -3023,6 +3926,9 @@ _nvnth_301:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2408]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_302
@@ -3033,6 +3939,9 @@ _nvnth_302:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2416]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_303
@@ -3043,6 +3952,9 @@ _nvnth_303:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2424]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_304
@@ -3053,6 +3965,9 @@ _nvnth_304:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2432]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_305
@@ -3063,6 +3978,9 @@ _nvnth_305:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2440]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_306
@@ -3073,6 +3991,9 @@ _nvnth_306:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2448]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_307
@@ -3083,6 +4004,9 @@ _nvnth_307:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2456]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_308
@@ -3093,6 +4017,9 @@ _nvnth_308:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2464]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_309
@@ -3103,6 +4030,9 @@ _nvnth_309:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2472]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_310
@@ -3113,6 +4043,9 @@ _nvnth_310:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2480]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_311
@@ -3123,6 +4056,9 @@ _nvnth_311:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2488]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_312
@@ -3133,6 +4069,9 @@ _nvnth_312:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2496]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_313
@@ -3143,6 +4082,9 @@ _nvnth_313:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2504]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_314
@@ -3153,6 +4095,9 @@ _nvnth_314:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2512]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_315
@@ -3163,6 +4108,9 @@ _nvnth_315:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2520]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_316
@@ -3173,6 +4121,9 @@ _nvnth_316:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2528]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_317
@@ -3183,6 +4134,9 @@ _nvnth_317:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2536]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_318
@@ -3193,6 +4147,9 @@ _nvnth_318:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2544]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_319
@@ -3203,6 +4160,9 @@ _nvnth_319:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2552]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_320
@@ -3213,6 +4173,9 @@ _nvnth_320:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2560]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_321
@@ -3223,6 +4186,9 @@ _nvnth_321:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2568]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_322
@@ -3233,6 +4199,9 @@ _nvnth_322:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2576]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_323
@@ -3243,6 +4212,9 @@ _nvnth_323:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2584]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_324
@@ -3253,6 +4225,9 @@ _nvnth_324:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2592]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_325
@@ -3263,6 +4238,9 @@ _nvnth_325:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2600]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_326
@@ -3273,6 +4251,9 @@ _nvnth_326:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2608]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_327
@@ -3283,6 +4264,9 @@ _nvnth_327:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2616]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_328
@@ -3293,6 +4277,9 @@ _nvnth_328:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2624]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_329
@@ -3303,6 +4290,9 @@ _nvnth_329:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2632]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_330
@@ -3313,6 +4303,9 @@ _nvnth_330:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2640]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_331
@@ -3323,6 +4316,9 @@ _nvnth_331:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2648]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_332
@@ -3333,6 +4329,9 @@ _nvnth_332:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2656]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_333
@@ -3343,6 +4342,9 @@ _nvnth_333:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2664]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_334
@@ -3353,6 +4355,9 @@ _nvnth_334:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2672]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_335
@@ -3363,6 +4368,9 @@ _nvnth_335:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2680]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_336
@@ -3373,6 +4381,9 @@ _nvnth_336:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2688]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_337
@@ -3383,6 +4394,9 @@ _nvnth_337:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2696]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_338
@@ -3393,6 +4407,9 @@ _nvnth_338:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2704]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_339
@@ -3403,6 +4420,9 @@ _nvnth_339:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2712]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_340
@@ -3413,6 +4433,9 @@ _nvnth_340:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2720]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_341
@@ -3423,6 +4446,9 @@ _nvnth_341:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2728]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_342
@@ -3433,6 +4459,9 @@ _nvnth_342:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2736]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_343
@@ -3443,6 +4472,9 @@ _nvnth_343:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2744]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_344
@@ -3453,6 +4485,9 @@ _nvnth_344:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2752]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_345
@@ -3463,6 +4498,9 @@ _nvnth_345:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2760]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_346
@@ -3473,6 +4511,9 @@ _nvnth_346:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2768]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_347
@@ -3483,6 +4524,9 @@ _nvnth_347:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2776]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_348
@@ -3493,6 +4537,9 @@ _nvnth_348:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2784]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_349
@@ -3503,6 +4550,9 @@ _nvnth_349:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2792]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_350
@@ -3513,6 +4563,9 @@ _nvnth_350:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2800]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_351
@@ -3523,6 +4576,9 @@ _nvnth_351:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2808]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_352
@@ -3533,6 +4589,9 @@ _nvnth_352:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2816]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_353
@@ -3543,6 +4602,9 @@ _nvnth_353:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2824]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_354
@@ -3553,6 +4615,9 @@ _nvnth_354:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2832]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_355
@@ -3563,6 +4628,9 @@ _nvnth_355:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2840]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_356
@@ -3573,6 +4641,9 @@ _nvnth_356:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2848]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_357
@@ -3583,6 +4654,9 @@ _nvnth_357:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2856]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_358
@@ -3593,6 +4667,9 @@ _nvnth_358:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2864]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_359
@@ -3603,6 +4680,9 @@ _nvnth_359:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2872]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_360
@@ -3613,6 +4693,9 @@ _nvnth_360:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2880]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_361
@@ -3623,6 +4706,9 @@ _nvnth_361:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2888]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_362
@@ -3633,6 +4719,9 @@ _nvnth_362:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2896]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_363
@@ -3643,6 +4732,9 @@ _nvnth_363:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2904]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_364
@@ -3653,6 +4745,9 @@ _nvnth_364:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2912]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_365
@@ -3663,6 +4758,9 @@ _nvnth_365:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2920]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_366
@@ -3673,6 +4771,9 @@ _nvnth_366:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2928]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_367
@@ -3683,6 +4784,9 @@ _nvnth_367:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2936]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_368
@@ -3693,6 +4797,9 @@ _nvnth_368:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2944]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_369
@@ -3703,6 +4810,9 @@ _nvnth_369:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2952]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_370
@@ -3713,6 +4823,9 @@ _nvnth_370:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2960]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_371
@@ -3723,6 +4836,9 @@ _nvnth_371:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2968]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_372
@@ -3733,6 +4849,9 @@ _nvnth_372:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2976]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_373
@@ -3743,6 +4862,9 @@ _nvnth_373:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2984]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_374
@@ -3753,6 +4875,9 @@ _nvnth_374:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #2992]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_375
@@ -3763,6 +4888,9 @@ _nvnth_375:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3000]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_376
@@ -3773,6 +4901,9 @@ _nvnth_376:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3008]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_377
@@ -3783,6 +4914,9 @@ _nvnth_377:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3016]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_378
@@ -3793,6 +4927,9 @@ _nvnth_378:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3024]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_379
@@ -3803,6 +4940,9 @@ _nvnth_379:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3032]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_380
@@ -3813,6 +4953,9 @@ _nvnth_380:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3040]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_381
@@ -3823,6 +4966,9 @@ _nvnth_381:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3048]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_382
@@ -3833,6 +4979,9 @@ _nvnth_382:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3056]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_383
@@ -3843,6 +4992,9 @@ _nvnth_383:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3064]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_384
@@ -3853,6 +5005,9 @@ _nvnth_384:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3072]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_385
@@ -3863,6 +5018,9 @@ _nvnth_385:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3080]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_386
@@ -3873,6 +5031,9 @@ _nvnth_386:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3088]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_387
@@ -3883,6 +5044,9 @@ _nvnth_387:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3096]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_388
@@ -3893,6 +5057,9 @@ _nvnth_388:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3104]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_389
@@ -3903,6 +5070,9 @@ _nvnth_389:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3112]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_390
@@ -3913,6 +5083,9 @@ _nvnth_390:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3120]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_391
@@ -3923,6 +5096,9 @@ _nvnth_391:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3128]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_392
@@ -3933,6 +5109,9 @@ _nvnth_392:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3136]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_393
@@ -3943,6 +5122,9 @@ _nvnth_393:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3144]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_394
@@ -3953,6 +5135,9 @@ _nvnth_394:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3152]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_395
@@ -3963,6 +5148,9 @@ _nvnth_395:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3160]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_396
@@ -3973,6 +5161,9 @@ _nvnth_396:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3168]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_397
@@ -3983,6 +5174,9 @@ _nvnth_397:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3176]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_398
@@ -3993,6 +5187,9 @@ _nvnth_398:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3184]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_399
@@ -4003,6 +5200,9 @@ _nvnth_399:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3192]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_400
@@ -4013,6 +5213,9 @@ _nvnth_400:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3200]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_401
@@ -4023,6 +5226,9 @@ _nvnth_401:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3208]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_402
@@ -4033,6 +5239,9 @@ _nvnth_402:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3216]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_403
@@ -4043,6 +5252,9 @@ _nvnth_403:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3224]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_404
@@ -4053,6 +5265,9 @@ _nvnth_404:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3232]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_405
@@ -4063,6 +5278,9 @@ _nvnth_405:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3240]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_406
@@ -4073,6 +5291,9 @@ _nvnth_406:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3248]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_407
@@ -4083,6 +5304,9 @@ _nvnth_407:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3256]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_408
@@ -4093,6 +5317,9 @@ _nvnth_408:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3264]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_409
@@ -4103,6 +5330,9 @@ _nvnth_409:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3272]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_410
@@ -4113,6 +5343,9 @@ _nvnth_410:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3280]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_411
@@ -4123,6 +5356,9 @@ _nvnth_411:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3288]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_412
@@ -4133,6 +5369,9 @@ _nvnth_412:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3296]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_413
@@ -4143,6 +5382,9 @@ _nvnth_413:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3304]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_414
@@ -4153,6 +5395,9 @@ _nvnth_414:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3312]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_415
@@ -4163,6 +5408,9 @@ _nvnth_415:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3320]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_416
@@ -4173,6 +5421,9 @@ _nvnth_416:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3328]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_417
@@ -4183,6 +5434,9 @@ _nvnth_417:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3336]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_418
@@ -4193,6 +5447,9 @@ _nvnth_418:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3344]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_419
@@ -4203,6 +5460,9 @@ _nvnth_419:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3352]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_420
@@ -4213,6 +5473,9 @@ _nvnth_420:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3360]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_421
@@ -4223,6 +5486,9 @@ _nvnth_421:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3368]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_422
@@ -4233,6 +5499,9 @@ _nvnth_422:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3376]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_423
@@ -4243,6 +5512,9 @@ _nvnth_423:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3384]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_424
@@ -4253,6 +5525,9 @@ _nvnth_424:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3392]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_425
@@ -4263,6 +5538,9 @@ _nvnth_425:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3400]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_426
@@ -4273,6 +5551,9 @@ _nvnth_426:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3408]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_427
@@ -4283,6 +5564,9 @@ _nvnth_427:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3416]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_428
@@ -4293,6 +5577,9 @@ _nvnth_428:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3424]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_429
@@ -4303,6 +5590,9 @@ _nvnth_429:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3432]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_430
@@ -4313,6 +5603,9 @@ _nvnth_430:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3440]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_431
@@ -4323,6 +5616,9 @@ _nvnth_431:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3448]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_432
@@ -4333,6 +5629,9 @@ _nvnth_432:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3456]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_433
@@ -4343,6 +5642,9 @@ _nvnth_433:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3464]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_434
@@ -4353,6 +5655,9 @@ _nvnth_434:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3472]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_435
@@ -4363,6 +5668,9 @@ _nvnth_435:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3480]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_436
@@ -4373,6 +5681,9 @@ _nvnth_436:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3488]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_437
@@ -4383,6 +5694,9 @@ _nvnth_437:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3496]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_438
@@ -4393,6 +5707,9 @@ _nvnth_438:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3504]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_439
@@ -4403,6 +5720,9 @@ _nvnth_439:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3512]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_440
@@ -4413,6 +5733,9 @@ _nvnth_440:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3520]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_441
@@ -4423,6 +5746,9 @@ _nvnth_441:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3528]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_442
@@ -4433,6 +5759,9 @@ _nvnth_442:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3536]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_443
@@ -4443,6 +5772,9 @@ _nvnth_443:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3544]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_444
@@ -4453,6 +5785,9 @@ _nvnth_444:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3552]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_445
@@ -4463,6 +5798,9 @@ _nvnth_445:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3560]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_446
@@ -4473,6 +5811,9 @@ _nvnth_446:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3568]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_447
@@ -4483,6 +5824,9 @@ _nvnth_447:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3576]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_448
@@ -4493,6 +5837,9 @@ _nvnth_448:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3584]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_449
@@ -4503,6 +5850,9 @@ _nvnth_449:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3592]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_450
@@ -4513,6 +5863,9 @@ _nvnth_450:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3600]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_451
@@ -4523,6 +5876,9 @@ _nvnth_451:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3608]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_452
@@ -4533,6 +5889,9 @@ _nvnth_452:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3616]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_453
@@ -4543,6 +5902,9 @@ _nvnth_453:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3624]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_454
@@ -4553,6 +5915,9 @@ _nvnth_454:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3632]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_455
@@ -4563,6 +5928,9 @@ _nvnth_455:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3640]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_456
@@ -4573,6 +5941,9 @@ _nvnth_456:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3648]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_457
@@ -4583,6 +5954,9 @@ _nvnth_457:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3656]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_458
@@ -4593,6 +5967,9 @@ _nvnth_458:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3664]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_459
@@ -4603,6 +5980,9 @@ _nvnth_459:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3672]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_460
@@ -4613,6 +5993,9 @@ _nvnth_460:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3680]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_461
@@ -4623,6 +6006,9 @@ _nvnth_461:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3688]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_462
@@ -4633,6 +6019,9 @@ _nvnth_462:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3696]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_463
@@ -4643,6 +6032,9 @@ _nvnth_463:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3704]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_464
@@ -4653,6 +6045,9 @@ _nvnth_464:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3712]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_465
@@ -4663,6 +6058,9 @@ _nvnth_465:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3720]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_466
@@ -4673,6 +6071,9 @@ _nvnth_466:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3728]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_467
@@ -4683,6 +6084,9 @@ _nvnth_467:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3736]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_468
@@ -4693,6 +6097,9 @@ _nvnth_468:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3744]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_469
@@ -4703,6 +6110,9 @@ _nvnth_469:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3752]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_470
@@ -4713,6 +6123,9 @@ _nvnth_470:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3760]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_471
@@ -4723,6 +6136,9 @@ _nvnth_471:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3768]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_472
@@ -4733,6 +6149,9 @@ _nvnth_472:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3776]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_473
@@ -4743,6 +6162,9 @@ _nvnth_473:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3784]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_474
@@ -4753,6 +6175,9 @@ _nvnth_474:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3792]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_475
@@ -4763,6 +6188,9 @@ _nvnth_475:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3800]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_476
@@ -4773,6 +6201,9 @@ _nvnth_476:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3808]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_477
@@ -4783,6 +6214,9 @@ _nvnth_477:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3816]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_478
@@ -4793,6 +6227,9 @@ _nvnth_478:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3824]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_479
@@ -4803,6 +6240,9 @@ _nvnth_479:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3832]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_480
@@ -4813,6 +6253,9 @@ _nvnth_480:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3840]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_481
@@ -4823,6 +6266,9 @@ _nvnth_481:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3848]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_482
@@ -4833,6 +6279,9 @@ _nvnth_482:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3856]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_483
@@ -4843,6 +6292,9 @@ _nvnth_483:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3864]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_484
@@ -4853,6 +6305,9 @@ _nvnth_484:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3872]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_485
@@ -4863,6 +6318,9 @@ _nvnth_485:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3880]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_486
@@ -4873,6 +6331,9 @@ _nvnth_486:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3888]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_487
@@ -4883,6 +6344,9 @@ _nvnth_487:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3896]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_488
@@ -4893,6 +6357,9 @@ _nvnth_488:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3904]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_489
@@ -4903,6 +6370,9 @@ _nvnth_489:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3912]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_490
@@ -4913,6 +6383,9 @@ _nvnth_490:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3920]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_491
@@ -4923,6 +6396,9 @@ _nvnth_491:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3928]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_492
@@ -4933,6 +6409,9 @@ _nvnth_492:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3936]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_493
@@ -4943,6 +6422,9 @@ _nvnth_493:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3944]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_494
@@ -4953,6 +6435,9 @@ _nvnth_494:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3952]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_495
@@ -4963,6 +6448,9 @@ _nvnth_495:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3960]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_496
@@ -4973,6 +6461,9 @@ _nvnth_496:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3968]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_497
@@ -4983,6 +6474,9 @@ _nvnth_497:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3976]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_498
@@ -4993,6 +6487,9 @@ _nvnth_498:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3984]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_499
@@ -5003,6 +6500,9 @@ _nvnth_499:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #3992]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_500
@@ -5013,6 +6513,9 @@ _nvnth_500:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4000]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_501
@@ -5023,6 +6526,9 @@ _nvnth_501:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4008]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_502
@@ -5033,6 +6539,9 @@ _nvnth_502:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4016]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_503
@@ -5043,6 +6552,9 @@ _nvnth_503:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4024]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_504
@@ -5053,6 +6565,9 @@ _nvnth_504:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4032]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_505
@@ -5063,6 +6578,9 @@ _nvnth_505:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4040]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_506
@@ -5073,6 +6591,9 @@ _nvnth_506:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4048]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_507
@@ -5083,6 +6604,9 @@ _nvnth_507:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4056]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_508
@@ -5093,6 +6617,9 @@ _nvnth_508:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4064]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_509
@@ -5103,6 +6630,9 @@ _nvnth_509:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4072]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_510
@@ -5113,6 +6643,9 @@ _nvnth_510:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4080]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_511
@@ -5123,6 +6656,9 @@ _nvnth_511:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4088]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_512
@@ -5133,6 +6669,9 @@ _nvnth_512:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4096]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_513
@@ -5143,6 +6682,9 @@ _nvnth_513:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4104]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_514
@@ -5153,6 +6695,9 @@ _nvnth_514:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4112]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_515
@@ -5163,6 +6708,9 @@ _nvnth_515:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4120]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_516
@@ -5173,6 +6721,9 @@ _nvnth_516:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4128]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_517
@@ -5183,6 +6734,9 @@ _nvnth_517:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4136]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_518
@@ -5193,6 +6747,9 @@ _nvnth_518:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4144]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_519
@@ -5203,6 +6760,9 @@ _nvnth_519:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4152]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_520
@@ -5213,6 +6773,9 @@ _nvnth_520:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4160]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_521
@@ -5223,6 +6786,9 @@ _nvnth_521:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4168]
     ldr x17, [x16, #8]
     br x17
     .globl _nvnth_522
@@ -5233,6 +6799,9 @@ _nvnth_522:
     add x16, x16, x17
     mov x17, #1
     stadd x17, [x16]
+    adrp x17, nvn_last_ra
+    add x17, x17, :lo12:nvn_last_ra
+    str x30, [x17, #4176]
     ldr x17, [x16, #8]
     br x17
     .data
@@ -6287,7 +7856,7 @@ nvn_names:
     .quad Ln520
     .quad Ln521
     .quad Ln522
-.section .rodata
+.section .rodata
 Ln0: .asciz "nvnDeviceBuilderSetDefaults"
 Ln1: .asciz "nvnDeviceBuilderSetFlags"
 Ln2: .asciz "nvnDeviceBuilderGetFlags"

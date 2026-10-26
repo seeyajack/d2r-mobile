@@ -3,6 +3,8 @@
 // Multi-module loading (playing the role of Horizon's rtld): mapping, claiming thread slots, gate registration, cross-module relocation, take-over by name, segment permissions.
 // The code area (original text and patch area) is set to read-only+execute as soon as it is copied in, and from then on the loader only writes data: on iOS these two blocks must be embedded as is as signed code segments.
 #include <stdatomic.h>
+#include <sched.h>
+#include <errno.h>
 #include "dm.h"
 #include <TargetConditionals.h>
 #include <fcntl.h>
@@ -189,7 +191,17 @@ module_t *module_of(const void *p) {
 
 // 跨模块符号解析：先在已装模块里找定义，找不到再交给 HLE / 桩
 // Cross-module symbol resolution: first look for a definition in the loaded modules, and only if not found hand over to HLE / stubs
+static void *force_lookup(const char *name);   // np323：前置声明
 static uint64_t resolve_sym(module_t *m, const char *name, int weak) {
+    // np323：**强制接管优先于模块内定义**。
+    // 上面那条注释（"命中即覆盖模块内定义"）一直是这个设计意图，但代码原来是先找模块定义，
+    // 于是"某个模块自己也实现了同名符号"时宿主替身永远轮不到 —— 门票① 的
+    // nn::mem::StandardAllocator::Allocate 正是这种情况（sdk 自己定义了它）。
+    // np323: forced handlers now take precedence over in-module definitions, which is what the comment above
+    // always intended. Before, a module that defined the same symbol won, so the host replacement was never
+    // reached -- exactly the case for nn::mem::StandardAllocator::Allocate (defined inside sdk).
+    void *f = force_lookup(name);
+    if (f) return (uint64_t)f;
     for (int i = 0; i < g_nmod; i++) { void *p = module_sym(&g_mod[i], name); if (p) return (uint64_t)p; }
     return resolve_import(m, name, weak);
 }
@@ -502,6 +514,17 @@ static void *guest_malloc(size_t n) {
     if (!p && n) atomic_fetch_add(&g_gmalloc_fail, 1);
     return p;
 }
+// np320：给 HLE 用的宿主堆入口（与 guest_malloc 共用计数）。
+// 用途：客体某些 StandardAllocator 实例从未初始化，客体实现在这种状态下只会返回 0；
+// 这些分配改由宿主堆服务（与 np293 想用改码达到的效果一致，但不需要改客体代码）。
+void *dm_guest_malloc(size_t n, size_t align) {
+    if (!align || align > 0x1000) align = 16;
+    if (align <= 16) return guest_malloc(n);
+    void *raw = guest_malloc(n + align);
+    if (!raw) return NULL;
+    return (void *)(((uintptr_t)raw + align - 1) & ~(uintptr_t)(align - 1));
+}
+
 unsigned long dm_guest_malloc_stat(unsigned long *fail) {
     if (fail) *fail = atomic_load(&g_gmalloc_fail);
     return atomic_load(&g_gmalloc_n);
@@ -650,7 +673,80 @@ static void guest_libc_hook(void) {
 // 这也解释了"有的补丁生效、有的不生效"：取决于那些 cache line 上次有没有被取过。
 // 所以：**装载完成后，对所有离线补丁点所在的 cache line 各刷一次**（只刷补丁点，不刷整段，
 // 避免 23MB text 全刷带来的启动开销）。
-static void guest_flush_icache(void) {
+// np304：改成**每线程**也调一次（原来只在装载线程装载后调一次）。
+// 为什么：`__builtin___clear_cache` 在 aarch64 上只对本核发 `ic ivau`，**不广播**；
+// 装载补丁发生在装载线程，而真正执行补丁点的可能是另一个核上的客体线程。
+// EL0 又没有 `ic ialluis`（EL1 才有）⇒ 跨核只能"谁执行谁自己清"。
+// 于是：每个客体线程在**开始跑客体代码之前**清一遍这 8 个点（8 条 cache line，代价可忽略）。
+// np304: also flush once per guest thread (previously only once after loading, on the loading thread).
+// Why: on aarch64 `__builtin___clear_cache` only issues `ic ivau` on the calling core and does NOT broadcast,
+// while the thread that actually executes a patched point may sit on another core; EL0 cannot use `ic ialluis`
+// (EL1 only), so cross-core can only be handled by "whoever executes, flushes".
+// Hence every guest thread flushes these 8 points right before it starts running guest code (8 cache lines, free).
+// np316：把当前线程钉在 CPU0，再清补丁点 icache —— 让"清"和"执行"必然在同一个核上。
+// 为什么需要：aarch64 的 `ic ivau` 只影响本核。线程清完 icache 之后若被调度到别的核，
+// 那个核上还留着**上一轮进程**的旧代码行（物理页被复用、内容已改，icache 行却还是旧的）
+// ⇒ 数据读出来是补丁，取指却走旧指令。这正是本崩点全部观测的唯一自洽解释。
+// np316: pin the current thread to CPU0, then flush the patched lines, so "flush" and "execute" are on
+// the same core. `ic ivau` is per-core; after a flush the thread may migrate to a core that still holds
+// the previous process's line for the same physical page -> data reads the patch, the fetch runs the old code.
+void guest_flush_icache(int verbose);   // 前置声明（下面用到）
+// np317：运行期把同一份补丁**重写一遍**（值不变），只为触发 mprotect 的页权限往返。
+// 依据：np297 的运行期改码生效、而离线写进文件的补丁"内存对、取指不对"（np315 探针桩一次都没触发，
+// np316 钉核+清 icache 也没用）⇒ 差别就在那次 mprotect；内核在页表更新时会做本地核的 icache 同步。
+// np317: rewrite the same patch bytes at run time (same values) purely to get the mprotect round trip,
+// which makes the kernel sync the instruction cache for that page. Evidence: np297's runtime patching worked
+// while identical bytes written into the file (and confirmed in memory) are still fetched as the old code,
+// even after pinning to one core and clearing the cache (np315/np316).
+static __attribute__((unused)) static void dm_repatch_runtime(void) {
+    static const uint64_t kEnt[] = {
+        0x105f9e4, 0x3326b8, 0x365324, 0x37621c, 0x40df2c, 0x41c728, 0x54f204, 0x45f9c8, 0x9f3410,
+    };
+    module_t *mm = NULL;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mm = &g_mod[i]; break; }
+    if (!mm) return;
+    unsigned done = 0, fail = 0;
+    const long pg = 0x4000;
+    for (unsigned i = 0; i < sizeof kEnt / sizeof kEnt[0]; i++) {
+        uint8_t *a = mm->base + kEnt[i];
+        uintptr_t base = (uintptr_t)a & ~(uintptr_t)(pg - 1);
+        if (mprotect((void *)base, pg, PROT_READ | PROT_WRITE | PROT_EXEC)) { fail++; continue; }
+        uint32_t v = *(volatile uint32_t *)a;
+        *(volatile uint32_t *)a = v;                      // 写回同值：只为让数据缓存脏、页表走过一遍
+        __builtin___clear_cache((char *)a, (char *)a + 4);
+        mprotect((void *)base, pg, PROT_READ | PROT_EXEC);
+        done++;
+    }
+    // 空穴桩整片（0x2404a70 ~ 0x2404c00）一并走一遍
+    {
+        uint8_t *a = mm->base + 0x2404a70;
+        uintptr_t base = (uintptr_t)a & ~(uintptr_t)(pg - 1);
+        if (!mprotect((void *)base, pg, PROT_READ | PROT_WRITE | PROT_EXEC)) {
+            for (unsigned off = 0; off < 0x180; off += 4) {
+                uint32_t v = *(volatile uint32_t *)(a + off);
+                *(volatile uint32_t *)(a + off) = v;
+            }
+            __builtin___clear_cache((char *)a, (char *)a + 0x180);
+            mprotect((void *)base, pg, PROT_READ | PROT_EXEC);
+        } else fail++;
+    }
+    LOG("np317 运行期重打补丁：%u 处成功，%u 处 mprotect 失败", done, fail);
+}
+
+void dm_pin_and_flush(void) {
+    static int logged;
+    cpu_set_t set; CPU_ZERO(&set); CPU_SET(0, &set);
+    // np318 收尾：真机四轮证明"钉核 / 运行期重打"都没能让取指跟上补丁（见 20-分析/真机定性-np315-317.md），
+    // 这里恢复成普通清 icache；钉核与重打留作记录，等换手段（下一轮不再默认启用）。
+    // np318: four device runs showed that neither pinning nor a runtime re-patch makes the fetch follow the
+    // patch, so fall back to a plain cache flush; the experiments stay as documented helpers.
+    int rc = sched_setaffinity(0, sizeof set, &set);
+    (void)rc;
+    guest_flush_icache(0);
+    if (!logged++) LOG("np316 钉核 + 清 icache：sched_setaffinity CPU0 → %s", rc == 0 ? "成功" : "失败（继续，只是没钉住）");
+}
+
+void guest_flush_icache(int verbose) {
     static const uint64_t kOff[] = {
         0x9f3410,   // np293 0x9f33f0 收敛
         0x105f9e4, 0x45f9c8, 0x3326b8, 0x37621c, 0x40df2c, 0x41c728, 0x54f204,   // np296 空指针保护
@@ -663,7 +759,7 @@ static void guest_flush_icache(void) {
         uint8_t *lo = (uint8_t *)((uintptr_t)a & ~(uintptr_t)63);   // cache line 对齐（aarch64 通常 64B）
         __builtin___clear_cache((char *)lo, (char *)lo + 64);
     }
-    LOG("已清 %u 个补丁点的 icache（np301）", (unsigned)(sizeof kOff / sizeof kOff[0]));
+    if (verbose) LOG("已清 %u 个补丁点的 icache（np301/np304）", (unsigned)(sizeof kOff / sizeof kOff[0]));
 }
 
 void load_modules(const char *dir, const char **names, int n) {
@@ -694,7 +790,7 @@ void load_modules(const char *dir, const char **names, int n) {
     guest_libc_hook();   // np292：扮演 rtld 装 libc 初始化 hook（必须在跑各模块 inits 之前） | np292: play rtld installing the libc init hook (must be before running module inits)
     { void hlecount_seal(void); hlecount_seal(); }   // DM_HLECOUNT：重定位完成，计数桩页封成只读可执行 | DM_HLECOUNT: relocation done, seal the counting stub pages as read-only executable
     if (getenv("DM_SYMCHECK")) LOG("DM_SYMCHECK：装载期共核 %lu 次符号查询，哈希与线性不一致 %lu", g_symchk_n, g_symchk_bad);
-    guest_flush_icache();   // np301：离线补丁写进产物后，装载完必须清 icache（否则可能执行旧指令）
+    guest_flush_icache(1);   // np301/np304：离线补丁写进产物后，装载完必须清 icache（否则可能执行旧指令）
     if (g_flag.bootprof) LOG("① 细分：映射（读 + 拷 + 封页）%.1f ms、解析动态段 %.1f ms、门注册 %.1f ms、重定位 + 强制接管 %.1f ms，合计 %.1f ms",
                              tm / 1e6, tp / 1e6, tg / 1e6, tr / 1e6, (now_ns() - t0) / 1e6);
 }
@@ -703,6 +799,86 @@ void load_modules(const char *dir, const char **names, int n) {
 // 时机由 nn::init::Start 决定：nninitStartup 与 _init_libc2 之后、nnMain 之前（Start 的第 4 个参数回调）。
 // Plays the role of rtld's InitModules (rtld+0x830): call each module's DT_INIT in forward order of the load list.
 // The timing is decided by nn::init::Start: after nninitStartup and _init_libc2, before nnMain (the 4th argument callback of Start).
+// np319：只读探测 —— 判断 this=0 是"客体 mem 没初始化"还是"线程分配器为空"。
+// 纯读三处数据，不改任何代码，所以不受"改码不生效"的限制。
+// np324：**直接把 GOT 槽写成宿主 handler**。
+// 依据：客体 malloc(0x9b27a0) 里是 `bl 0x1632580`（PLT 桩）→ 桩里 `ldr x17,[GOT]` → br。
+// 只要把那个 GOT 槽改成我们的 handler，调用就必然落到宿主（与"谁解析的"无关）。
+// 这是纯数据写 ⇒ 不受"改客体代码不生效"的限制。
+void *dm_hle_alloc_em_addr(void);   // np324：hle_svc.c 提供
+void dm_pin_alloc_got(void) {
+    module_t *mm = NULL;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mm = &g_mod[i]; break; }
+    if (!mm) return;
+    uint8_t *b = mm->base;
+    uint32_t w0 = *(volatile uint32_t *)(b + 0x1632580), w1 = *(volatile uint32_t *)(b + 0x1632584);
+    if ((w0 & 0x9f000000) != 0x90000000 || (w1 & 0xffc00000) != 0xf9400000) {
+        LOG("np324 GOT 定位失败：桩指令 %08x %08x", w0, w1); return;
+    }
+    int64_t imm = ((w0 >> 29) & 3) | (((w0 >> 5) & 0x7ffff) << 2);
+    if (imm & (1ll << 20)) imm -= 1ll << 21;
+    uint64_t page = ((uint64_t)(uintptr_t)(b + 0x1632580) & ~0xfffull) + ((uint64_t)imm << 12);
+    uint64_t slot = page + ((w1 >> 10) & 0xfff) * 8;
+    uint64_t off = slot - (uint64_t)(uintptr_t)b;
+    if (off >= mm->size) { LOG("np324 槽 %#llx 超出模块范围", (unsigned long long)off); return; }
+    void *want = dm_hle_alloc_em_addr();
+    void *cur = *(void **)(uintptr_t)slot;
+    LOG("np324 GOT 槽 main+%#llx：当前 %p，宿主 handler %p → %s", (unsigned long long)off, cur, want,
+        cur == want ? "已经是我们的" : "改写");
+    if (cur != want) *(volatile void **)(uintptr_t)slot = want;
+}
+
+void dm_dump_alloc_state(const char *when) {
+    module_t *mm = NULL;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mm = &g_mod[i]; break; }
+    if (!mm) return;
+    uint8_t *b = mm->base;
+    uint64_t gp   = *(volatile uint64_t *)(b + 0x226f0a0);   // 全局分配器对象指针
+    uint64_t hook = *(volatile uint64_t *)(b + 0x22d7230);   // 客体 malloc 的 libc hook（装载期写成 1）
+    uint64_t h1   = *(volatile uint64_t *)(b + 0x22d71e8);
+    uint64_t vp = 0;
+    int in_mod = 0;
+    for (int i = 0; i < g_nmod; i++) {
+        uintptr_t lo = (uintptr_t)g_mod[i].base, hi = lo + (uintptr_t)g_mod[i].size;
+        if (gp >= lo && gp + 8 <= hi) in_mod = 1;
+    }
+    if (in_mod) vp = *(volatile uint64_t *)(uintptr_t)gp;    // 同进程，直接解引用（前面的范围检查保证不会野指针）
+    // np326：把四个 GOT 槽一起打出来 —— 一眼看出"分配链上到底谁被调用"。
+    // AllocateEm/Emm/Free 与 GetTlsValue 的槽（离线从 main 的 GLOB_DAT 查得）。
+    uint64_t g1 = *(volatile uint64_t *)(b + 0x2263628);   // AllocateEm
+    uint64_t g2 = *(volatile uint64_t *)(b + 0x2263638);   // Free
+    uint64_t g3 = *(volatile uint64_t *)(b + 0x2263648);   // AllocateEmm
+    uint64_t g4 = *(volatile uint64_t *)(b + 0x22634a8);   // GetTlsValue
+    unsigned long fails = 0, gmn = (unsigned long)dm_guest_malloc_stat(&fails);
+    LOG("[np319 %s] obj=%#llx vptr=%#llx hook=%#llx [0x22d71e8]=%#llx | GOT Em=%#llx Free=%#llx Emm=%#llx TLS=%#llx | gm=%lu fail=%lu",
+        when, (unsigned long long)gp, (unsigned long long)vp,
+        (unsigned long long)hook, (unsigned long long)h1,
+        (unsigned long long)g1, (unsigned long long)g2, (unsigned long long)g3, (unsigned long long)g4,
+        gmn, fails);
+}
+
+void dm_pin_alloc_got(void);
+unsigned long dm_guest_malloc_stat(unsigned long *fail);
+// np331：把** 0 页**映射成可写（哑页）。目的：`this=0` 时 `str wzr,[x19,#0x60]` 不再 fault。
+// 为什么这么干：改客体代码在本机不生效（np315–318），外部调试器也不可用（设备 uid=2000，无 gdb/ptrace）。
+// 这是唯一不改码、不要权限、能把"空指针写"变无害的手段。
+// 注意：mmap_min_addr 通常会拒绝映射 0 —— 成功与否都会打印，失败就说明这条路不通。
+// np331: map the zero page writable so a null-this store faults nowhere. Guest code patching does not work
+// on this device (np315-318) and no external debugger is available, so this is the only no-code, no-privilege
+// way to make the null store harmless. mmap_min_addr usually refuses address 0; the result is logged either way.
+void dm_map_null_page(void) {
+    static int done;
+    if (done++) return;
+    void *p = mmap((void *)0, 0x10000, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (p == MAP_FAILED) {
+        LOG("【黄】np331 0 页映射失败（%s）：空指针写仍会崩", strerror(errno));
+    } else {
+        memset(p, 0, 0x10000);
+        LOG("np331 0 页已映射为可写（%p）：空指针写会被吞掉", p);
+    }
+}
+
 void run_module_inits(void) {
     // DM_GUARDDBG=1：跑各模块构造器前，读一下 sdk 的 locale 守卫字节（sdk+0x78f1e8）。
     // 用途：确认"守卫字节在进函数时已非 0"是装载写脏还是别的构造器写脏（np242 排障）。

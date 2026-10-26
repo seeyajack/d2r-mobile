@@ -65,6 +65,8 @@ typedef struct {
     uint8_t *begin;                      // 本次录制的 BEGIN 记录 | BEGIN record of this recording
     PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC cb; void *cb_data;
     NVNdevice *dev;
+    uint64_t used;                       // np314：本次录制已写入的字节数（Begin 清零、每次分配累加）——GetCommandMemoryUsed 要它
+                                         // np314: bytes written in this recording (cleared at Begin, added on every alloc)
 } cmd_t;                                                                                     FITS(cmd_t, NVNcommandBuffer);
 
 // ---------- 状态对象（默认值按 NVN / GL 默认） ----------

@@ -31,6 +31,25 @@ static uint64_t watch_now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 uint64_t crash_watch_progress_count(void) { return atomic_load(&g_watch_count); }
+// ---------- 本轮标识 run-id（np304） ----------
+// 为什么：np300–np302 三轮的结论建立在"崩点分毫未变"上，而 hilog 是环形缓冲、带历史全部崩溃块 ——
+// 一旦读到的其实是**上一轮**的块，就会得出"补丁在文件里、在内存里都对，执行流却按旧指令走"这种
+// 按代码不可能的结论（np303 已证明那个地址静态不可达）。所以现场必须能自证"这是哪一轮"。
+// 用法：每个崩溃块头部都带 [run=… pid=… 构建=…]；读日志只认**最后一块**且块内有本轮痕迹。
+// ---------- Per-run id (np304) ----------
+// Why: the np300-np302 conclusions rested on "the crash point never moved", but hilog is a ring buffer that
+// also holds every historical crash block -- reading a block from the PREVIOUS run yields the "patch is in the
+// file and in memory, yet the old instruction still executes" paradox (np303 proved that address is statically
+// unreachable). So every dump must identify the run it came from: read only the LAST block, and only if its
+// run tag matches this run.
+static char g_run_tag[96];
+static void run_tag_init(void) {
+    static int done; if (done) return; done = 1;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    snprintf(g_run_tag, sizeof g_run_tag, "run=%ld.%03ld pid=%ld 构建=%s %s",
+             (long)ts.tv_sec, (long)(ts.tv_nsec / 1000000), (long)getpid(), __DATE__, __TIME__);
+}
+const char *dm_run_tag(void) { run_tag_init(); return g_run_tag; }
 void crash_watch_progress(uint32_t tick, const char *stage) {
     int next = 1 - atomic_load(&g_watch_stage_idx);
     if (stage && *stage) snprintf(g_watch_stage[next], sizeof g_watch_stage[next], "%s", stage);
@@ -132,14 +151,244 @@ void crash_set_wait_dump(void (*fn)(void)) { g_wait_dump = fn; }
 // Dump the current state on demand (without exiting): the iOS app has no no-progress watchdog, so when the smoke test fails it sends dump through DM_LOG_PORT to trigger this -- what each guest thread is waiting on + the graphics-side wait points, the same thing the watchdog prints
 void crash_dump_now(const char *why) { fprintf(stderr, "[dm] 现场导出（%s）：拍 %u / 阶段 %s\n", why, atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]); if (g_dump_hook) g_dump_hook(); if (g_wait_dump) g_wait_dump(); }
 unsigned long dm_guest_malloc_stat(unsigned long *fail);
+// ---------- 空指针保护桩的"现场自证"（np307） ----------
+// 离线补丁（vk-spike/s3/fixup.py）把每个保护桩里"this 为空"的那一格从 `ret` 换成
+// `brk #0xB0xx`（xx = 桩序号+1）。命中时在这里打印**是哪一个桩、寄存器、以及 lr（= 调用点）**，
+// 然后把 PC 设成 LR —— 与原来那条 `ret` 语义完全一致，游戏照常往下走。
+// 为什么值得这么做：np296–np303 追"this 为什么是 0"追了三天，最大的代价是**现场里没有"谁传的"**。
+// 现在命中即带调用点，下一次真机日志里直接就有答案。
+// ---------- Self-identifying null guards (np307) ----------
+// The offline patch turns the "this is null" cell of every guard stub from `ret` into `brk #0xB0xx`
+// (xx = guard index + 1). On a hit we print which guard, the registers, and lr (= the call site), then set
+// PC to LR -- exactly what the old `ret` did, so the game keeps running. Worth it because np296-np303 chased
+// "why is this null" for three days and the most expensive part was that the dump never said WHO passed it.
+#define NULL_GUARD_BRK 0xB000u
+// 是"我们的 brk"就返回 id，否则 0
+// Return the id when this word is one of our brk instructions, 0 otherwise
+static unsigned our_brk_id(uintptr_t pc) {
+    if (pc < 0x1000 || (pc & 3)) return 0;
+    uint32_t insn = *(volatile uint32_t *)pc;
+    if ((insn & 0xFFE0001F) != 0xD4200000) return 0;          // 不是 brk | not a brk
+    unsigned id = (insn >> 5) & 0xFFFF;
+    // 0xB0xx = 空指针保护桩；0xB1xx = np315 诊断探针（只记录后继续执行）
+    return (((id & 0xFF00) == NULL_GUARD_BRK) || ((id & 0xFF00) == 0xB100u)) ? id : 0;
+}
+static int null_guard_trap(ucontext_t *uc) {
+    uintptr_t pc = (uintptr_t)UC_PC(uc);
+    // 内核给的 BRK 返回地址约定不同：有的指向 brk 本身，有的已指向下一条 ⇒ 两个位置都试
+    // Kernels differ on the preferred return address for BRK: some point at the brk, some already past it.
+    unsigned id = our_brk_id(pc);
+    if (!id) { id = our_brk_id(pc - 4); if (id) pc -= 4; }
+    if (!id) return 0;                                        // 不是我们的 | not ours
+    // np315 诊断：0xB1xx = 探针桩 —— 只记录，然后把 PC 推进到桩的下一个字（= 原第一条指令），
+    // 既不改语义，也能回答"x0 在入口到底是什么、取指到底跟不跟补丁"。
+    if ((id & 0xFF00) == 0xB100) {
+        fprintf(stderr, "\n[dm] 【诊断】探针桩 #%u [%s] x0=%#llx x1=%#llx lr=%#llx\n",
+                id & 0xFF, dm_run_tag(),
+                (unsigned long long)UC_X(uc, 0), (unsigned long long)UC_X(uc, 1),
+                (unsigned long long)UC_LR(uc));
+        off("lr", (uint64_t)UC_LR(uc));
+        UC_PC(uc) = pc + 4;
+        return 1;
+    }
+    static int seen;
+    if (seen++ < 16) {
+        fprintf(stderr, "\n[dm] 【红】空指针保护命中 #%u [%s]\n", id & 0xFF, dm_run_tag());
+        off("pc", (uint64_t)pc); off("lr", (uint64_t)UC_LR(uc));
+        // np333（修正）：保护桩内部先 `str x19,[sp,#-0x20]!`，所以
+        //   [sp+0x10] = 被调函数保存的 x29，[sp+0x18] = 它的返回地址（=0x45f9dc，已对上）
+        //   被调函数的入口 sp = sp+0x20 ⇒ 构造函数自己的帧在 sp+0x20 起
+        //   ⇒ **构造函数的返回地址（= 谁调用 0x45f9c8）在 [sp+0x38]**
+        {
+            uint64_t sp = (uint64_t)UC_SP(uc);
+            fprintf(stderr, " np333 调用者链：");
+            for (int d = 0; d < 4; d++) {
+                uint64_t ret = *(uint64_t *)(uintptr_t)(sp + 0x20 * (uint64_t)(d + 1) + 0x18);
+                const char *nm = "?"; uint64_t off = 0;
+                for (int k = 0; k < g_nmod; k++) {
+                    uint64_t lo = (uint64_t)(uintptr_t)g_mod[k].base, hi = lo + g_mod[k].size;
+                    if (ret >= lo && ret < hi) { nm = g_mod[k].name; off = ret - lo; break; }
+                }
+                fprintf(stderr, " [%d]%s+%#llx", d, nm, (unsigned long long)off);
+            }
+            fprintf(stderr, "\n");
+        }
+        fprintf(stderr, " x0=%#llx x1=%#llx x2=%#llx x3=%#llx sp=%#llx\n",
+                (unsigned long long)UC_X(uc, 0), (unsigned long long)UC_X(uc, 1),
+                (unsigned long long)UC_X(uc, 2), (unsigned long long)UC_X(uc, 3),
+                (unsigned long long)UC_SP(uc));
+    }
+    UC_PC(uc) = UC_LR(uc);                                    // 等价于原来那条 ret | same as the old ret
+    return 1;
+}
+// np327：**自己扫栈**，把"栈上落在客体代码段里的返回地址"按从近到远打出来。
+// 为什么需要：改客体代码在本机不生效（np315–318），没法在入口下桩；而崩溃现场的线程转储被
+// _exit 截断，拿不到调用链。栈里的返回地址是**数据**，扫它不需要任何补丁。
+// np332：把地址格式化成 "模块+偏移"（两个缓冲轮换，便于一行里打两个地址）
+// np339：倒出"各 NVN 入口最后一次是从客体的哪里被调的"（thunk 记录的 x30）。
+static const char *fmt_off(uint64_t a);
+extern void nvn_unimpl_entry(void);   // 与 hle_nvn.c 一致
+static void dump_nvn_last_calls(void) {
+    extern uint64_t nvn_last_ra[];
+    extern const char *nvn_names[];
+    typedef struct { _Atomic uint64_t cnt; void *fn; } nvn_slot_t;
+    extern nvn_slot_t nvn_slot[];
+    struct { const char *nm; uint64_t off; unsigned long long seq; } e[523];
+    int n = 0;
+    for (unsigned i = 0; i < 523; i++) {
+        uint64_t ra = nvn_last_ra[i];
+        if (!ra) continue;
+        unsigned long long seq = atomic_load(&nvn_slot[i].cnt);
+        if (!seq) continue;
+        const char *nm = "?"; uint64_t off = 0;
+        for (int k = 0; k < g_nmod; k++) {
+            uint64_t lo = (uint64_t)(uintptr_t)g_mod[k].base, hi = lo + g_mod[k].size;
+            if (ra >= lo && ra < hi) { nm = g_mod[k].name; off = ra - lo; break; }
+        }
+        e[n].nm = nm; e[n].off = off; e[n].seq = seq; n++;
+    }
+    // 按"该入口最后一次调用的全局序号"降序 = 最近调用的排前面
+    for (int a = 0; a < n; a++) for (int b = a + 1; b < n; b++)
+        if (e[b].seq > e[a].seq) { typeof(e[0]) t = e[a]; e[a] = e[b]; e[b] = t; }
+    fprintf(stderr, "[dm] np341 NVN 最近调用（时间序，前 16）：\n");
+    for (int a = 0; a < n && a < 16; a++)
+        fprintf(stderr, "   %-40s <- %s+%#llx  (seq %llu)\n", e[a].nm, e[a].nm ? "" : "",
+                (unsigned long long)e[a].off, e[a].seq);
+    if (!n) fprintf(stderr, "   （没有记录）\n");
+    // np342：**未实现但被调用过**的入口 = 嫌疑名单（返回 0 会让调用方跳过创建子对象 ⇒ 满盘空指针）
+    fprintf(stderr, "[dm] np342 未实现但被调用过的 NVN 入口：\n");
+    int bad = 0;
+    for (unsigned i = 0; i < 523; i++) {
+        if (nvn_last_ra[i] && nvn_slot[i].fn == (void *)nvn_unimpl_entry) {
+            fprintf(stderr, "   ★ %s  （调用点 %s）\n", nvn_names[i], fmt_off(nvn_last_ra[i]));
+            bad++;
+        }
+    }
+    if (!bad) fprintf(stderr, "   （没有 —— 所有被调用的入口都有真实现）\n");
+}
+static const char *fmt_off(uint64_t a) {
+    static char b[2][64]; static int k;
+    char *o = b[k++ & 1];
+    for (int i = 0; i < g_nmod; i++) {
+        uint64_t lo = (uint64_t)(uintptr_t)g_mod[i].base, hi = lo + g_mod[i].size;
+        if (a >= lo && a < hi) { snprintf(o, 64, "%s+%#llx", g_mod[i].name, (unsigned long long)(a - lo)); return o; }
+    }
+    snprintf(o, 64, "%#llx", (unsigned long long)a);
+    return o;
+}
+static void dump_guest_stack_chain(uint64_t sp) {
+    const char *nm; uint64_t off;
+    uint64_t *p = (uint64_t *)(sp & ~7ull);
+    int shown = 0;
+    fprintf(stderr, "[dm] np327 栈返回地址链（sp=%#llx）：\n", (unsigned long long)sp);
+    for (int i = 0; i < 4096 && shown < 24; i++) {
+        uint64_t v = 0;
+        // 直接读；越界会再崩，所以先按页粗判（栈区总是可读的，这里只在 sp..sp+32KB 内走）
+        if ((uintptr_t)p >= sp + 0x8000) break;
+        v = *p;
+        nm = NULL; off = 0;
+        for (int k = 0; k < g_nmod; k++) {
+            uint64_t lo = (uint64_t)(uintptr_t)g_mod[k].base, hi = lo + g_mod[k].size;
+            if (v >= lo && v < hi) { nm = g_mod[k].name; off = v - lo; break; }
+        }
+        if (nm && off < 0x2000000ull) {
+            fprintf(stderr, "   %2d: %s+%#llx   (%#llx)\n", shown, nm, (unsigned long long)off, (unsigned long long)v);
+            shown++;
+        }
+        p++;
+    }
+    if (!shown) fprintf(stderr, "   （栈上没找到指向客体代码的返回地址）\n");
+}
 static void on_crash(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = uc_;
-    if (sig == SIGTRAP && g_trap_hook && g_trap_hook(uc)) return;
+    if (sig == SIGTRAP) {
+        if (null_guard_trap(uc)) return;
+        if (g_trap_hook && g_trap_hook(uc)) return;
+    } else if (sig == SIGILL) {
+        // np313：极少数平台把 BRK 投递成 SIGILL。若真是我们的桩，照样接住并继续，
+        // 别让它走崩溃路径把进程杀掉、白丢一轮真机（判据：读指令字判断，不是我们的就照常崩）。
+        // A few platforms deliver BRK as SIGILL; catch ours here too so the run is not wasted. Anything
+        // that is not our brk falls through to the normal crash path.
+        if (null_guard_trap(uc)) return;
+    }
+    // np332：**先打一行最小现场**——不读任何内存，保证一定能落地。
+    // 教训：np330 在读 [sp+0x18] 时如果 sp 是坏的，handler 自己再崩，连 CRASH 行都出不来（np331 那轮就是这样）。
+    // np335：**吞掉空指针写**（门票① 的最后手段）。
+    // 依据：0 页映射被 mmap_min_addr 拒绝（np331），而崩溃点是 `str wzr,[x19,#0x60]`（x19=0）。
+    // 这里不模拟指令、不重试，只**跳过**这条往低地址写的存储（PC+=4），让构造函数继续跑完。
+    // 为什么可接受：往 0 地址写本身就是未定义行为；跳过它等价于"这个对象没被构造出来"，
+    // 而游戏对未构造对象的常见处理是继续走（这正是 np296 想达到的效果，只是现在不需要改码）。
+    if (sig == SIGSEGV || sig == SIGBUS) {
+        uintptr_t pc = (uintptr_t)UC_PC(uc), bad = (uintptr_t)si->si_addr;
+        if (bad < 0x1000 && pc > 0x1000) {
+            uint32_t w = *(volatile uint32_t *)pc;
+            // 只认"存储"类指令（str/stp/stur/strb/strh），别把读错误地吞掉
+            // 放宽到整个 load/store 家族：构造函数里后面还有 `stp xzr,xzr,[x19,#0x50]` 这类成对存储。
+            int is_store = ((w & 0x0C000000u) == 0x08000000u);
+            if (is_store) {
+                static uint64_t seen[8]; static int nseen;
+                int known = 0;
+                for (int i = 0; i < nseen; i++) if (seen[i] == pc) known = 1;
+                if (!known && nseen < 8) {
+                    seen[nseen++] = pc;
+                    // np337：**帧原样 dump**（不再按序言猜偏移）——找出返回地址到底存在哪、
+                    // 以及 0xa00000002 这个垃圾值是从哪来的（第一次吞写时帧还完整）。
+                    if (nseen == 1) {   // 第一次吞写（PC 是绝对地址，不是偏移，之前判错了）
+                        uint64_t sp0 = (uint64_t)UC_SP(uc);
+                        fprintf(stderr, "[dm] np337 帧原样（sp=%#llx）：\n", (unsigned long long)sp0);
+                        for (int k = -4; k < 20; k++) {
+                            uint64_t v = *(uint64_t *)(uintptr_t)(sp0 + (uint64_t)(k * 8));
+                            const char *nm = NULL; uint64_t off = 0;
+                            for (int m = 0; m < g_nmod; m++) {
+                                uint64_t lo = (uint64_t)(uintptr_t)g_mod[m].base, hi = lo + g_mod[m].size;
+                                if (v >= lo && v < hi) { nm = g_mod[m].name; off = v - lo; break; }
+                            }
+                            fprintf(stderr, "   [sp%+3d] %#018llx%s%s\n", k * 8,
+                                    (unsigned long long)v, nm ? "  = " : "", nm ? fmt_off(v) : "");
+                        }
+                    }
+                    fprintf(stderr, "[dm] np335 吞掉空指针写：pc=%s addr=%#llx insn=%08x x0=%#llx\n",
+                            fmt_off(pc), (unsigned long long)bad, w, (unsigned long long)UC_X(uc, 0));
+                }
+                UC_PC(uc) = pc + 4;
+                return;
+            }
+        }
+    }
+    if (sig == SIGSEGV || sig == SIGBUS)
+        fprintf(stderr, "\n[dm] FAULT sig=%d pc=%s lr=%s addr=%#llx x0=%#llx sp=%#llx fp=%#llx\n",
+                sig, fmt_off((uint64_t)UC_PC(uc)), fmt_off((uint64_t)UC_LR(uc)),
+                (unsigned long long)(uintptr_t)si->si_addr,
+                (unsigned long long)UC_X(uc, 0), (unsigned long long)UC_SP(uc),
+                (unsigned long long)UC_FP(uc));
+    if (sig == SIGSEGV || sig == SIGBUS) dump_nvn_last_calls();
+    // np330：**sp 基调用链**。0x45f9c8 的序言是 `stp x29,x30,[sp,#0x10]`，
+    // 所以调用者的返回地址就在 [sp+0x18]，上一帧的 fp 在 [sp+0x10] —— 不需要 x29（它在本现场是垃圾）。
+    if (sig == SIGSEGV || sig == SIGBUS) {
+        uint64_t sp0 = (uint64_t)UC_SP(uc);
+        if (sp0 < 0x10000 || sp0 > 0x800000000000ull) { fprintf(stderr, "[dm] np330 sp 不合理，跳过链\n"); goto np330_done; }
+        uint64_t ret0 = *(uint64_t *)(uintptr_t)(sp0 + 0x18);
+        uint64_t fp0  = *(uint64_t *)(uintptr_t)(sp0 + 0x10);
+        fprintf(stderr, "[dm] np330 调用链（sp=%#llx）：\n", (unsigned long long)sp0);
+        uint64_t fp = fp0;
+        for (int lvl = 0; lvl < 16; lvl++) {
+            uint64_t ret = ret0;
+            if (lvl) { uint64_t *f = (uint64_t *)(uintptr_t)fp; ret = f[1]; fp = f[0]; }
+            const char *nm = NULL; uint64_t off = 0;
+            for (int k2 = 0; k2 < g_nmod; k2++) {
+                uint64_t lo = (uint64_t)(uintptr_t)g_mod[k2].base, hi = lo + g_mod[k2].size;
+                if (ret >= lo && ret < hi) { nm = g_mod[k2].name; off = ret - lo; break; }
+            }
+            fprintf(stderr, "   %2d: %s+%#llx\n", lvl, nm ? nm : "?", (unsigned long long)off);
+            if (!fp) break;
+        }
+        np330_done: ;
+    }
     if (sig == SIGSEGV || sig == SIGBUS) {
         int is_write = (int)((UC_ESR(uc) >> 6) & 1);   // ESR 的 WnR 位 | The WnR bit of ESR
         for (int i = 0; i < g_nfault_hook; i++) if (g_fault_hook[i](si->si_addr, is_write, uc)) return;
     }
-    fprintf(stderr, "[dm] CRASH sig=%d", sig);
+    fprintf(stderr, "[dm] CRASH sig=%d [%s]", sig, dm_run_tag());
     // np254 临时探针（BotW 专属）：崩点 main+0x9fcfd8 的 blr x8 取自
     //   x8 = *(main+0x227ff90) → *(main+0x22d7c30)
     // 文件里这两处一个是 RELATIVE 槽、一个是全 0，运行时到底是什么值只能现场读。
@@ -390,7 +639,7 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
     {
         module_t *mm2 = NULL;
         for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mm2 = &g_mod[i]; break; }
-        fprintf(stderr, " [np298 nmod=%d mm=%p size=%#zx]", g_nmod, (void *)mm2,
+        fprintf(stderr, " [%s] [np298 nmod=%d mm=%p size=%#zx]", dm_run_tag(), g_nmod, (void *)mm2,
                 mm2 ? (size_t)mm2->size : (size_t)0);
         if (mm2) {
             uint64_t cave = (uint64_t)(uintptr_t)(mm2->base + 0x2404a70);
@@ -400,6 +649,17 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
                     *(volatile uint32_t *)(uintptr_t)(mm2->base + 0x45f9c8),
                     *(volatile uint32_t *)(uintptr_t)(mm2->base + 0x45f9cc),
                     *(volatile uint32_t *)(uintptr_t)(mm2->base + 0x105f9e4));
+        }
+        { void dm_dump_alloc_state(const char *); dm_dump_alloc_state("崩溃现场"); }
+        // np328：把**调用者**（subsdk0+0x10cb80 附近）的运行期指令 dump 出来。
+        // 为什么：subsdk0 的 .bin 是压缩映像，离线反汇编对不上；运行期内存里才是真指令。
+        // 调用链来自 np327 的栈扫描：main+0x45f9dc ← subsdk0+0x10cb80 ← sdk+0x6c21d0 …
+        for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "subsdk0")) {
+            uint32_t *q = (uint32_t *)(g_mod[i].base + 0x10cb30);
+            fprintf(stderr, "[dm] np328 subsdk0+0x10cb30:");
+            for (int k = 0; k < 28; k++) fprintf(stderr, " %08x", q[k]);
+            fprintf(stderr, "\n");
+            break;
         }
         fprintf(stderr, " | 原始 pc=%#llx 该处指令=%08x lr=%#llx",
                 (unsigned long long)UC_PC(uc),
@@ -433,6 +693,8 @@ void crash_thread_init(void) {}
 #endif
 void crash_install(void) {
     crash_thread_init();
+    // np304：启动就打一行本轮标识 —— 读 hilog 时"哪一块是这一轮"由此判定，不再靠猜。
+    fprintf(stderr, "[dm] 本轮启动 %s\n", dm_run_tag());
     struct sigaction sa = {.sa_sigaction = on_crash, .sa_flags = SA_SIGINFO | CRASH_SA_ONSTACK};
     sigaction(SIGALRM, &sa, 0);
     // 两种看门狗都只在测试显式设了 DM_WATCH / DM_WATCH_STALL 时开：产品（玩家从桌面启动，无环境变量）一个不开。

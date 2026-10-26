@@ -80,10 +80,17 @@ typedef struct { const char *name; void *fn; } nvn_impl;
 
 static int g_log;
 uint64_t nvn_new_serial(void) { static _Atomic uint64_t n; return ++n; }
+// np339：每个 NVN 入口的"最后一次客体调用点"（thunk 里 `str x30` 写入），崩溃时倒出。
+// np339: last guest call site per NVN entry, written by the thunk (str x30). Dumped on crash.
+__attribute__((visibility("hidden"))) uint64_t nvn_last_ra[NVN_NFUNC];   // np339：隐藏可见性 ⇒ 汇编可直接相对寻址
+
 static unsigned g_nsem;                          // 语义实现个数（nvn_init_slots 填） | Number of semantic implementations (filled by nvn_init_slots)
 // np269：OLOG 原来只认 DM_NVN_LOG，而真机上 g_log 常为 false ⇒ DeviceGetInteger 这类
 // 关键调用序列被吞掉，白白浪费好几轮。改成 DM_NVN_LOG **或** DM_IMPORTS 都输出。
 #define OLOG(...) do { if (g_log || g_flag.imports) LOG("[nvn] " __VA_ARGS__); } while (0)
+// np314：每次进程只打一条（上游 nxnative 的 ONCE_LOG 同款），用于"知道但暂时不实现"的入口，避免刷屏楔死客体线程
+// np314: log once per process (same as upstream's ONCE_LOG) for entries we knowingly leave unimplemented
+#define ONCE_LOG(...) do { static int _once; if (_once++ < 4) LOG("[nvn] " __VA_ARGS__); } while (0)
 
 static void nvn_init_slots(void) {
     static int done; if (done) return; done = 1;
@@ -152,6 +159,18 @@ NVN(nvnDeviceInitialize, NVNboolean, NVNdevice *d, const NVNdeviceBuilder *b) {
     return 1;
 }
 NVN(nvnDeviceFinalize, void, NVNdevice *d) { ((dev_t_ *)d)->magic = 0; }
+// np310：GetTimestampInNanoseconds —— 之前返 0 ⇒ 游戏算出的时间差恒 0（性能统计/帧节奏会乱）。
+// 我们没有 NVN counter 那套硬件计数器，用宿主单调时钟顶替：**单调、纳秒、与调用次数同序**，
+// 这正是调用方拿它做差时要的性质（判据：连续两次调用返回值不减）。
+// np310: GetTimestampInNanoseconds used to return 0, so every delta the game computed was 0. We have no NVN
+// hardware counters, so hand out the host monotonic clock: monotonic, nanoseconds, same order as the calls.
+NVN(nvnDeviceGetTimestampInNanoseconds, uint64_t, const NVNdevice *d, const NVNcounterData *c) {
+    (void)d; (void)c;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+// np310：延迟收尾 —— 宿主是即时释放，没有"延迟队列"，空实现即正确。
+NVN(nvnDeviceApplyDeferredFinalizes, void, NVNdevice *d, int n) { (void)d; (void)n; }
 NVN(nvnDeviceGetProcAddress, PFNNVNGENERICFUNCPTRPROC, const NVNdevice *d, const char *name) {
     (void)d; return (PFNNVNGENERICFUNCPTRPROC)nvn_lookup(name);
 }
@@ -220,6 +239,17 @@ NVN(nvnDeviceGetImageHandle, NVNimageHandle, const NVNdevice *d, int id) { (void
 // 分离贴图 / 采样器句柄：值 = 描述符号（采样器号放 20 位以上，与组合句柄的位布局一致）
 // Separate texture / sampler handles: value = descriptor index (the sampler index goes in bit 20 and above, consistent with the bit layout of combined handles)
 NVN(nvnDeviceGetSeparateTextureHandle, NVNseparateTextureHandle, const NVNdevice *d, int id) { (void)d; return (NVNseparateTextureHandle){(uint64_t)id}; }
+// np308：旧式合成句柄 = 贴图号 | (采样器号 << 20)。
+// 判据不是"照抄 NVN 文档"，而是**引擎侧的解码**：xbg_game.cpp 里贴图是 `handle & 0xfffff`、
+// 采样器是 `handle >> 20`，且 combined-image-sampler 在没有独立采样器槽时直接拿 handle 当采样器句柄。
+// 所以这个位域必须与那两处解码对上，否则绑上去的贴图/采样器会指向错的东西（不会崩，纯画面错）。
+// np308: legacy combined handle = texture id | (sampler id << 20). The justification is the ENGINE's own decode
+// (xbg_game.cpp: texture = handle & 0xfffff, sampler = handle >> 20, and a combined-image-sampler falls back to
+// using the handle itself as the sampler handle), so the bit layout must match those two sites.
+NVN(nvnDeviceGetTextureHandle, NVNtextureHandle, const NVNdevice *d, int tid, int sid) {
+    (void)d;
+    return (NVNtextureHandle)(((uint64_t)tid & 0xFFFFFu) | ((uint64_t)sid << 20));
+}
 NVN(nvnDeviceGetSeparateSamplerHandle, NVNseparateSamplerHandle, const NVNdevice *d, int id) { (void)d; return (NVNseparateSamplerHandle){(uint64_t)id << 20}; }
 NVN(nvnDeviceInstallDebugCallback, void, NVNdevice *d, const PFNNVNDEBUGCALLBACKPROC cb, void *data, uint32_t enable) {
     dev_t_ *o = (dev_t_ *)d; o->dbg_cb = B(enable) ? (void *)cb : NULL; o->dbg_data = data;
@@ -271,7 +301,18 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
 }
 NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) { pool_flags_del(p); if (((pool_t *)p)->mem) { nvn_dirty_remove_range(((pool_t *)p)->mem); mtl_pool_del(((pool_t *)p)->mem); } ((pool_t *)p)->magic = 0; }
 NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
+// np310：宿主内存是 cache 相干的普通内存，Flush/Invalidate 都无事可做（与上面 Flush 对称）。
+NVN(nvnMemoryPoolInvalidateMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
 NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { return (NVNbufferAddress)((const pool_t *)p)->mem; }
+// np308：MemoryPoolMap 在 BotW 里有 266 个静态调用点，之前落到通用空实现 ⇒ 返回 NULL，
+// 调用方拿到 NULL 基址后自己算偏移，写进去就崩（和 this=0 同一类）。
+// 语义：返回一段**CPU 可访问**的池存储指针。我们的池本来就是宿主内存（pool_t.mem），
+// 所以这就是 mem 本身 —— 与上面 GetBufferAddress 的既有做法完全一致（判据：两者返回值相同）。
+// np308: MemoryPoolMap has 266 static call sites in BotW and used to hit the generic stub (NULL), so callers
+// computed offsets off a NULL base. Semantics: return a CPU-accessible pointer to the pool storage; our pools
+// ARE host memory (pool_t.mem), so it is just `mem` -- the same thing GetBufferAddress already returns.
+NVN(nvnMemoryPoolMap, void *, const NVNmemoryPool *p) { return (void *)((const pool_t *)p)->mem; }
+NVN(nvnMemoryPoolGetFlags, NVNmemoryPoolFlags, const NVNmemoryPool *p) { return (NVNmemoryPoolFlags)((const pool_t *)p)->flags; }
 
 // ---------- 描述符池 ----------
 // ---------- Descriptor pools ----------
@@ -300,6 +341,13 @@ NVN(nvnTextureBuilderSetWidth, void, NVNtextureBuilder *b, int v) { TB(b)->d.wid
 NVN(nvnTextureBuilderSetHeight, void, NVNtextureBuilder *b, int v) { TB(b)->d.height = v; }
 NVN(nvnTextureBuilderSetDepth, void, NVNtextureBuilder *b, int v) { TB(b)->d.depth = v; }
 NVN(nvnTextureBuilderSetSize1D, void, NVNtextureBuilder *b, int w) { TB(b)->d.width = w; TB(b)->d.height = TB(b)->d.depth = 1; }
+// np310：SetSize2D / SetSize3D —— BotW 在初始化段各调 4 / 1 次。
+// 之前落到通用空实现 ⇒ 尺寸保持 SetDefaults 的 1×1，采样出来就是"整张贴图一个像素"。
+// 判据：与 SetWidth/SetHeight 写同一批字段（d.width/d.height/d.depth）。
+// np310: SetSize2D / SetSize3D (4 / 1 call sites in the init segment). They used to hit the generic stub, so the
+// size stayed at the 1x1 from SetDefaults -- every such texture sampled as a single pixel. Same fields as SetWidth.
+NVN(nvnTextureBuilderSetSize2D, void, NVNtextureBuilder *b, int w, int h) { TB(b)->d.width = w; TB(b)->d.height = h; TB(b)->d.depth = 1; }
+NVN(nvnTextureBuilderSetSize3D, void, NVNtextureBuilder *b, int w, int h, int d) { TB(b)->d.width = w; TB(b)->d.height = h; TB(b)->d.depth = d; }
 NVN(nvnTextureBuilderSetLevels, void, NVNtextureBuilder *b, int v) { TB(b)->d.levels = v; }
 NVN(nvnTextureBuilderSetFormat, void, NVNtextureBuilder *b, NVNformat f) { TB(b)->d.format = f; }
 NVN(nvnTextureBuilderSetSamples, void, NVNtextureBuilder *b, int s) { TB(b)->d.samples = s; }
@@ -416,6 +464,10 @@ NVN(nvnTextureGetWidth, int, const NVNtexture *t) { return (int)CTX(t)->d.width;
 NVN(nvnTextureGetHeight, int, const NVNtexture *t) { return (int)CTX(t)->d.height; }
 NVN(nvnTextureGetDepth, int, const NVNtexture *t) { return (int)CTX(t)->d.depth; }
 NVN(nvnTextureGetStorageSize, int, const NVNtexture *t) { return (int)CTX(t)->L.size; }
+// np310：ZCull 在宿主侧不存在（引擎按普通颜色目标处理）⇒ 尺寸恒 0。
+// 若游戏拿非 0 去算偏移，反而是错的；0 与"没有 ZCull"一致。
+NVN(nvnTextureGetZCullStorageSize, size_t, const NVNtexture *t) { (void)t; return 0; }
+NVN(nvnTextureBuilderGetZCullStorageSize, size_t, const NVNtextureBuilder *b) { (void)b; return 0; }
 NVN(nvnTextureCompare, NVNboolean, const NVNtexture *a, const NVNtexture *b) {
     const tex_t *x = CTX(a), *y = CTX(b);
     return !memcmp(&x->d, &y->d, sizeof x->d) && x->mem == y->mem;
@@ -469,6 +521,15 @@ NVN(nvnSamplerBuilderSetDefaults, void, NVNsamplerBuilder *b) {
     o->lod_min = -1000.f; o->lod_max = 1000.f; o->aniso = 1.f;
 }
 NVN(nvnSamplerBuilderSetDevice, void, NVNsamplerBuilder *b, NVNdevice *d) { ((samp_builder_t *)b)->dev = d; }
+// np314：两个采样器是否等价。按我们 samp_par 里**实际有的**字段比（我们没有 reduction 字段）。
+// 用途是游戏的去重优化：判错只影响"要不要重绑"，不影响正确性。
+NVN(nvnSamplerCompare, NVNboolean, const NVNsampler *a, const NVNsampler *b) {
+    const samp_par *x = &((const samp_t *)a)->p, *y = &((const samp_t *)b)->p;
+    return x->minf == y->minf && x->magf == y->magf && x->ws == y->ws && x->wt == y->wt && x->wr == y->wr &&
+           x->cmp_mode == y->cmp_mode && x->cmp_func == y->cmp_func &&
+           x->lod_min == y->lod_min && x->lod_max == y->lod_max && x->lod_bias == y->lod_bias &&
+           x->aniso == y->aniso && !memcmp(x->border, y->border, sizeof x->border);
+}
 NVN(nvnSamplerBuilderSetMinMagFilter, void, NVNsamplerBuilder *b, NVNminFilter mi, NVNmagFilter ma) { SB(b)->minf = mi; SB(b)->magf = ma; }
 NVN(nvnSamplerBuilderSetWrapMode, void, NVNsamplerBuilder *b, NVNwrapMode s, NVNwrapMode t, NVNwrapMode r) { SB(b)->ws = s; SB(b)->wt = t; SB(b)->wr = r; }
 NVN(nvnSamplerBuilderSetLodClamp, void, NVNsamplerBuilder *b, float lo, float hi) { SB(b)->lod_min = lo; SB(b)->lod_max = hi; }
@@ -487,6 +548,10 @@ NVN(nvnSamplerInitialize, NVNboolean, NVNsampler *s, const NVNsamplerBuilder *b)
     samp_t *o = (samp_t *)s; o->magic = MAGIC('S', 'M', 'P', 0); o->p = ((const samp_builder_t *)b)->p; return 1;
 }
 NVN(nvnSamplerFinalize, void, NVNsampler *s) { ((samp_t *)s)->magic = 0; }
+// np310：调试标签 —— 宿主没有 GPU 调试标记通道（VK_EXT_debug_marker 未启用），空实现即正确。
+NVN(nvnSamplerSetDebugLabel, void, NVNsampler *s, const char *l) { (void)s; (void)l; }
+NVN(nvnMemoryPoolSetDebugLabel, void, NVNmemoryPool *p, const char *l) { (void)p; (void)l; }
+NVN(nvnProgramSetDebugLabel, void, NVNprogram *p, const char *l) { (void)p; (void)l; }
 
 // ---------- 程序 ----------
 // ---------- Programs ----------
@@ -738,12 +803,14 @@ static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
         o->cb((NVNcommandBuffer *)o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY, size + OP_RESERVE, o->cb_data);
     }
     if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.bytes += size; g_cs.recs++; pthread_mutex_unlock(&g_cs_mu); }
+    if (o->recording) o->used += size;                       // np314：GetCommandMemoryUsed 的来源
     uint8_t *p = o->cur; o->cur += size; put_hdr(p, 0, size); return p;
 }
 NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
     cmd_t *o = CB(c);
     if (o->recording) LOG("【红】BeginRecording 重入");
     o->recording = 1;
+    o->used = 0;                                             // np314：新一次录制从 0 开始
     uint8_t *p = cmd_alloc(o, 8); put_hdr(p, OP_BEGIN, 8); o->begin = p;
 }
 NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
@@ -753,8 +820,34 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     return (NVNcommandHandle)o->begin;
 }
 NVN(nvnCommandBufferIsRecording, NVNboolean, const NVNcommandBuffer *c) { return ((const cmd_t *)c)->recording != 0; }
+// np314：命令内存用量 —— BotW 在初始化段会取这三个名字（GetCommandMemoryUsed 有 3 个静态调用点）。
+// 语义照 nxnative：Used = 本次录制写入的字节，Free = 当前段剩余，Size = Used + Free。
+// ⚠ 为什么必须给真值而不是 0：nxnative 有个真机崩溃（王国之泪，跑几分钟后 mtl_exec 崩）的根因就是
+//   "命令内存链不该写过 GetCommandMemoryUsed 报出去的量" —— 报 0 等于告诉游戏"这段还没用"。
+// np314: command-memory accounting. Upstream (nxnative) traced a real crash to this contract: a command-memory
+// link must never write past what GetCommandMemoryUsed reported, so returning 0 is not harmless.
+NVN(nvnCommandBufferGetCommandMemoryUsed, size_t, const NVNcommandBuffer *c) {
+    const cmd_t *m = (const cmd_t *)c;
+    return m->begin ? (size_t)m->used : 0;
+}
+NVN(nvnCommandBufferGetCommandMemoryFree, size_t, const NVNcommandBuffer *c) {
+    const cmd_t *m = (const cmd_t *)c;
+    return (m->cur && m->end > m->cur) ? (size_t)(m->end - m->cur) : 0;
+}
+NVN(nvnCommandBufferGetCommandMemorySize, size_t, const NVNcommandBuffer *c) {
+    return h_nvnCommandBufferGetCommandMemoryUsed(c) + h_nvnCommandBufferGetCommandMemoryFree(c);
+}
+NVN(nvnCommandBufferGetControlMemoryUsed, size_t, const NVNcommandBuffer *c) { (void)c; return 0; }
+
 NVN(nvnCommandBufferCopyCommands, void, NVNcommandBuffer *c, int n, const NVNcommandHandle *h) {
     for (int i = 0; i < n; i++) { uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_CALL, 16); memcpy(p + 8, &h[i], 8); }
+}
+// np314：CallCommands（25 个静态调用点，是我们最大的一块缺口）= 二级命令缓冲继承。
+// 照 nxnative：回放层对 CALL 与 COPY 同等对待 ⇒ 直接委派给 CopyCommands，不新造记录。
+// np314: CallCommands (25 static call sites, our biggest gap). Upstream treats CALL and COPY alike at replay time,
+// so delegate to CopyCommands instead of inventing a record.
+NVN(nvnCommandBufferCallCommands, void, NVNcommandBuffer *c, int n, const NVNcommandHandle *h) {
+    h_nvnCommandBufferCopyCommands(c, n, h);
 }
 NVN(nvnCommandBufferSignalEvent, void, NVNcommandBuffer *c, const NVNevent *e, NVNeventSignalMode m, NVNeventSignalLocation loc, int flags, uint32_t v) {
     (void)loc; (void)flags;
@@ -815,6 +908,28 @@ NVN(nvnCommandBufferSetViewports, void, NVNcommandBuffer *c, int first, int n, c
     p_viewports *r = REC(c, OP_VIEWPORTS, p_viewports); r->first = first; r->n = n;
     for (int i = 0; i < n; i++) memcpy(r->v[i], v + 4 * i, 16);
 }
+// np305：旧式单个视口（4 个静态调用点）= "设 1 个"的 SetViewports 版；整型 → 浮点，深度范围由引擎默认补。
+// np305: legacy single viewport (4 static call sites) == SetViewports with n=1; ints -> floats, depth range left to the engine default.
+// np314：渲染使能（13 + 11 个静态调用点）。真条件渲染需要新的 OP（引擎要认），
+// 上游 nxnative 的默认行为也是"只记一条日志，照样画" ⇒ 先对齐这个默认，画面不会因此更差，
+// 但**已知缺口**：SetRenderEnable(false) 期间我们仍会画（写在这里，免得以后当成新 bug 查）。
+// np314: render enable (13 + 11 static sites). Real conditional rendering needs a new OP; upstream's default is
+// to log once and draw anyway, so match it -- with a KNOWN GAP: we still draw while it is disabled.
+NVN(nvnCommandBufferSetRenderEnable, void, NVNcommandBuffer *c, uint32_t en) {
+    (void)c; if (!(en & 0xff)) ONCE_LOG("[nvn] SetRenderEnable(false)：暂时照样画（已知缺口）");
+}
+NVN(nvnCommandBufferSetRenderEnableConditional, void, NVNcommandBuffer *c, NVNconditionalRenderMode m, NVNbufferAddress a) {
+    (void)c; (void)m; (void)a; ONCE_LOG("[nvn] SetRenderEnableConditional：暂时照样画（已知缺口）");
+}
+NVN(nvnCommandBufferSetViewport, void, NVNcommandBuffer *c, int x, int y, int w, int h) {
+    const float v[4] = {(float)x, (float)y, (float)w, (float)h};
+    h_nvnCommandBufferSetViewports(c, 0, 1, v);   // NVN() 宏生成的是 h_ 前缀的静态函数 | the NVN() macro defines a static h_-prefixed function
+}
+// np314：这三个在 Vulkan 后端没有对应状态（线宽恒 1、点大小来自着色器、alpha test 由着色器做），
+// 与上游 nxnative 一致：只记一条，不改行为。
+NVN(nvnCommandBufferSetAlphaRef, void, NVNcommandBuffer *c, float r) { (void)c; (void)r; ONCE_LOG("[nvn] SetAlphaRef：宿主无 alpha test（由着色器做）"); }
+NVN(nvnCommandBufferSetLineWidth, void, NVNcommandBuffer *c, float w) { (void)c; if (w != 1.0f) ONCE_LOG("[nvn] SetLineWidth %.2f：宿主只支持 1 像素线", w); }
+NVN(nvnCommandBufferSetPointSize, void, NVNcommandBuffer *c, float s) { (void)c; (void)s; ONCE_LOG("[nvn] SetPointSize：点大小来自着色器"); }
 NVN(nvnCommandBufferSetScissor, void, NVNcommandBuffer *c, int x, int y, int w, int h) { *REC(c, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h}; }
 NVN(nvnCommandBufferSetDepthRange, void, NVNcommandBuffer *c, float n, float f) { *REC(c, OP_DEPTH_RANGE, p_depth_range) = (p_depth_range){n, f}; }
 NVN(nvnCommandBufferBindProgram, void, NVNcommandBuffer *c, const NVNprogram *p, int stages) {
@@ -823,6 +938,10 @@ NVN(nvnCommandBufferBindProgram, void, NVNcommandBuffer *c, const NVNprogram *p,
 static void bind_state(NVNcommandBuffer *c, int kind, const void *st, size_t n) { p_bind_state *r = REC(c, OP_BIND_STATE, p_bind_state); r->kind = kind; memcpy(r->bytes, st, n); }
 NVN(nvnCommandBufferBindBlendState, void, NVNcommandBuffer *c, const NVNblendState *st) { bind_state(c, 0, st, sizeof(blend_st)); }
 NVN(nvnCommandBufferBindColorState, void, NVNcommandBuffer *c, const NVNcolorState *st) { bind_state(c, 1, st, sizeof(color_st)); }
+// np314：color_st 里本来就有 logic_op / alpha_func 两个位域（BindColorState 会把整块记进去），
+// 之前这两个 setter 落到空实现 ⇒ 游戏设的值根本没写进状态对象。照 nxnative 补上。
+NVN(nvnColorStateSetLogicOp, void, NVNcolorState *s, NVNlogicOp op) { ((color_st *)s)->logic_op = (uint32_t)op; }
+NVN(nvnColorStateSetAlphaTest, void, NVNcolorState *s, NVNalphaFunc f) { ((color_st *)s)->alpha_func = (uint32_t)f; }
 NVN(nvnCommandBufferBindChannelMaskState, void, NVNcommandBuffer *c, const NVNchannelMaskState *st) { bind_state(c, 2, st, sizeof(chmask_st)); }
 NVN(nvnCommandBufferBindMultisampleState, void, NVNcommandBuffer *c, const NVNmultisampleState *st) { bind_state(c, 3, st, sizeof(ms_st)); }
 NVN(nvnCommandBufferBindPolygonState, void, NVNcommandBuffer *c, const NVNpolygonState *st) { bind_state(c, 4, st, sizeof(poly_st)); }
@@ -838,6 +957,12 @@ NVN(nvnCommandBufferBindVertexStreamState, void, NVNcommandBuffer *c, int n, con
 NVN(nvnCommandBufferBindVertexBuffers, void, NVNcommandBuffer *c, int first, int n, const NVNbufferRange *rg) {
     if (n < 0 || first + n > 16) { LOG("【红】BindVertexBuffers first=%d n=%d", first, n); return; }
     p_bind_vbuf *r = RECN(c, OP_BIND_VBUF, p_bind_vbuf, r, n); r->first = first; r->n = n; memcpy(r->r, rg, sizeof *rg * n);
+}
+// np305：旧式单条顶点缓冲（21 个静态调用点）= "绑 1 条"的 BindVertexBuffers 版；参数 (index, address, size) 正好是一个区间。
+// np305: legacy single vertex buffer (21 static call sites) == BindVertexBuffers with n=1; (index, address, size) is exactly one range.
+NVN(nvnCommandBufferBindVertexBuffer, void, NVNcommandBuffer *c, int i, NVNbufferAddress addr, size_t size) {
+    const NVNbufferRange r = {(NVNbufferAddress)addr, (uint64_t)size};
+    h_nvnCommandBufferBindVertexBuffers(c, i, 1, &r);
 }
 NVN(nvnCommandBufferBindUniformBuffer, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNbufferAddress a, size_t n) {
     *REC(c, OP_BIND_UBO, p_bind_buf) = (p_bind_buf){st, i, a, n};
@@ -863,6 +988,11 @@ NVN(nvnCommandBufferBindImages, void, NVNcommandBuffer *c, NVNshaderStage st, in
 NVN(nvnCommandBufferBindSeparateTextures, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNseparateTextureHandle *h) {
     bind_handles(c, OP_BIND_TEX, st, first, n, (const uint64_t *)h);
 }
+// np305：旧式单张贴图绑定（4 个静态调用点）= "绑定 1 张"的 Separated 版；NVNtextureHandle 本身就是 uint64_t。
+// np305: legacy single-texture bind (4 static call sites) == the separated form with n=1; NVNtextureHandle is a uint64_t.
+NVN(nvnCommandBufferBindTexture, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNtextureHandle h) {
+    bind_handles(c, OP_BIND_TEX, st, i, 1, &h);
+}
 NVN(nvnCommandBufferBindSeparateSamplers, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNseparateSamplerHandle *h) {
     bind_handles(c, OP_BIND_SAMP, st, first, n, (const uint64_t *)h);
 }
@@ -879,6 +1009,19 @@ NVN(nvnCommandBufferDrawArrays, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, 
 NVN(nvnCommandBufferDrawElementsInstanced, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, int n, NVNbufferAddress ib,
     int bv, int bi, int inst) {
     *REC(c, OP_DRAW_IDX, p_draw_idx) = (p_draw_idx){pr, it, n, bv, bi, inst, ib};
+}
+// np305：BotW 的**主绘制调用**（main 里有 269 个静态调用点），之前一直落到通用空实现 ⇒ 什么都不画。
+// 语义就是 Instanced 版取默认值：base_vertex=0、base_instance=0、instances=1 ⇒ 发出的 OP 记录完全相同，
+// 所以这里不新造路径，直接复用同一张记录表（判据：与 Instanced 版只差这三个常量）。
+// np305: BotW's **main draw call** (269 static call sites in main) used to fall through to the generic stub, so
+// nothing was ever drawn. Semantics == the instanced form with the defaults (base_vertex=0, base_instance=0,
+// instances=1), so the emitted OP record is identical; reuse the same record instead of a new path.
+NVN(nvnCommandBufferDrawElements, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, int n, NVNbufferAddress ib) {
+    *REC(c, OP_DRAW_IDX, p_draw_idx) = (p_draw_idx){pr, it, n, 0, 0, 1, ib};
+}
+NVN(nvnCommandBufferDrawElementsBaseVertex, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, int n, NVNbufferAddress ib,
+    int bv) {
+    *REC(c, OP_DRAW_IDX, p_draw_idx) = (p_draw_idx){pr, it, n, bv, 0, 1, ib};
 }
 NVN(nvnCommandBufferDispatchCompute, void, NVNcommandBuffer *c, int x, int y, int z) {
     // 跳板是尾跳（br），这里的返回地址就是游戏里的调用点

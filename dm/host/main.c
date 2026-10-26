@@ -98,7 +98,9 @@ static void guest_main(void) {
     LOG(">>> nninitStartup"); ((fn0)req("nninitStartup"))();
     ((fn0)req("_init_libc2"))();
     dm_prof_mark("② SDK 初始化（nnosInitialize → nninitStartup）");
+    { void dm_map_null_page(void); dm_map_null_page(); }
     run_module_inits();   // rtld 回调 B：各模块 DT_INIT（全局构造函数） | rtld callback B: each module's DT_INIT (global constructors)
+    { void dm_pin_alloc_got(void); dm_pin_alloc_got(); void dm_dump_alloc_state(const char *); dm_dump_alloc_state("模块构造后"); }
     dm_prof_mark("③ 各模块 init_array");
     ((fnp)req("_ZN2nn2os11SetHostArgcEi"))((void *)(uint64_t)g_argc);
     ((fnp)req("_ZN2nn2os11SetHostArgvEPPc"))(g_argv);
@@ -227,6 +229,7 @@ int dm_app_bootstrap(int *argc, char ***argv);   // app_mac.m：包成 .app 双�
 static void *guest_run_thread(void *a) {
     (void)a;
     void crash_thread_init(void); crash_thread_init();   // 信号备用栈是每线程的
+    { void guest_flush_icache(int); guest_flush_icache(0); }   // np304：本线程执行前清补丁点 icache
     front_run(guest_main);
     return NULL;
 }
@@ -268,6 +271,10 @@ int main(int argc, char **argv) {
         void crash_thread_init(void); crash_thread_init();   // 信号备用栈是每线程的：装载在别的线程上装过，本线程补上 | The signal alternate stack is per thread: loading installed it on another thread, so add it for this thread
         LOG("宿主装载已在后台提前完成（dm_host_preload_start）");
     } else host_preload(argc, argv);
-    if (!run_guest_on_guest_stack()) front_run(guest_main);
+    if (!run_guest_on_guest_stack()) {
+        void crash_thread_init(void); crash_thread_init();
+        { void guest_flush_icache(int); guest_flush_icache(0); }   // np304：退回宿主栈时这条路径也要清
+        front_run(guest_main);
+    }
     return 0;
 }

@@ -187,6 +187,7 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
 // ---------- 锁 ----------
 // ---------- Locks ----------
 static inline uint32_t ld32(uint64_t a) { return __atomic_load_n((uint32_t *)a, __ATOMIC_SEQ_CST); }
+static inline uint64_t ld64(uint64_t a) { return __atomic_load_n((uint64_t *)a, __ATOMIC_SEQ_CST); }
 static inline void st32(uint64_t a, uint32_t v) { __atomic_store_n((uint32_t *)a, v, __ATOMIC_SEQ_CST); }
 static inline int cas32(uint64_t a, uint32_t *exp, uint32_t v) { return __atomic_compare_exchange_n((uint32_t *)a, exp, v, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
 
@@ -226,6 +227,7 @@ static void *thread_main(void *p) {
     t->mport = pthread_mach_thread_np(pthread_self());
     crash_thread_init();
     guest_thread_init();
+    { void guest_flush_icache(int); guest_flush_icache(0); }   // np304：本线程执行前清补丁点 icache（不广播，只能各清各的） | np304: flush patched points before this thread runs guest code (no broadcast, so each thread flushes its own)
     pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); pthread_mutex_unlock(&G);
     dm_thread_enter(t->entry, t->arg, t->stack_top);   // 不返回：客体须经 ExitThread 退出 | Does not return: the guest must exit through ExitThread
     die("客体线程入口返回");
@@ -483,6 +485,17 @@ void svc_thread_dump(void) {
     }
 }
 
+// np343 对齐 nxnative：占进程线程资源上限名额的游戏线程数——已创建（无论是否 started）且未退出（hle_svc.c GetInfo FreeThreadCount 用）。
+// Horizon 里 pm 给应用的限额是 96 个线程；SDK 11+ 的 nn::os::GetFreeThreadCount 拿它决定建不建线程，
+// 回 0 会让主线程在启动时等一个永远不会出现的线程（nxnative 实测：Monster Train 2 卡死在 main+0x3e1ac4）
+int thr_limit_used(void) {
+    int n = 0;
+    pthread_mutex_lock(&G);
+    for (thr_t *t = g_all; t; t = t->all) n += !t->exited;
+    pthread_mutex_unlock(&G);
+    return n;
+}
+
 int svc_thread(int num, uint64_t *regs) {
     { thr_t *me = pthread_getspecific(g_keythr); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->nsvc++; } }
     // np243：带上返回地址 —— 一轮"逐页扫内存"的 svc 只有靠 lr 才能定位是客体的哪个函数在扫
@@ -498,7 +511,10 @@ int svc_thread(int num, uint64_t *regs) {
         thr_t *t = calloc(1, sizeof *t);
         pthread_cond_init(&t->cv, NULL);
         t->entry = regs[1]; t->arg = regs[2]; t->stack_top = regs[3] & ~0xFull;
-        t->prio = (int)regs[4]; t->core = (int)regs[5]; t->mask = t->core >= 0 ? 1ull << t->core : 7;
+        // np343 对齐 nxnative：核 -2（IdealCoreUseProcessValue）= 进程缺省理想核（本游戏为 0），亲和掩码只有它——同 Horizon 内核。
+        // 原先原样记 -2，GetCurrentProcessorNumber 就会答 0xFFFFFFFE：按当前核号做下标索引每核引擎槽的代码会越界
+        // （nxnative 实测：SMBW 字体引擎以核号选槽，收到 -2 直接崩 main+0x107dbc0）。
+        t->prio = (int)regs[4]; t->core = (int)regs[5] >= 0 ? (int)regs[5] : 0; t->mask = 1ull << t->core;
         t->born_ns = now_ns(); t->born_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
         pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
         pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 1 << 20);
@@ -535,12 +551,16 @@ int svc_thread(int num, uint64_t *regs) {
     case 0x0D: { thr_t *t = h_get((uint32_t)regs[0], O_THREAD); if (t) t->prio = (int)regs[1]; regs[0] = t ? 0 : R_BAD_HANDLE; return 1; }
     case 0x0E: { thr_t *t = h_get((uint32_t)regs[2], O_THREAD);
                  regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)(uint32_t)t->core : 0; regs[2] = t ? t->mask : 0; return 1; }
-    case 0x0F: {  // SetThreadCoreMask(w0, w1 理想核, x2 掩码)：-1 = 用进程缺省、-2/-3 = 不改理想核；宿主只记账 | SetThreadCoreMask(w0, w1 ideal core, x2 mask): -1 = use the process default, -2/-3 = leave the ideal core unchanged; the host only keeps the bookkeeping
+    case 0x0F: {  // SetThreadCoreMask(w0, w1 理想核, x2 掩码)：-2 = 进程缺省（理想核 0、掩码只有它）、-1 = 不在乎、-3 = 理想核不变（同 Horizon 内核）；宿主只记账 | SetThreadCoreMask(w0, w1 ideal core, x2 mask): -2 = use the process default (ideal core 0, mask of just that core), -1 = don't care, -3 = leave the ideal core unchanged (as in the Horizon kernel); the host only keeps the bookkeeping
         thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
-        if (t) { int c = (int)regs[1]; if (c >= 0) t->core = c; else if (c == -1) t->core = 0; if (regs[2]) t->mask = regs[2]; }
+        if (t) { int c = (int)regs[1]; if (c >= 0) t->core = c; if (c == -2) { t->core = 0; t->mask = 1; } else if (regs[2]) t->mask = regs[2];
+            // np343 对齐 nxnative：理想核不在新掩码里（-2/-3 保留理想核但钉到别的核）时，同 Horizon 把理想核挪到掩码最低核。
+            // 否则 GetCurrentProcessorNumber 对钉在核 1/2 的线程仍报核 0，按核分队列的作业系统会去取核 0 的活、核 1/2 的队列没人排空
+            if (t->mask && (t->core < 0 || !(t->mask >> t->core & 1))) t->core = __builtin_ctzll(t->mask); }
         regs[0] = t ? 0 : R_BAD_HANDLE; return 1;
     }
-    case 0x10: regs[0] = (uint64_t)(uint32_t)cur()->core; return 1;
+    case 0x10: { thr_t *t = cur(); int c = t->core;   // np343 对齐 nxnative：当前核号永远答 0..2；没有理想核时报掩码允许的最低核，而不是掩码外的核 0
+                 regs[0] = (uint64_t)(uint32_t)(c >= 0 ? c : t->mask ? __builtin_ctzll(t->mask) : 0); return 1; }
     case 0x25: { thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? t->id : 0; return 1; }
 
     case 0x1A: {  // ArbitrateLock(w0 持有者句柄, x1 地址, w2 本线程标签) | ArbitrateLock(w0 owner handle, x1 address, w2 this thread's tag)
@@ -591,11 +611,12 @@ int svc_thread(int num, uint64_t *regs) {
         regs[0] = 0; return 1;
     }
 
-    case 0x34: {  // WaitForAddress(x0 地址, w1 类型, w2 值, x3 超时)：0 小于则等、1 小于则减一再等、2 相等则等 | WaitForAddress(x0 address, w1 type, w2 value, x3 timeout): 0 wait if less than, 1 decrement if less than then wait, 2 wait if equal
+    case 0x34: {  // WaitForAddress(x0 地址, w1 类型, w2 值, x3 超时)：0 小于则等、1 小于则减一再等、2 相等则等、3 64 位值相等则等 | WaitForAddress(x0 address, w1 type, w2 value, x3 timeout): 0 wait if less than, 1 decrement if less than then wait, 2 wait if equal, 3 wait if the 64-bit value is equal
+        // np343 对齐 nxnative：补类型 3（SDK 19 的 nn::os::WaitForAddress(const long*, long) 用它，之前会落进 32 位小于判断）
         thr_t *t = cur(); uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2];
         pthread_mutex_lock(&G);
         int64_t r; uint32_t v = ld32(addr);
-        int ok = type == 2 ? (int32_t)v == val : (int32_t)v < val;
+        int ok = type == 3 ? ld64(addr) == regs[2] : type == 2 ? (int32_t)v == val : (int32_t)v < val;
         if (ok && type == 1) { while (!cas32(addr, &v, v - 1)) if (!((int32_t)v < val)) { ok = 0; break; } }
         if (!ok) r = R_BAD_STATE;
         else { t->waddr = addr; r = block(t, 3, (int64_t)regs[3]); }
@@ -610,7 +631,10 @@ int svc_thread(int num, uint64_t *regs) {
         if (type != 0) {
             int32_t nv = val + 1;
             if (type == 2) {
-                if (cnt <= 0) nv = nw > 0 ? val - 1 : val + 1;
+                // np343 对齐 nxnative（mesosphere KAddressArbiter::SignalAndModifyByWaitingCountIfEqual；Ryujinx 与 yuzu 一致）：
+                // 全醒（count <= 0）且有等待者时减 2，不是减 1。以前减 1：Unity 的作业栅栏靠这个值判断作业是否做完，
+                // 等待者被提前放行，粒子几何作业与主线程对不上数、写出界（纹理对象下标、写空指针）
+                if (cnt <= 0) nv = nw > 0 ? val - 2 : val + 1;
                 else nv = nw == 0 ? val + 1 : nw <= cnt ? val - 1 : val;
             }
             uint32_t e = (uint32_t)val;

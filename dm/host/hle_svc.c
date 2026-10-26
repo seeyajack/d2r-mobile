@@ -90,6 +90,7 @@ static size_t image_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i++)
 // (after 82 minutes of boss rush, the asynchronous disk-read callback main+0x27ecdc asked for a contiguous 765 KB block, got null, and memset wrote to address 0; the process resident memory does not show this).
 // Free space / largest allocatable block call the allocator's own queries (sdk+0x2f9d78 / +0x2f9dbc, which go through CentralHeap::Query and take their own lock) and may only be called on a guest thread.
 // The values read are kept in g_gheap_last, and the red report on a null allocation carries the last readout directly (the allocator is not entered again at that moment). Units: total / free in MB, largest block in KB
+void *dm_guest_malloc(size_t n, size_t align);   // np320
 static module_t *mod_named(const char *n) { for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, n)) return &g_mod[i]; return NULL; }
 static _Atomic unsigned long long g_gheap_last[3];
 int dm_guest_heap_stat(unsigned long long *total_mb, unsigned long long *free_mb, unsigned long long *maxblk_kb) {
@@ -102,12 +103,78 @@ int dm_guest_heap_stat(unsigned long long *total_mb, unsigned long long *free_mb
 // 上次读到的主堆读数（总量 MB、余量 MB、最大可分配块 KB；没读过全 0）。任何线程可调——不进分配器（iOS 壳在主线程上记内存告警那一行用）
 // The last main-heap readout (total MB, free MB, largest allocatable block KB; all 0 if never read). Callable from any thread - does not enter the allocator (the iOS shell uses it on the main thread for the memory-warning log line)
 void dm_guest_heap_last(unsigned long long v[3]) { for (int i = 0; i < 3; i++) v[i] = atomic_load(&g_gheap_last[i]); }
-HLE_FORCE("_ZN2nn3mem17StandardAllocator8AllocateEmm", "照原版分配，只在返回空时报红（原版调用方多处不判空）", void *, hle_stdalloc_allocate, void *self, size_t size, size_t align) {
+// np322：两个重载共用一份实现（客体 malloc 走的是 Em，不是 Emm —— 上一轮拦错了重载）。
+static void *stdalloc_alloc_common(void *self, size_t size, size_t align) {
+    static void *(*orig)(void *, size_t); if (!orig) { module_t *ms = mod_named("sdk"); orig = (void *(*)(void *, size_t))(ms->base + 0x2f9974); }
+    void *p = orig(self, size);
+    // np321/322：客体分配器失败就由宿主兜底。实测这台机器上这个 StandardAllocator(main+0x22d71e8)
+    // 报"已初始化"却仍返回 0 ⇒ 工厂拿到 this=0 ⇒ 崩在 str wzr,[x19,#0x60]。
+    // np321/322: fall back to the host heap whenever the guest allocator fails. Measured on this device the
+    // StandardAllocator at main+0x22d71e8 reports initialized yet Allocate(0xa0) returns 0, so the factory gets
+    // this = 0 and dies on str wzr,[x19,#0x60].
+    // np325：**不再要求 size 非零** —— 真机证明这个入口会被以 size=0 调用（或参数位置与假设不同），
+    // 于是旧条件 `size && ...` 直接跳过兜底、把 0 原样返回，正好复现 this=0。
+    // np325: do not require a non-zero size. On device this entry is reached with size = 0 (or with a
+    // different argument layout), so the old `size && ...` guard skipped the fallback and returned 0 -- exactly
+    // the this = 0 we chase.
+    if (!p || (uintptr_t)p >= (uintptr_t)-4096) {
+        void *h = dm_guest_malloc(size, align);
+        static _Atomic int n;
+        if (atomic_fetch_add(&n, 1) < 10)
+            LOG("np325 客体分配器没给出内存（self=%p size=%zu 返回 %p）→ 宿主堆 %p", self, size, p, h);
+        if (!h) LOG("【红】np322 宿主堆也没给出 %zu 字节（对齐 %zu）", size, align);
+        p = h;
+    }
+    return p;
+}
+HLE_FORCE("_ZN2nn3mem17StandardAllocator8AllocateEm", "客体 malloc 用的就是这个重载：失败由宿主堆兜底", void *, hle_stdalloc_em, void *self, size_t size) {
+    return stdalloc_alloc_common(self, size, 16);
+}
+HLE_FORCE("_ZN2nn3mem17StandardAllocator8AllocateEmm", "带对齐的重载，同一份实现", void *, hle_stdalloc_allocate, void *self, size_t size, size_t align) {
+    return stdalloc_alloc_common(self, size, align);
+}
+// np324：把 handler 地址暴露给 loader，用于装载后**直接改写 GOT 槽**（纯数据写）
+void *dm_hle_alloc_em_addr(void) { return (void *)(uintptr_t)&hle_stdalloc_em; }
+void *dm_hle_alloc_emm_addr(void) { return (void *)(uintptr_t)&hle_stdalloc_allocate; }
+#if 0   /* np322：旧实现留档（只拦了 Emm，导致 np321 的兜底从未走到） */
+HLE_FORCE("_ZN2nn3mem17StandardAllocator8AllocateEmm", "照原版分配，只在返回空时报红（原版调用方多处不判空）", void *, hle_stdalloc_allocate_old, void *self, size_t size, size_t align) {
+    // np320：**未初始化的分配器**（首字节 = 已初始化标志，0 = 没构造）交给宿主堆。
+    // 为什么：客体 malloc(0x9b27a0) 用的那个 StandardAllocator(main+0x22d71e8) 在本作里从没被构造，
+    // 客体实现在这种状态下直接返回 0；而"改客体代码去绕开它"已被真机证明不生效（np315–318）。
+    // 这条链是：工厂 → Allocate(vptr=0 → 0x9f3444) → 客体 malloc → 就是这个导入 ⇒ 这里放行即可。
+    // np320: an uninitialized allocator (byte 0 = the initialized flag) is served from the host heap. The
+    // StandardAllocator at main+0x22d71e8 is never constructed in this title and the guest implementation
+    // returns 0 in that state; patching guest code to bypass it does not work on this device (np315-318).
     static void *(*orig)(void *, size_t, size_t); if (!orig) { module_t *ms = mod_named("sdk"); orig = (void *(*)(void *, size_t, size_t))(ms->base + 0x2f9974); }
     void *p = orig(self, size, align);
+    // np321：**客体分配器失败就由宿主兜底**。实测这台机器上：这个 StandardAllocator(main+0x22d71e8)
+    // 首字节是 1（已初始化），但 Allocate(0xa0) 仍返回 0 ⇒ 工厂拿到 this=0 ⇒ 崩在 str wzr,[x19,#0x60]。
+    // 与其猜它为什么失败，不如在这里兜住：非零申请、返回空（或 −4096 以内的伪地址）就改给宿主堆。
+    // np321: fall back to the host heap whenever the guest allocator fails. Measured on this device: the
+    // StandardAllocator at main+0x22d71e8 reports initialized (byte 0 = 1) yet Allocate(0xa0) returns 0, so the
+    // factory gets this = 0 and dies on str wzr,[x19,#0x60]. Instead of guessing why, catch it here.
+    if (size && (!p || (uintptr_t)p >= (uintptr_t)-4096)) {
+        void *h = dm_guest_malloc(size, align);
+        static _Atomic int n;
+        if (atomic_fetch_add(&n, 1) < 10)
+            LOG("np321 客体分配器没给出内存（self=%p 申请 %zu 返回 %p）→ 宿主堆 %p", self, size, p, h);
+        if (!h) LOG("【红】np321 宿主堆也没给出 %zu 字节（对齐 %zu）", size, align);
+        p = h;
+    }
     if (!p && size) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) LOG("【红】游戏堆分配返回空：申请 %zu 字节（对齐 %zu），分配器 %p；上次读数 主堆 %llu MB、余量 %llu MB、最大可分配块 %llu KB", size, align, self,
         (unsigned long long)g_gheap_last[0], (unsigned long long)g_gheap_last[1], (unsigned long long)g_gheap_last[2]); }
     return p;
+}
+#endif
+
+// np321：客体侧 Free —— 宿主堆给的指针不在客体地址空间里，交给客体分配器会把它当野指针处理。
+// 这里只把"客体地址空间内"的指针转发给原实现，其余跳过（泄漏换稳定；等分配器问题查清再收回）。
+int dm_ptr_in_as(const void *p);   // 定义在本文件后面
+HLE_FORCE("_ZN2nn3mem17StandardAllocator4FreeEPv", "客体地址空间内的指针才转发给原实现", void, hle_stdalloc_free, void *self, void *ptr) {
+    if (!ptr) return;
+    static void (*orig)(void *, void *); if (!orig) { module_t *ms = mod_named("sdk"); orig = (void (*)(void *, void *))(ms->base + 0x81144); }   // sdk 里 StandardAllocator::Free 的真实地址（离线从 sdk 的 dynsym 查到）
+    if (!dm_ptr_in_as(ptr)) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) LOG("np321 Free(%p)：不在客体地址空间（宿主堆给的），跳过", ptr); return; }
+    orig(self, ptr);
 }
 
 // 内存账（memstat.m）用：客体地址空间整块范围（未初始化时 base = NULL）
@@ -125,7 +192,8 @@ int dm_ptr_in_as(const void *p) {
 enum { I_CoreMask=0, I_PriorityMask=1, I_AliasAddr=2, I_AliasSize=3, I_HeapAddr=4, I_HeapSize=5,
        I_TotalMem=6, I_UsedMem=7, I_DebuggerAttached=8, I_ResourceLimit=9, I_IdleTick=10, I_RandomEntropy=11,
        I_AslrAddr=12, I_AslrSize=13, I_StackAddr=14, I_StackSize=15, I_SysResTotal=16, I_SysResUsed=17,
-       I_ProgramId=18, I_InitProcIdRange=19, I_UserExcAddr=20, I_TotalNonSys=21, I_UsedNonSys=22, I_IsApplication=23 };
+       I_ProgramId=18, I_InitProcIdRange=19, I_UserExcAddr=20, I_TotalNonSys=21, I_UsedNonSys=22, I_IsApplication=23,
+       I_FreeThreadCount=24 };
 
 static uint8_t g_seen[256];
 
@@ -146,13 +214,7 @@ static int map_find(uint64_t a, uint64_t n) {       // 返回 1 基下标，0 = 
     for (int i = 0; i < g_nmap; i++) if (a < g_map[i].base + g_map[i].size && g_map[i].base < a + n) return i + 1;
     return 0;
 }
-static void map_add(uint64_t b, uint64_t n, uint64_t src, uint32_t st) {
-    pthread_mutex_lock(&g_map_lock);
-    if (g_nmap >= MAX_MAP) die("映射表满");
-    g_map[g_nmap++] = (typeof(g_map[0])){b, n, src, st};
-    pthread_mutex_unlock(&g_map_lock);
-}
-static void map_del(int i) { pthread_mutex_lock(&g_map_lock); g_map[i] = g_map[--g_nmap]; pthread_mutex_unlock(&g_map_lock); }
+// np343：0x04/0x05 已改为调用点全程持锁内联登记，这两个带锁包装不再使用（保留定义会触发未用告警，删）
 
 int svc_thread(int num, uint64_t *regs);
 
@@ -179,24 +241,34 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
     case 0x03: regs[0] = 0; return 0;   // SetMemoryAttribute
     case 0x04: {  // MapMemory(dst, src, size)：SDK 建线程时把堆上的栈搬进栈区 | MapMemory(dst, src, size): when creating a thread the SDK moves the stack on the heap into the stack region
         uint64_t dst = regs[0], src = regs[1], size = regs[2];
+        // np343 对齐 nxnative：查找 + 校验 + 登记**全程持锁**（原先 find 在锁外、add 在锁内，
+        // 两个线程同时建栈时可同时通过 find、把对方的映射顶掉）
+        pthread_mutex_lock(&g_map_lock);
         if ((uint8_t *)dst < g_stack || (uint8_t *)dst + size > g_stack + g_stack_cap || map_find(dst, size)) {
+            pthread_mutex_unlock(&g_map_lock);
             LOG("MapMemory 目标非法或已占用 %#llx+%#llx", dst, size); regs[0] = 0xDC01; return 0; }
         // 苹果页 16K、Horizon 页 4K：可访问区扩到 16K 边界（多放开的是同区未用页，不影响语义）
         // Apple pages are 16K, Horizon pages 4K: the accessible region is extended to a 16K boundary (the extra pages opened are unused pages of the same region, semantics unaffected)
         uint64_t lo = dst & ~0x3FFFull, hi = (dst + size + 0x3FFF) & ~0x3FFFull;
         if (mprotect((void *)lo, hi - lo, PROT_READ | PROT_WRITE)) die("MapMemory mprotect errno=%d", errno);
         memcpy((void *)dst, (void *)src, size);   // 搬移语义：映射期间源区不被访问（Horizon 把它设为不可访问） | move semantics: the source region is not accessed while mapped (Horizon makes it inaccessible)
-        map_add(dst, size, src, 0x0B /*MappedMemory*/);
+        if (g_nmap >= MAX_MAP) { pthread_mutex_unlock(&g_map_lock); die("映射表满"); }
+        g_map[g_nmap++] = (typeof(g_map[0])){dst, size, src, 0x0B /*MappedMemory*/};
+        pthread_mutex_unlock(&g_map_lock);
         if (g_flag.svc) LOG("MapMemory %#llx <- %#llx +%#llx", dst, src, size);
         regs[0] = 0; return 0;
     }
     case 0x05: {  // UnmapMemory(dst, src, size)：内容搬回源区；16K 页可能与相邻映射共用，不收回权限 | UnmapMemory(dst, src, size): contents are moved back to the source region; a 16K page may be shared with an adjacent mapping, permissions are not revoked
         uint64_t dst = regs[0], src = regs[1], size = regs[2];
+        // np343 对齐 nxnative：与 0x04 同理查找 + 校验 + 删除全程持锁
+        pthread_mutex_lock(&g_map_lock);
         int k = map_find(dst, size);
         if (!k || g_map[k - 1].base != dst || g_map[k - 1].size != size || g_map[k - 1].src != src) {
+            pthread_mutex_unlock(&g_map_lock);
             LOG("UnmapMemory 与映射不符 %#llx+%#llx", dst, size); regs[0] = 0xD401; return 0; }
         memcpy((void *)src, (void *)dst, size);
-        map_del(k - 1);
+        g_map[k - 1] = g_map[--g_nmap];
+        pthread_mutex_unlock(&g_map_lock);
         regs[0] = 0; return 0;
     }
     case 0x06: {  // QueryMemory(MemoryInfo* out, PageInfo* pout, addr) → x1 = pageinfo
@@ -371,7 +443,12 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         case I_RandomEntropy: { uint64_t dm_entropy64(void); v = dm_entropy64(); break; }   // DM_DETCLOCK 开时为确定流（hle_os.c） | a deterministic stream when DM_DETCLOCK is on (hle_os.c)
         case I_ProgramId: v = 0x0100726014352000ull; break;
         case I_IsApplication: v = 1; break;
-        case I_UserExcAddr: v = 0; break;
+        // np343 对齐 nxnative：用户异常上下文区给一块真 0x1000 对齐缓冲（原先回 0——
+        // 较新 SDK 的 SetDyingMessageRegion 会往 +0x1c0 写，地址 0 就是空指针写）
+        case I_UserExcAddr: { static _Alignas(0x1000) uint8_t ctx[0x1000]; v = (uint64_t)ctx; break; }
+        // np343 对齐 nxnative：nn::os::GetFreeThreadCount（SDK 11+）= 限额 96 − 活着的游戏线程数；
+        // 回 0 会让主线程启动时等一个永远不会出现的线程（Monster Train 2 实测卡死）
+        case I_FreeThreadCount: { int thr_limit_used(void); int u = thr_limit_used(); v = u < 96 ? 96 - u : 0; break; }
         default: v = 0; break;
         }
         // np247：把客体实际问的 InfoType 和我们的回答打出来。
