@@ -821,7 +821,13 @@ static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
     for (int tries = 0; !o->cur || o->cur + size + OP_RESERVE > o->end; tries++) {
         if (!o->cb || tries == 2) die("NVN 命令内存耗尽且无法补充（cb=%p）", (void *)o->cb);
         if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.cbs++; pthread_mutex_unlock(&g_cs_mu); }
+        // np349：崩点是否在"宿主回调游戏补命令内存"里面 —— 进/出各记一行，只有进没有出即定谳
+        // np349: is the crash inside the host->game out-of-memory callback? One line in, one line out; "in without out" settles it
+        static int ncb;
+        int say = ncb < 6; if (say) ncb++;
+        if (say) LOG("[nvn] 补内存回调 进入 cb=%p data=%p need=%u cur=%p end=%p", (void *)o->cb, o->cb_data, size + OP_RESERVE, (void *)o->cur, (void *)o->end);
         o->cb((NVNcommandBuffer *)o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY, size + OP_RESERVE, o->cb_data);
+        if (say) LOG("[nvn] 补内存回调 返回 cur=%p end=%p", (void *)o->cur, (void *)o->end);
     }
     if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.bytes += size; g_cs.recs++; pthread_mutex_unlock(&g_cs_mu); }
     if (o->recording) o->used += size;                       // np314：GetCommandMemoryUsed 的来源
@@ -833,11 +839,29 @@ NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
     o->recording = 1;
     o->used = 0;                                             // np314：新一次录制从 0 开始
     uint8_t *p = cmd_alloc(o, 8); put_hdr(p, OP_BEGIN, 8); o->begin = p;
+    // np359：**BEGIN 是宿主自己的簿记记录，真驱动没有它**，所以这 8 字节不能算进用量。
+    // 依据（上游 nxnative，同游戏同一处）：`docs/agents/03-bringup.md` 的 BotW 条目 ——
+    //   游戏把每个网格的 draw、每个 shape 的每 pass 状态录进临时命令缓冲，再用 GetCommandMemoryUsed
+    //   求和，给模型的预录命令留字节；**每次录制多一条 BEGIN** 就让三个模型各差一个 4 KB 页而崩。
+    // 上游的 hle_nvn.c 干脆不写 BEGIN；我们保留它是为了回放（nvn_mtl.m 里 `case OP_BEGIN: break;` 忽略它），
+    // 但把它从 `used` 里扣掉，等价于"录制从第一条命令开始"。
+    // np359: the BEGIN record is our own bookkeeping and the real driver has none, so its 8 bytes must not count
+    // towards GetCommandMemoryUsed. Upstream (nxnative, same game) records each mesh's draw into a scratch command
+    // buffer and sums GetCommandMemoryUsed to reserve a model's prerecorded bytes; one extra BEGIN per recording made
+    // three models a 4 KB page short. Upstream omits BEGIN entirely; we keep it for replay (ignored there) but
+    // subtract it from `used`, which is equivalent to "a recording starts with its first command".
+    o->used -= 8;
 }
 NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     cmd_t *o = CB(c);
+    // np349：进/出各一行 —— 崩点在"EndRecording 返回之后"还是"我们内部"，看有没有"返回"这行即定谳
+    // np349: one line in, one line out -- whether the crash is after our return or inside us is settled by the presence of the "out" line
+    static int nrec;
+    int say = nrec < 6; if (say) nrec++;
+    if (say) LOG("[nvn] EndRecording 进入 c=%p 在AS=%d cur=%p end=%p cb=%p", (void *)c, as_ok(c), (void *)o->cur, (void *)o->end, (void *)o->cb);
     uint8_t *p = cmd_alloc(o, 8); put_hdr(p, OP_END, 8);
     o->recording = 0;
+    if (say) LOG("[nvn] EndRecording 返回 begin=%p used=%llu", (void *)o->begin, (unsigned long long)o->used);
     return (NVNcommandHandle)o->begin;
 }
 NVN(nvnCommandBufferIsRecording, NVNboolean, const NVNcommandBuffer *c) { return ((const cmd_t *)c)->recording != 0; }
@@ -860,15 +884,46 @@ NVN(nvnCommandBufferGetCommandMemorySize, size_t, const NVNcommandBuffer *c) {
 }
 NVN(nvnCommandBufferGetControlMemoryUsed, size_t, const NVNcommandBuffer *c) { (void)c; return 0; }
 
+// np360：**CopyCommands 必须真复制**。原来我们照抄 nxnative 的做法，把 Copy 写成 OP_CALL（引用），
+// 又让 Call 委派给 Copy —— 两者被当成了同一件事。安卓版塞尔达（BOTWRecompAndroid，同游戏 1.6/1.0）
+// 的移植日志把它们分开记：「`CopyCommands` tratado como `CallCommands`」是 bug，修法是「copia de verdade」。
+//
+// 为什么这条会崩：Call = 引用别人的命令（对方内存被覆盖/回收后就悬空）；Copy = 当场快照。
+// BotW 在第一帧用它把每帧的命令拼起来，语义错了就会在 EndRecording 之后读到被改写的记录。
+//
+// 实现：句柄就是我们自己写的段首（BEGIN 记录），记录自描述（op_hdr{op,size}），
+// 所以逐条 memcpy 到当前段，遇到 OP_END 停。
+// np360: CopyCommands must really copy. We had copied nxnative's shortcut: Copy was written as an OP_CALL
+// reference and Call delegated to Copy, conflating the two. The Android BotW port (same game) lists
+// "CopyCommands treated as CallCommands" as a bug and fixes it with a real copy. Semantics differ: a call
+// references the other buffer's memory (dangling once that memory is reused), a copy snapshots it now.
+// The handle is the segment start we wrote (a BEGIN record) and records are self-describing (op_hdr{op,size}),
+// so copy record by record into the current segment until OP_END.
 NVN(nvnCommandBufferCopyCommands, void, NVNcommandBuffer *c, int n, const NVNcommandHandle *h) {
-    for (int i = 0; i < n; i++) { uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_CALL, 16); memcpy(p + 8, &h[i], 8); }
+    cmd_t *o = CB(c);
+    static int say;
+    if (n > 0 && say < 4) { say++; LOG("[dm] np360 CopyCommands n=%d（真复制）", n); }
+    for (int i = 0; i < n; i++) {
+        const uint8_t *src = (const uint8_t *)(uintptr_t)h[i];
+        if (!src) continue;
+        for (int guard = 0; guard < 65536; guard++) {
+            op_hdr hd;
+            memcpy(&hd, src, sizeof hd);
+            if (hd.size < sizeof hd || hd.size > (1u << 20)) break;   // 记录坏了就停，别把宿主拖进去
+            uint8_t *p = cmd_alloc(o, hd.size);
+            memcpy(p, src, hd.size);
+            src += hd.size;
+            if (hd.op == OP_END) break;                              // 一次录制的结尾
+        }
+    }
 }
-// np314：CallCommands（25 个静态调用点，是我们最大的一块缺口）= 二级命令缓冲继承。
-// 照 nxnative：回放层对 CALL 与 COPY 同等对待 ⇒ 直接委派给 CopyCommands，不新造记录。
-// np314: CallCommands (25 static call sites, our biggest gap). Upstream treats CALL and COPY alike at replay time,
-// so delegate to CopyCommands instead of inventing a record.
+// np360：CallCommands 是**引用**（二级命令缓冲继承），照 nxnative 的说法回放层本来就同等对待 ⇒
+// 仍然只写一条 OP_CALL 记录。不再委派给 CopyCommands（否则每次 Call 都变成一次全量复制）。
+// np360: CallCommands is a reference (second-level command buffer inheritance); replay treats it the same way,
+// so it keeps writing a single OP_CALL record. It no longer delegates to CopyCommands (that would turn every
+// call into a full copy).
 NVN(nvnCommandBufferCallCommands, void, NVNcommandBuffer *c, int n, const NVNcommandHandle *h) {
-    h_nvnCommandBufferCopyCommands(c, n, h);
+    for (int i = 0; i < n; i++) { uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_CALL, 16); memcpy(p + 8, &h[i], 8); }
 }
 NVN(nvnCommandBufferSignalEvent, void, NVNcommandBuffer *c, const NVNevent *e, NVNeventSignalMode m, NVNeventSignalLocation loc, int flags, uint32_t v) {
     (void)loc; (void)flags;
