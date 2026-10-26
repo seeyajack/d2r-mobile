@@ -230,6 +230,23 @@ NVN(nvnDeviceGetInteger, void, const NVNdevice *d, NVNdeviceInfo what, int *out)
     // 若 out 指向某个"后来被当指针用"的结构体字段，一眼就能证实。
     // np275：what==0（API 主版本）走可配置路径 —— 这是唯一"因游戏而异"的数值
     if (w == 0) { *out = nvn_api_major(); OLOG("DeviceGetInteger what=0 out=%p -> %d (可配置)", (void *)out, *out); return; }
+    // np347：能力位（SUPPORTS_*）的"硬件真值 vs 引擎真值"开关，**默认关 = 零行为变化**。
+    // 背景：上游引擎自己有 xbg_device_integer()（按 Vulkan 实际能力答，未实现的功能答 0），
+    // 但全树**没有任何调用者**——实际只有下面这张 Tegra X1 实测表在答（能力位一律 1）。
+    // 若某功能引擎并不实现（如 conservative raster / passthrough GS / sparse tiled），
+    // 答 1 会让客体启用它、拿到空实现（铁律 12：能力有三套开关；BOTWRecompAndroid 的
+    // Link 沉地就是 device info 值错 → GPU→CPU 写回数据错）。
+    // DM_DEVIINFO_CAP=1 时这些位按"引擎未实现"答 0（= 上游引擎的口径），供对照实验用。
+    static int cap_truth = -1;
+    if (cap_truth < 0) { const char *e = getenv("DM_DEVIINFO_CAP"); cap_truth = e && *e && atoi(e) ? 1 : 0; }
+    if (cap_truth) {
+        switch (w) {
+        case 0x28: case 0x2A: case 0x32: case 0x3B: case 0x42: case 0x43: case 0x44:
+        case 0x45: case 0x47: case 0x48: case 0x49: case 0x4A: case 0x4C:
+            *out = 0; OLOG("DeviceGetInteger what=%#x -> 0（引擎能力口径 DM_DEVIINFO_CAP=1）", w); return;
+        default: break;
+        }
+    }
     *out = g_devinfo[w];
     // np270：蹦床是尾调用（br x17），LR 仍是**客体调用点** —— 直接取回来打出来，
     // 就知道是哪个站点在问、以及 0x340000ca 里那个 52/202 是谁喂的。
