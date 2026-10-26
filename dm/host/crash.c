@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <dlfcn.h>
 #include <sys/ucontext.h>
+#include <sys/uio.h>   // np348b: process_vm_readv 安全读客体内存
 #include <unistd.h>
 #include <sys/mman.h>
 #include <libkern/OSCacheControl.h>
@@ -230,30 +231,34 @@ static const char *fmt_off(uint64_t a);
 extern void nvn_unimpl_entry(void);   // 与 hle_nvn.c 一致
 static void dump_nvn_last_calls(void) {
     extern uint64_t nvn_last_ra[];
+    extern uint64_t nvn_last_ts[];   // np348：真时间序（thunk 记的 cntvct）
     extern const char *nvn_names[];
     typedef struct { _Atomic uint64_t cnt; void *fn; } nvn_slot_t;
     extern nvn_slot_t nvn_slot[];
-    struct { const char *nm; uint64_t off; unsigned long long seq; } e[523];
+    struct { const char *entry; const char *nm; uint64_t off; unsigned long long seq; } e[523];
     int n = 0;
     for (unsigned i = 0; i < 523; i++) {
         uint64_t ra = nvn_last_ra[i];
         if (!ra) continue;
-        unsigned long long seq = atomic_load(&nvn_slot[i].cnt);
-        if (!seq) continue;
+        // np348：排序键换成**调用时间戳**（cntvct 单调计数），而不是每槽累计次数
+        unsigned long long seq = nvn_last_ts[i];
+        if (!seq) seq = atomic_load(&nvn_slot[i].cnt);   // 兜底：时间戳没写（老产物）时退回计数
         const char *nm = "?"; uint64_t off = 0;
         for (int k = 0; k < g_nmod; k++) {
             uint64_t lo = (uint64_t)(uintptr_t)g_mod[k].base, hi = lo + g_mod[k].size;
             if (ra >= lo && ra < hi) { nm = g_mod[k].name; off = ra - lo; break; }
         }
-        e[n].nm = nm; e[n].off = off; e[n].seq = seq; n++;
+        e[n].entry = nvn_names[i]; e[n].nm = nm; e[n].off = off; e[n].seq = seq; n++;
     }
-    // 按"该入口最后一次调用的全局序号"降序 = 最近调用的排前面
+    // 按"该入口最后一次调用的时间戳"降序 = 最近调用的排前面
     for (int a = 0; a < n; a++) for (int b = a + 1; b < n; b++)
         if (e[b].seq > e[a].seq) { typeof(e[0]) t = e[a]; e[a] = e[b]; e[b] = t; }
-    fprintf(stderr, "[dm] np341 NVN 最近调用（时间序，前 16）：\n");
+    fprintf(stderr, "[dm] np348 NVN 最近调用（真时间序，前 16）：\n");
+    unsigned long long tmax = n ? e[0].seq : 0;
     for (int a = 0; a < n && a < 16; a++)
-        fprintf(stderr, "   %-40s <- %s+%#llx  (seq %llu)\n", e[a].nm, e[a].nm ? "" : "",
-                (unsigned long long)e[a].off, e[a].seq);
+        fprintf(stderr, "   %-44s <- %s+%#llx  (t-%llu)\n",
+                e[a].entry ? e[a].entry : "?", e[a].nm ? e[a].nm : "?",
+                (unsigned long long)e[a].off, tmax - e[a].seq);
     if (!n) fprintf(stderr, "   （没有记录）\n");
     // np342：**未实现但被调用过**的入口 = 嫌疑名单（返回 0 会让调用方跳过创建子对象 ⇒ 满盘空指针）
     fprintf(stderr, "[dm] np342 未实现但被调用过的 NVN 入口：\n");
@@ -362,6 +367,83 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
                 (unsigned long long)UC_X(uc, 0), (unsigned long long)UC_SP(uc),
                 (unsigned long long)UC_FP(uc));
     if (sig == SIGSEGV || sig == SIGBUS) dump_nvn_last_calls();
+    // np348b：**vtable 探针** —— 崩点紧接 EndRecording 之后，客体在 0x9fd1ac 做
+    //   `ldr x8,[x19]; ldr x8,[x8,#0xf8]; blr x8`（虚调用）。x19 就是那个对象；
+    // 把 [x19]（vtable 指针）与几个关键槽读出来，就能判断是"虚表槽是垃圾"还是"对象本身被写坏"。
+    // 安全读用 process_vm_readv（对不可读地址返回错误，**不会二次崩**）。
+    if ((sig == SIGSEGV || sig == SIGBUS) && UC_X(uc, 19) && getenv("DM_NO_VT") == NULL) {
+        uint64_t o = (uint64_t)UC_X(uc, 19);
+        uint64_t vals[8] = {0}; int ok[8] = {0};
+        const long offs[8] = {0, 0xf8, 0x18, 0x98, 0x1b0, 0x1d0, 0x208, 0x10};
+        for (int i = 0; i < 8; i++) {
+            struct iovec l = { &vals[i], 8 }, r = { (void *)(uintptr_t)(o + offs[i]), 8 };
+            ok[i] = process_vm_readv(getpid(), &l, 1, &r, 1, 0) == 8;
+        }
+        fprintf(stderr, "[dm] np348b x19=%#llx  vtable=[x19]=%#llx%s\n", (unsigned long long)o,
+                (unsigned long long)vals[0], ok[0] ? "" : "（读不到）");
+        for (int i = 1; i < 8; i++)
+            fprintf(stderr, "   [x19+%#lx] = %#llx%s\n", (unsigned long)offs[i],
+                    (unsigned long long)vals[i], ok[i] ? "" : "（读不到）");
+        // 虚表本身的前 8 个槽（看是不是真虚表：应当落在某模块映像里）
+        if (ok[0] && vals[0]) {
+            for (int i = 0; i < 8; i++) {
+                uint64_t v = 0;
+                struct iovec l = { &v, 8 }, r = { (void *)(uintptr_t)(vals[0] + (uint64_t)i * 8), 8 };
+                if (process_vm_readv(getpid(), &l, 1, &r, 1, 0) != 8) break;
+                const char *nm = NULL; uint64_t off = 0;
+                for (int k4 = 0; k4 < g_nmod; k4++) {
+                    uint64_t l2 = (uint64_t)(uintptr_t)g_mod[k4].base, h2 = l2 + g_mod[k4].size;
+                    if (v >= l2 && v < h2) { nm = g_mod[k4].name; off = v - l2; break; }
+                }
+                fprintf(stderr, "   vtable[%d] = %#llx  %s\n", i, (unsigned long long)v,
+                        nm ? fmt_off(v) : "（不在模块内）");
+                (void)off;
+            }
+        }
+    }
+    // np348：定点内存扫描 —— 崩在"数据当地址"（pc/addr 是个小数值）时，找出**谁持有这个值**。
+    // 现场 0xa00000002 = 两个 int（低 2 高 10）的 8 字节小端 = 0x0000000A00000002 ⇒ 精确 8 字节搜。
+    // 安全：先读 /proc/self/maps，只扫**可读**区（PROT_NONE 页读下去会在 handler 里二次崩）。
+    if ((sig == SIGSEGV || sig == SIGBUS) && (uint64_t)(uintptr_t)si->si_addr &&
+        (uint64_t)(uintptr_t)si->si_addr < 0x100000000ull && getenv("DM_NO_SCAN") == NULL) {
+        uint64_t bad = (uint64_t)(uintptr_t)si->si_addr;
+        FILE *mp = fopen("/proc/self/maps", "r");
+        int hits = 0;
+        unsigned long long scanned = 0;
+        fprintf(stderr, "[dm] np348 内存扫描：谁持有 %#llx（只扫可读区，最多报 8 处）\n", (unsigned long long)bad);
+        if (mp) {
+            char line[512];
+            while (fgets(line, sizeof line, mp) && hits < 8) {
+                unsigned long long lo = 0, hi = 0;
+                char perm[8] = {0};
+                if (sscanf(line, "%llx-%llx %7s", &lo, &hi, perm) != 3) continue;
+                if (perm[0] != 'r') continue;
+                if (hi - lo > (256ull << 20)) hi = lo + (256ull << 20);   // 单段最多扫 256MB，防超时
+                const uint64_t *p = (const uint64_t *)(uintptr_t)((lo + 7) & ~7ull);
+                const uint64_t *e = (const uint64_t *)(uintptr_t)(hi & ~7ull);
+                for (; p < e; p++) {
+                    if (*p == bad) {
+                        // 判断命中位置落在哪个模块/堆
+                        uint64_t a = (uint64_t)(uintptr_t)p;
+                        const char *nm = NULL; uint64_t off = 0;
+                        for (int k3 = 0; k3 < g_nmod; k3++) {
+                            uint64_t l2 = (uint64_t)(uintptr_t)g_mod[k3].base, h2 = l2 + g_mod[k3].size;
+                            if (a >= l2 && a < h2) { nm = g_mod[k3].name; off = a - l2; break; }
+                        }
+                        if (nm) fprintf(stderr, "   [%d] %s+%#llx\n", hits, nm, (unsigned long long)off);
+                        else    fprintf(stderr, "   [%d] %#llx（宿主/堆区，map 段 %#llx-%#llx）\n",
+                                        hits, (unsigned long long)a, lo, hi);
+                        hits++;
+                        if (hits >= 8) break;
+                    }
+                }
+                scanned += (hi > lo ? hi - lo : 0);
+            }
+            fclose(mp);
+        }
+        fprintf(stderr, "   （扫了 %.0f MB，命中 %d 处%s）\n", scanned / 1048576.0, hits,
+                hits ? "" : " —— 值不在任何可读内存里，说明它是算出来的");
+    }
     // np330：**sp 基调用链**。0x45f9c8 的序言是 `stp x29,x30,[sp,#0x10]`，
     // 所以调用者的返回地址就在 [sp+0x18]，上一帧的 fp 在 [sp+0x10] —— 不需要 x29（它在本现场是垃圾）。
     if (sig == SIGSEGV || sig == SIGBUS) {

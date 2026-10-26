@@ -83,6 +83,10 @@ uint64_t nvn_new_serial(void) { static _Atomic uint64_t n; return ++n; }
 // np339：每个 NVN 入口的"最后一次客体调用点"（thunk 里 `str x30` 写入），崩溃时倒出。
 // np339: last guest call site per NVN entry, written by the thunk (str x30). Dumped on crash.
 __attribute__((visibility("hidden"))) uint64_t nvn_last_ra[NVN_NFUNC];   // np339：隐藏可见性 ⇒ 汇编可直接相对寻址
+// np348：每个 NVN 入口最后一次被调用的**时间戳**（thunk 里 mrs cntvct_el0 写入）。
+// np339 的 nvn_slot[i].cnt 是每槽累计次数，排出来不是全局时间序；有了它才能回答
+// "崩之前最后调的是哪几个入口、间隔多少"——门票① 缺的就是这个。
+__attribute__((visibility("hidden"))) uint64_t nvn_last_ts[NVN_NFUNC];
 
 static unsigned g_nsem;                          // 语义实现个数（nvn_init_slots 填） | Number of semantic implementations (filled by nvn_init_slots)
 // np269：OLOG 原来只认 DM_NVN_LOG，而真机上 g_log 常为 false ⇒ DeviceGetInteger 这类
