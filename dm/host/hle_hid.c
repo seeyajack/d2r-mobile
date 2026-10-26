@@ -372,6 +372,20 @@ static void receipt(const NpadState *s, uint32_t id, uint32_t style, uint64_t km
 void (*dm_pad_hook)(uint64_t, uint64_t *, int32_t *, int32_t *, int32_t *, int32_t *);
 static void fill(NpadState *s, uint32_t id, uint32_t style) {
     pthread_once(&g_receipt_once, receipt_init);
+    // np380：**这一整串是 Diablo 2 的界面/游戏逻辑自动化，BotW 上必须关掉**。
+    // 真机实证（np379 探针）：`dm_actions_pump()` 里 `((uint64_t(*)(uint32_t))(b + 0x45f9d0))(...)`
+    // 是 D2R 的"取玩家对象"，硬编码 D2R 地址；在 BotW 镜像里 0x45f9d0 正好是某个构造函数中段的
+    // `add x29,sp,#0x10`，被当函数指针调用、x0 取自 D2R 的数据字段（本次 0）⇒ 门票① 的全部现场
+    // （this=0、从中段进入、lr=dm_actions_pump+0x7c）都由这一串造成。
+    // 这些 pump 只对 D2R 有意义，换游戏必须全部不跑：默认关，要跑设 DM_D2R_PUMPS=1。
+    // np380: this whole list is Diablo 2 UI/gameplay automation and must not run on BotW. Device evidence
+    // (np379 probe): dm_actions_pump() calls ((...)(b + 0x45f9d0))(...) -- D2R's "get player", a hard-coded D2R
+    // address; in the BotW image 0x45f9d0 is the middle of a constructor (`add x29,sp,#0x10`), so it gets
+    // called as a function with x0 from a D2R data field (0 here) -- which produced every 门票① symptom
+    // (this=0, entered mid-function, lr=dm_actions_pump+0x7c). Default off; set DM_D2R_PUMPS=1 to enable.
+    static int d2r_pumps = -1;
+    if (d2r_pumps < 0) d2r_pumps = getenv("DM_D2R_PUMPS") != NULL;
+    if (d2r_pumps) {
     DM_PROF(0, "taps", ui_taps_step());
     DM_PROF(0, "ui_frontend", dm_ui_frontend_pump());
     { void dm_textinput_pump(void); DM_PROF(0, "textinput", dm_textinput_pump()); }   // 文本框补「弹键盘」那一下、数量框设值（dm_textinput.c） | the extra "bring up keyboard" press for text boxes, setting the value of quantity boxes (dm_textinput.c)
@@ -380,6 +394,7 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
     { void dm_world_pump(void); DM_PROF(0, "world", dm_world_pump()); }   // 点世界目标 = 交互（dm_world.c） | tapping a world target = interact (dm_world.c)
     DM_PROF(0, "ui_mouse", dm_ui_mouse_pump());   // 界面鼠标消息（原生点击）在取手柄处发：主线程、每帧一条 | UI mouse messages (native clicks) are sent at the controller read: main thread, one per frame
     { void dm_aim_cone_pump(void); DM_PROF(0, "aim_cone", dm_aim_cone_pump()); dm_ipf_frame(0); }   // 手指方向选目标：右摇杆归零时恢复（hle_private_aim.c） | target selection by finger direction: restored when the right stick returns to zero (hle_private_aim.c)
+    }   // np380：D2R 专属 pump 到此结束（DM_D2R_PUMPS=1 才跑）
     if (atomic_load(&g_stall_due) && atomic_exchange(&g_stall_due, 0)) usleep((useconds_t)g_stall_ms * 1000);   // DM_TEST_HID_STALL_MS
     uint64_t read_start_ns = g_receipt_file ? now_ns() : 0; // 覆盖整个多原子字段读取区间 | covers the whole read interval of the multi-atomic fields
     memset(s, 0, sizeof *s);

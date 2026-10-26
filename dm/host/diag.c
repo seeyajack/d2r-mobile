@@ -794,7 +794,16 @@ static void cube_diag_tick(uint64_t G, uint64_t player) {   // 合成请求后 2
 // All three "who is the controlled player" sites go by it: the per-tick feature entry hud_tick, the state dump state_dump, the position check poschk. A corpse left in the player table after the character dies is also a player-type unit with "mode ≠ 0 and coordinates",
 // so counting units present reports "living player + own corpse" as non-unique. That is a stale measuring criterion, not two players on the field
 static uint32_t local_player_id(void) { uint32_t slot = 8, lid = 0xffffffffu; module_t *mm = main_mod(); if (mm && tk_rd((uint64_t)mm->base + 0x2d20e4c, &slot, 4) && slot < 8) tk_rd((uint64_t)mm->base + 0x2d60380 + 4 * slot, &lid, 4); return lid; }
-static void hud_tick(uint64_t G) {        // 每拍：受控玩家等级 / 本级经验‰ / 腰带四列件数 / 回城次数 + 当前人数档 → g_hud（前端 dm_hud_get） | Every tick: controlled player's level / current-level experience ‰ / item counts of the four belt columns / town portal count + current /players setting → g_hud (front end dm_hud_get)
+static void hud_tick(uint64_t G) {
+    // np381：**整段 D2R 按帧自动化在换游戏时必须不跑**。真机实证（np379/np380）：这一串里
+    // `dm_actions_pump` 用硬编码 D2R 地址 `b+0x45f9d0` 当函数指针调用，在 BotW 镜像里正好落在
+    // 某个构造函数中段 ⇒ 门票① 的全部现场；关掉它之后下一个崩点又来自 `dm_bossrush_tick`。
+    // 这些模块只对 Diablo 2 有意义，默认全关；要跑设 DM_D2R_PUMPS=1。
+    // np381: the whole per-tick D2R automation must not run for another game. Device evidence (np379/np380):
+    // dm_actions_pump calls a hard-coded D2R address (b+0x45f9d0) as a function pointer, which in the BotW image
+    // is the middle of a constructor -- that produced every 门票① symptom; after disabling it the next crash came
+    // from dm_bossrush_tick. These modules only make sense for Diablo 2: off by default, DM_D2R_PUMPS=1 enables.
+    { static int d2r = -1; if (d2r < 0) d2r = getenv("DM_D2R_PUMPS") != NULL; if (!d2r) return; }        // 每拍：受控玩家等级 / 本级经验‰ / 腰带四列件数 / 回城次数 + 当前人数档 → g_hud（前端 dm_hud_get） | Every tick: controlled player's level / current-level experience ‰ / item counts of the four belt columns / town portal count + current /players setting → g_hud (front end dm_hud_get)
     dm_hud_info h = {0};
     uint64_t player = 0, inv = 0, u = 0, next = 0;
     // 受控玩家 = 客户端自己记的本地玩家单位号那个单位（main+0x2d20e4c 本地玩家槽号 → main+0x2d60380[槽号] 单位号，原版 0x45f9d0 同口径），
