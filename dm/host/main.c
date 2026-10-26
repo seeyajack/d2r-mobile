@@ -107,6 +107,65 @@ static void guest_main(void) {
     game_seed_maybe(); save_throttle_patch();
     { void dm_guest_spawn_selftest(void); dm_guest_spawn_selftest(); }   // DM_GUEST_SPAWN_TEST 宿主客体线程自检（hle_guestthread.c） | DM_GUEST_SPAWN_TEST self-test of host-created guest threads (hle_guestthread.c)
     { void dm_padmode_boot(void); dm_padmode_boot(); }   // 触屏覆盖层在：布局前缀改指触屏版（dm_padmode.c），要在游戏建面板之前 | Touch overlay present: repoint the layout prefixes to the touch version (dm_padmode.c); must happen before the game builds its panels
+    // np366：**守卫记录槽所在页改成可写**。np364 的桩要 `stp x0,x30,[槽]`，但洞在 RX 段里
+    // （真机实测桩里的 stp 直接 SIGSEGV，addr 正是槽地址 main+0x2405a70）。
+    // np365 挂在 dm_pin_and_flush() 上，实测那个函数**根本没被调用**（np316 的日志一条都没有），
+    // 所以改挂到这里 —— nnMain 之前必走。桩页(0x2404000)与槽页(0x2405000)不同页，只放开槽页。
+    // np366: make the guard-cell page writable. The np364 stub stores (this, call site) into a cell but the cave
+    // lives in an RX mapping (the stub's stp took SIGSEGV at exactly main+0x2405a70). np365 hung this on
+    // dm_pin_and_flush(), which is never called (not a single np316 line), so do it here -- always reached before
+    // nnMain. Stubs and cells are on different pages, so only the cell page is opened.
+    {
+        for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) {
+            uintptr_t pg = (uintptr_t)(g_mod[i].base + 0x2405000);
+            int rc = mprotect((void *)pg, 0x1000, PROT_READ | PROT_WRITE);
+            // np370：槽区**先清零**。这块页属于数据段，初始值不是 0，而桩用"槽值 != 0"判断"已记录过"
+            // ——不清零就永远判成"已记录"，一个槽也不会写（真机实测只有 slot0 有值，其余全空）。
+            // np370: clear the cell area first. The page is data-segment and not zero initially, while the stub
+            // treats "cell != 0" as "already recorded"; without clearing, no cell ever gets written.
+            if (!rc) memset((void *)(pg + (0x2405a70 - 0x2405000)), 0, 0x100);
+            LOG("np370 槽页 mprotect → %s；槽区已清零", rc ? "失败" : "RW 成功");
+            break;
+        }
+    }
+    // np356：**启动时打一张可执行映射表**。真机崩点显示"客体构造函数被宿主代码调用"，
+    // 返回地址 0x59b8… 不在任何客体模块内，但每次运行 ASLR 都变 ⇒ 必须**同一次运行**里记下来才能对表。
+    // 只列可执行段（通常 5~15 行），崩了拿返回地址一查就知道是哪个库。
+    // np356: dump the executable mapping table at startup. On device the guest constructor is called from host
+    // code and the return address is outside every guest module; ASLR changes per run, so it must be recorded in
+    // the SAME run to be usable. Only executable ranges are listed (usually 5-15 lines).
+    {
+        FILE *mp = fopen("/proc/self/maps", "r");
+        if (mp) {
+            char ln[512];
+            LOG("[dm] np356 可执行映射表（start-end perms offset dev inode path）");
+            while (fgets(ln, sizeof ln, mp)) {
+                unsigned long long lo = 0, hi = 0; char perm[8] = {0};
+                if (sscanf(ln, "%llx-%llx %7s", &lo, &hi, perm) != 3) continue;
+                if (perm[2] != 'x') continue;   // perms[2] == 'x' 即可执行 | perms[2] == 'x' means executable
+                size_t n = strlen(ln);
+                while (n && (ln[n - 1] == '\n' || ln[n - 1] == '\r')) ln[--n] = 0;
+                LOG("   %s", ln);
+            }
+            fclose(mp);
+        }
+    }
+    // np374：**运行期**安装空 this 守卫。离线写进文件的补丁"内存对、取指不对"（np315–318 实测），
+    // 而运行期改码是生效的（np297）。这里调用 loader.c 里那段一直没被调用的运行期安装器，
+    // 它写好桩、改入口、清 icache —— 守卫命中时 crash.c 的 null_guard_trap() 会打出调用者链。
+    // np374: install the null-this guards at RUN TIME. Patches written into the file are "right in memory,
+    // wrong for fetch" (np315-318), while runtime patching does take effect (np297). This calls the installer
+    // that had never been wired up; on a hit, crash.c's null_guard_trap() prints the caller chain.
+    { void guest_null_tolerant_ctor(void); guest_null_tolerant_ctor(); }
+    // np376：**装完补丁立刻在"将要执行客体的这个线程"上清 icache**。
+    // 为什么必须有这一步：aarch64 的 `ic ivau` 只影响本核；`guest_flush_icache()` 原来只在
+    // worker 线程（thread_main）里被调，**主线程从不经过那里**——而崩溃正发生在主线程（h=0x1001）。
+    // 于是补丁写进了内存（读得到），执行流却还在跑旧指令，所有守卫一次都不命中。
+    // np376: flush the icache on the very thread that is about to run guest code, right after installing.
+    // `ic ivau` is per-core, and guest_flush_icache() used to be called only from worker threads
+    // (thread_main); the main thread never passes there -- and the crash is on the main thread (h=0x1001).
+    // So the patches were visible to reads while the fetch kept running the old instructions.
+    { void guest_flush_icache(int); guest_flush_icache(0); }
     LOG(">>> nnMain"); ((fn0)req("nnMain"))();
     LOG("nnMain returned");
 }

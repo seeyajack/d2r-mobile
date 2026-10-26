@@ -556,6 +556,11 @@ static void guest_redirect(uint8_t *at, void *fn, uint32_t expect0, const char *
 }
 
 // np296：AArch64 `b` 指令编码（同一个模块内，±128MB 射程）。
+// np379：adrp 编码（rd <- page(addr)，以 insn_at 为基准）
+static uint32_t arm64_adrp_rt(int rd, uint64_t addr, uint64_t insn_at) {
+    long d = (long)(addr >> 12) - (long)(insn_at >> 12);
+    return 0x90000000u | ((uint32_t)(d & 3) << 29) | (((uint32_t)((d >> 2) & 0x7FFFF)) << 5) | (uint32_t)rd;
+}
 static uint32_t arm64_b(uint64_t from, uint64_t to) {
     int64_t d = (int64_t)to - (int64_t)from;
     return 0x14000000u | ((uint32_t)(d >> 2) & 0x03FFFFFFu);
@@ -572,7 +577,7 @@ static uint32_t arm64_b(uint64_t from, uint64_t to) {
 // this is the single choke point on the chain. Semantics: with a null this there is no "correct"
 // behaviour to preserve (the original crashes), so let the caller continue; if it really uses the
 // null sub-object it will fault **somewhere else**, which is exactly the information we want.
-__attribute__((unused)) static void guest_null_tolerant_ctor(void) {
+void guest_null_tolerant_ctor(void) {   // np374：改为运行期安装（np297 证明运行期改码取指能跟上）
     // np296：整条"分配→构造"链一次全装空指针保护。
     // 崩点链 0x634fa0/… → 0x3326b8|0x37621c|0x40df2c|0x41c728|0x54f204 → 0x45f9c8 → 0x105f9e4 → 0xba5aa4，
     // 每层都只是把 x0 原样往下传（`mov x19,x0; bl 下一层`），所以 **任一层把空指针挡下来，
@@ -584,13 +589,37 @@ __attribute__((unused)) static void guest_null_tolerant_ctor(void) {
     // this can never be null; it is null here, so something upstream differs -- keep the guest alive
     // first and then see where it actually uses the null object.
     static const struct { uint64_t off; uint32_t first; int mode; const char *name; } kEnt[] = {
-        { 0x105f9e4, 0xF81E0FF3u, 1, "0x105f9e4 就地构造【np299 对照：无条件 ret】" },
+        { 0x105f9e4, 0xF81E0FF3u, 0, "0x105f9e4 就地构造（np374：改回真守卫，不再无条件 ret）" },
         { 0x45f9c8,  0xF81E0FF3u, 0, "0x45f9c8 类构造器" },
         { 0x3326b8,  0xF81E0FF3u, 0, "0x3326b8 构造包装 A" },
         { 0x37621c,  0xF81E0FF3u, 0, "0x37621c 构造包装 B" },
         { 0x40df2c,  0xF81E0FF3u, 0, "0x40df2c 构造包装 C" },
         { 0x41c728,  0xF81E0FF3u, 0, "0x41c728 构造包装 D" },
         { 0x54f204,  0xA9BE4FF4u, 0, "0x54f204 构造包装 E" },
+        // np375：**这条链上唯一没守卫的一环**。0xba5aa4 就是"写 vptr 那一句"所在的构造函数，
+        // 真机崩溃点一直是它里面的 `str x8,[x20]`（addr=0）。给它装上守卫，命中时 null_guard_trap()
+        // 会打出 np333 调用者链 —— 那就是"谁把这个空对象递给它"的直接答案。
+        // np375: the only unguarded link in this chain. 0xba5aa4 is the constructor that stores the vptr and
+        // is where the faulting `str x8,[x20]` lives (addr=0). Guarding it makes null_guard_trap() print the
+        // np333 caller chain, i.e. who handed in the null object.
+        { 0xba5aa4,  0xA9BE4FF4u, 0, "0xba5aa4 就地构造（写 vptr）" },
+        // np377：**中段入口**。真机三轮都指向"不是从 0x45f9c8 进来的"：入口守卫一次不命中、
+        // 而函数体（0x45f9dc 的 bl）在跑、fp 链还缺了 `str x19,[sp,#-0x20]!` 那次分栈。
+        // 把 0x45f9cc（`stp x29,x30,[sp,#0x10]`）也当入口装一个守卫——它一命中，
+        // null_guard_trap() 会打出 x0 与调用者链，直接给出"谁跳到中段"。
+        // np377: the mid-function entry. Three device runs say the body is entered without passing 0x45f9c8
+        // (entry guard never fires, the body runs, and the frame lacks the stack allocation). Guard 0x45f9cc
+        // as well; a hit prints x0 and the caller chain.
+        { 0x45f9cc,  0xA9017BFDu, 0, "0x45f9cc 类构造器中段" },
+        // np378：**两个无条件探针**（mode 2）。前面 11 个守卫零命中，而这段代码确实在跑，
+        // 最自洽的解释是"有人直接跳进函数体更深处"。把探针装在 `mov x19,x0` 与 `str wzr,[x19,#0x60]`
+        // 上：命中就打一行（宿主 0xB1xx 回调记录后继续，原指令照跑，语义不变），
+        // 谁命中就说明执行流真的到过那里、以及当时的 x0/lr 是什么。
+        // np378: two unconditional probes (mode 2). Eleven guards never fired while this code does run, which
+        // fits a direct jump into the function body. Probes on `mov x19,x0` and `str wzr,[x19,#0x60]`: a hit
+        // prints a line (the 0xB1xx handler logs and continues at the original instruction, semantics unchanged).
+        { 0x45f9d4,  0xAA0003F3u, 2, "探针 0x45f9d4 mov x19,x0" },
+        { 0x45f9dc,  0xB900627Fu, 2, "探针 0x45f9dc str wzr,[x19,#0x60]" },
     };
     module_t *mm = NULL;
     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mm = &g_mod[i]; break; }
@@ -603,6 +632,30 @@ __attribute__((unused)) static void guest_null_tolerant_ctor(void) {
         uint8_t *fn = mm->base + kEnt[i].off;
         if (*(volatile uint32_t *)fn != kEnt[i].first) {
             LOG("【红】空指针保护 %s：原值 %#x ≠ 期望 %#x，跳过", kEnt[i].name, *(volatile uint32_t *)fn, kEnt[i].first);
+            continue;
+        }
+        if (kEnt[i].mode == 2) {   // np379：无条件 brk 探针 + **抓栈顶**（7 字）
+            // 为什么加抓栈：np378 证明"执行流是从函数体中段进来的"，但 lr 对跳转进入是陈旧值、
+            // fp 链也断，唯一还可能带着"跳转者返回地址"的地方就是 **sp 附近的栈**。
+            // 桩形：brk #0xB1xx / adrp x16,槽页 / add x16,#lo / add x17,sp,#0 / stp x17,x30,[x16] / 原第一条 / b 入口+4
+            // x17 = sp（AArch64 里 sp 只能经 add 读进通用寄存器），和 x30 一起存进槽位；
+            // 宿主崩溃时读槽位 → 顺着那个 sp 打印 16 个字，跳转者的返回地址就在里面。
+            // np379: unconditional brk probe that also captures the stack pointer. np378 proved execution enters from
+            // the function body, but lr is stale for jumps and the fp chain is broken -- the stack near sp is the only
+            // place that can still hold the jumper's return address.
+            uint64_t cell = (uint64_t)mm->base + 0x2405a70 + 0x10ull * (uint64_t)i;
+            uint32_t pv[7];
+            pv[0] = 0xD4200000u | ((0xB100u | (i + 1)) << 5);   // brk #0xB1xx（宿主记录后继续）
+            pv[1] = arm64_adrp_rt(16, cell, (uint64_t)stub + 4);
+            pv[2] = 0x91000000u | ((uint32_t)(cell & 0xFFF) << 10) | (16u << 5) | 16u;   // add x16,x16,#lo12
+            pv[3] = 0x91000000u | (31u << 5) | 17u;                                      // add x17, sp, #0
+            pv[4] = 0xA9000000u | (30u << 10) | (16u << 5) | 17u;                        // stp x17,x30,[x16]
+            pv[5] = kEnt[i].first;                              // 原第一条
+            pv[6] = arm64_b((uint64_t)(stub + 24), (uint64_t)(fn + 4));
+            if (*(uint32_t *)stub) { LOG("【红】探针 %s：空穴槽已被占用，跳过", kEnt[i].name); continue; }
+            memcpy(stub, pv, sizeof pv);
+            __builtin___clear_cache((char *)stub, (char *)stub + 28);
+            guest_patch32((uint32_t *)fn, kEnt[i].first, arm64_b((uint64_t)fn, (uint64_t)stub), kEnt[i].name);
             continue;
         }
         if (kEnt[i].mode == 1) {   // np297 对照实验：无条件 ret（不占空穴）
@@ -618,6 +671,22 @@ __attribute__((unused)) static void guest_null_tolerant_ctor(void) {
         memcpy(stub, w, sizeof w);
         __builtin___clear_cache((char *)stub, (char *)stub + 16);
         guest_patch32((uint32_t *)fn, kEnt[i].first, arm64_b((uint64_t)fn, (uint64_t)stub), kEnt[i].name);
+        // np363：**装完立刻回读**。真机实测 7 个桩的前三个字都对（cbz / 原指令 / 跳回），
+        // 第 4 个字却是 `0xD4360020 + 0x20*i` 这种递增垃圾，而不是设计的 `ret`(0xD65F03C0)。
+        // 回读能分辨两件事：装的时候就写错，还是**之后被别人覆盖**。前者是写入路径的问题，
+        // 后者说明还有第二处代码在写同一块空穴（那种必须靠"谁写"来定位，不能再猜）。
+        // np363: read the stub back right after installing it. On device all seven stubs had their first three
+        // words right (cbz / original instruction / branch back) but the fourth was `0xD4360020 + 0x20*i`
+        // instead of the intended `ret` (0xD65F03C0). Reading back distinguishes "the write itself is wrong"
+        // from "something overwrote it later" -- the latter needs finding the second writer, not more guessing.
+        {
+            const uint32_t *rb = (const uint32_t *)stub;
+            if (rb[0] != 0xB4000060u || rb[1] != kEnt[i].first || rb[3] != 0xD65F03C0u)
+                LOG("【红】np363 桩 %s 回读不符：%08x %08x %08x %08x（期望 %08x %08x ? %08x）",
+                    kEnt[i].name, rb[0], rb[1], rb[2], rb[3], 0xB4000060u, kEnt[i].first, 0xD65F03C0u);
+            else
+                LOG("[dm] np363 桩 %s 回读一致（cbz/原指令/b 回/ret 四个字都对）", kEnt[i].name);
+        }
     }
     if (mprotect((void *)pg, 0x2000, PROT_READ | PROT_EXEC)) LOG("【红】空穴复原只读失败");
 }
@@ -734,6 +803,25 @@ static __attribute__((unused)) static void dm_repatch_runtime(void) {
 }
 
 void dm_pin_and_flush(void) {
+    // np365：**守卫记录槽所在页改成可写**。np364 的桩要 `stp x0,x30,[槽]` 把 this 与调用点记下来，
+    // 但洞所在段被映射成 RX（真机实测：桩里的 stp 直接 SIGSEGV，addr 正是槽地址）。
+    // 桩在 0x2404a70 那一页、槽在 0x2405a70 那一页，隔一页 ⇒ 只放开槽页，桩页仍保持只读。
+    // np365: make the guard-cell page writable. The np364 stub stores (this, call site) into a cell, but the
+    // cave lives in an RX mapping (on device the stub's stp took SIGSEGV at exactly the cell address).
+    // Stubs sit on page 0x2404000 and cells on 0x2405000, so only the cell page is opened; stubs stay RX.
+    {
+        static int once;
+        if (!once) {
+            once = 1;
+            module_t *mm = NULL;
+            for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mm = &g_mod[i]; break; }
+            if (mm) {
+                uintptr_t pg = (uintptr_t)(mm->base + 0x2405000);
+                int rc = mprotect((void *)pg, 0x1000, PROT_READ | PROT_WRITE);
+                LOG("np365 守卫记录槽页（main+0x2405000）mprotect → %s", rc ? "失败" : "RW 成功");
+            }
+        }
+    }
     static int logged;
     cpu_set_t set; CPU_ZERO(&set); CPU_SET(0, &set);
     // np318 收尾：真机四轮证明"钉核 / 运行期重打"都没能让取指跟上补丁（见 20-分析/真机定性-np315-317.md），

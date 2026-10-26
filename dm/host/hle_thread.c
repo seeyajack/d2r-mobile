@@ -88,6 +88,47 @@ static thr_t *cur(void) {
     if (!t) die("非客体线程调用了线程 SVC");
     return t;
 }
+// np352：给崩溃处理器用——报出"当前这个客体线程是谁"（entry / arg / 栈顶）。
+// 真机现场：构造函数 `main+0x45f9c8` 被以 `this=NULL` 调用，而它栈里保存的 x30 = 0
+// （aarch64 上 LR=0 是线程入口的特征）⇒ 先要确认是哪个线程、它的 arg 本来就是不是 0。
+// np352: for the crash handler -- report which guest thread we are on (entry / arg / stack top).
+// On device the ctor main+0x45f9c8 is entered with this=NULL and its saved x30 is 0 (the aarch64
+// thread-entry signature), so we must first know which thread this is and whether its arg was 0.
+int dm_thread_self_info(uint64_t *entry, uint64_t *arg, uint64_t *stack_top, uint32_t *handle) {
+    thr_t *t = pthread_getspecific(g_keythr);
+    if (!t) return 0;
+    if (entry) *entry = t->entry;
+    if (arg) *arg = t->arg;
+    if (stack_top) *stack_top = t->stack_top;
+    if (handle) *handle = t->handle;
+    return 1;
+}
+// np373：**把每个客体线程的 entry/arg 连同 arg 指向的结构 dump 出来**。
+// 为什么要这个：dm_thread_enter(entry, arg, sp) 把 **arg 放进 x0** 再跳进 entry，
+// 而 CreateThread 的 entry 全是 sdk+0x8b2d8（SDK 线程蹦床）——真正的"每线程入口函数"
+// 在 ThreadType 结构里，蹦床从 x0 指向的结构取它。门票① 的现象（构造函数 this=arg=0）
+// 只有"蹦床取出来的入口就是那个构造函数"才成立，所以直接把结构打出来找那个指针。
+// np373: dump every guest thread's entry/arg plus the structure arg points at. dm_thread_enter puts
+// **arg into x0** before jumping to entry, and every CreateThread entry is sdk+0x8b2d8 (the SDK thread
+// trampoline) -- the real per-thread function lives inside the ThreadType struct at x0. The observed
+// "constructor sees this = arg = 0" only holds if the trampoline takes that constructor as the entry.
+void dm_thread_dump_all(void) {
+    static char buf[0x300];
+    for (thr_t *t = g_all; t; t = t->all) {
+        fprintf(stderr, "[dm] np373 线程 h=%#x entry=%#llx arg=%#llx started=%d exited=%d\n",
+                t->handle, (unsigned long long)t->entry, (unsigned long long)t->arg,
+                t->started, t->exited);
+        if (!t->arg) continue;
+        struct iovec li = { buf, sizeof buf }, ri = { (void *)(uintptr_t)t->arg, sizeof buf };
+        if (process_vm_readv(getpid(), &li, 1, &ri, 1, 0) != (ssize_t)sizeof buf) {
+            fprintf(stderr, "     结构读不到\n");
+            continue;
+        }
+        fprintf(stderr, "     +0x00:");
+        for (int q = 0; q < 96; q++) fprintf(stderr, " %016llx", (unsigned long long)((uint64_t *)buf)[q]);
+        fprintf(stderr, "\n");
+    }
+}
 
 // ---------- 等待原语（持 G 调用）----------
 // ---------- Wait primitives (called holding G) ----------
@@ -511,6 +552,26 @@ int svc_thread(int num, uint64_t *regs) {
         thr_t *t = calloc(1, sizeof *t);
         pthread_cond_init(&t->cv, NULL);
         t->entry = regs[1]; t->arg = regs[2]; t->stack_top = regs[3] & ~0xFull;
+        // np357：**入参对不对**。真机崩点是"构造函数 main+0x45f9c8 被以 this=NULL 调用"，
+        // 而 dm_thread_enter 是尾跳转（不改 lr）⇒ 现象与"某个线程的 entry 就是这个构造函数、
+        // arg=0"完全一致。这里把前 8 次 CreateThread 的原始入参记下来，一眼看穿是游戏传错还是我们读错寄存器。
+        // np357: are the arguments right? The crash is "ctor main+0x45f9c8 entered with this=NULL", and
+        // dm_thread_enter tail-branches (does not touch lr), which fits "some thread's entry is that
+        // constructor with arg=0" exactly. Record the raw arguments of the first 8 CreateThread calls.
+        {
+            static int ncreate;
+            if (ncreate < 8) {
+                ncreate++;
+                module_t *me_ = module_of((void *)regs[1]);
+                module_t *ml_ = module_of((void *)regs[30]);
+                LOG("[dm] np357 CreateThread#%d x0=%#llx x1(entry)=%#llx(%s+%#llx) x2(arg)=%#llx x3(sp)=%#llx x4=%#llx x5=%#llx 调用者=%s+%#llx",
+                    ncreate, (unsigned long long)regs[0],
+                    (unsigned long long)regs[1], me_ ? me_->name : "?", me_ ? (uint64_t)regs[1] - (uint64_t)me_->base : 0,
+                    (unsigned long long)regs[2], (unsigned long long)regs[3],
+                    (unsigned long long)regs[4], (unsigned long long)regs[5],
+                    ml_ ? ml_->name : "?", ml_ ? (uint64_t)regs[30] - (uint64_t)ml_->base : 0);
+            }
+        }
         // np343 对齐 nxnative：核 -2（IdealCoreUseProcessValue）= 进程缺省理想核（本游戏为 0），亲和掩码只有它——同 Horizon 内核。
         // 原先原样记 -2，GetCurrentProcessorNumber 就会答 0xFFFFFFFE：按当前核号做下标索引每核引擎槽的代码会越界
         // （nxnative 实测：SMBW 字体引擎以核号选槽，收到 -2 直接崩 main+0x107dbc0）。

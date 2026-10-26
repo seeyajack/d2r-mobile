@@ -325,7 +325,17 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
     // 而游戏对未构造对象的常见处理是继续走（这正是 np296 想达到的效果，只是现在不需要改码）。
     if (sig == SIGSEGV || sig == SIGBUS) {
         uintptr_t pc = (uintptr_t)UC_PC(uc), bad = (uintptr_t)si->si_addr;
-        if (bad < 0x1000 && pc > 0x1000) {
+        // np351：**默认不再吞写**。np349 真机证明 np335 正在掩盖真正的病因：
+        // 构造函数 `main+0x45f9c8` 被以 `this=NULL` 调用，4 条写（含写 vptr 那句 `str x8,[x19]`）
+        // 全被吞掉，对象从头到尾没被构造，几百毫秒后才在无关代码里踩栈垃圾崩。
+        // 现在默认让它在第一时间崩：崩点就是"构造 NULL 对象的那一行"，`lr` 就是真正把 NULL 传进来的人。
+        // 想恢复旧行为（吞写继续跑）设 `DM_SWALLOW=1`。
+        // np351: no longer swallow by default. np349 proved np335 masks the real cause: ctor main+0x45f9c8
+        // is entered with this=NULL, all 4 stores (including the vptr store) are skipped, the object is never
+        // constructed, and the process dies hundreds of ms later on unrelated garbage. Crashing immediately puts
+        // the fault back on the NULL-object construction line, and `lr` names whoever passed NULL.
+        // Set `DM_SWALLOW=1` to restore the old swallow-and-continue behaviour.
+        if (bad < 0x1000 && pc > 0x1000 && getenv("DM_SWALLOW") != NULL) {
             uint32_t w = *(volatile uint32_t *)pc;
             // 只认"存储"类指令（str/stp/stur/strb/strh），别把读错误地吞掉
             // 放宽到整个 load/store 家族：构造函数里后面还有 `stp xzr,xzr,[x19,#0x50]` 这类成对存储。
@@ -366,7 +376,262 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
                 (unsigned long long)(uintptr_t)si->si_addr,
                 (unsigned long long)UC_X(uc, 0), (unsigned long long)UC_SP(uc),
                 (unsigned long long)UC_FP(uc));
-    if (sig == SIGSEGV || sig == SIGBUS) dump_nvn_last_calls();
+    // np369：**fp 链逐帧打印**。np330 读 [sp+0x18] 只能看最近一帧，而这次要回答的是
+    // "谁调用了 0x45f9c8"。帧指针链是 `x29` 指向本帧保存的 x29/x30 对（[fp]=旧 x29、[fp+8]=返回地址），
+    // 顺链走 8 帧就能把真实调用者列出来（每帧都用 process_vm_readv，不会二次崩）。
+    // np369: walk the frame-pointer chain and print each frame's saved return address; np330 only read the
+    // innermost frame, and the question here is who called 0x45f9c8.
+    if ((sig == SIGSEGV || sig == SIGBUS) && UC_FP(uc)) {
+        uint64_t fp = (uint64_t)UC_FP(uc);
+        fprintf(stderr, "[dm] np369 fp 链（每帧 返回地址）：\n");
+        for (int i = 0; i < 8 && fp; i++) {
+            uint64_t pair[2] = { 0, 0 };
+            struct iovec li = { pair, 16 }, ri = { (void *)(uintptr_t)fp, 16 };
+            if (process_vm_readv(getpid(), &li, 1, &ri, 1, 0) != 16) { fprintf(stderr, "   帧%d 读不到\n", i); break; }
+            fprintf(stderr, "   帧%d ret=%s  fp=%#llx\n", i, pair[1] ? fmt_off(pair[1]) : "0",
+                    (unsigned long long)pair[0]);
+            if (pair[0] <= fp) break;
+            fp = pair[0];
+        }
+    }
+    // np364：**守卫记录槽**。9 个守卫桩把 (x0 = this, x30 = 调用点)
+    // 写进数据段 main+0x2405a70 起的槽位（每 16 字节一个）。崩的时候读出来，
+    // "每个入口收到的 this 到底是什么、是谁递进来的"就变成直接读数，不用再靠帧链推断。
+    // np364: the guard stubs now record instead of blocking, storing (x0 = this, x30 = call site) into
+    // cells at main+0x2405a70 (16 bytes each). Reading them at the crash turns "what this did each entry get,
+    // and who passed it" into a direct read instead of frame-chain inference.
+    if (sig == SIGSEGV || sig == SIGBUS) {
+        static const char *gnm[10] = { "就地构造辅助", "类构造器", "包装A", "包装B", "包装B上层", "包装C", "包装D", "包装E", "分配器", "类构造器中段" };
+        for (int k7 = 0; k7 < g_nmod; k7++) {
+            if (strcmp(g_mod[k7].name, "main")) continue;
+            uint64_t cb = (uint64_t)(uintptr_t)g_mod[k7].base;
+            fprintf(stderr, "[dm] np364 守卫记录槽（this / 调用点）：\n");
+            for (int i = 0; i < 10; i++) {
+                uint64_t v[2] = { 0, 0 };
+                struct iovec li = { v, 16 }, ri = { (void *)(uintptr_t)(cb + 0x2405a70 + 0x10 * (uint64_t)i), 16 };
+                if (process_vm_readv(getpid(), &li, 1, &ri, 1, 0) != 16) {
+                    fprintf(stderr, "   %-14s 读不到\n", gnm[i]);
+                    continue;
+                }
+                fprintf(stderr, "   %-14s this=%#llx  caller=%s\n", gnm[i],
+                        (unsigned long long)v[0], v[1] ? fmt_off(v[1]) : "0（未被调用）");
+                // np379：探针槽（i>=9）存的是 {sp, x30} —— 顺着 sp 打 16 个字，
+                // 找"跳进函数体中段"那一方留下的返回地址。
+                // np379: probe cells (i >= 9) hold {sp, x30}; dump 16 words at that sp to find the jumper.
+                if (i >= 9 && v[0] > 0x1000) {
+                    uint64_t w16[16] = { 0 };
+                    struct iovec li2 = { w16, sizeof w16 }, ri2 = { (void *)(uintptr_t)v[0], sizeof w16 };
+                    if (process_vm_readv(getpid(), &li2, 1, &ri2, 1, 0) == (ssize_t)sizeof w16) {
+                        fprintf(stderr, "      栈(sp=%#llx):", (unsigned long long)v[0]);
+                        for (int q = 0; q < 16; q++)
+                            fprintf(stderr, " %s", w16[q] ? fmt_off(w16[q]) : "0");
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
+            break;
+        }
+    }
+    // np362：**看空指针保护桩的真实字节**。np296 把 7 个构造入口改成跳进代码洞（main+0x2404a70 起，
+    // 每 0x20 一个桩），桩本应是 `cbz x0,+0xC / 原首指令 / b 回函数体 / ret`。
+    // 真机却是 this=0 仍然进到函数体（`mov x19,x0` 之后才崩）⇒ 怀疑 cbz 没生效，
+    // 也就是洞里真实的字节与设计不符。这里把洞里的前 4 个字直接打出来。
+    // np362: dump the real bytes of the null-this guard stubs. np296 turns 7 constructor entries into jumps
+    // into the code cave (main+0x2404a70, one stub every 0x20) whose body should be
+    // `cbz x0,+0xC / original first instruction / b back / ret`. On device this=0 still reaches the body,
+    // so the cbz seems not to take effect -- print the four words actually sitting in the cave.
+    if (sig == SIGSEGV || sig == SIGBUS) {
+        for (int k6 = 0; k6 < g_nmod; k6++) {
+            if (strcmp(g_mod[k6].name, "main")) continue;
+            uint64_t cbase = (uint64_t)(uintptr_t)g_mod[k6].base;
+            for (int i = 0; i < 10; i++) {
+                uint64_t a = cbase + 0x2404a70 + (uint64_t)0x40 * (uint64_t)i;   // np367：stride 已改 0x40
+                uint32_t w[8] = {0};
+                int ok = 1;
+                for (int q = 0; q < 8; q++) {
+                    struct iovec li = { &w[q], 4 }, ri = { (void *)(uintptr_t)(a + 4 * (uint64_t)q), 4 };
+                    if (process_vm_readv(getpid(), &li, 1, &ri, 1, 0) != 4) { ok = 0; break; }
+                }
+                if (i == 0) fprintf(stderr, "[dm] np368 桩实况（9 个，stride 0x40，各 8 字）：\n");
+                if (ok) fprintf(stderr, "   桩%d %#llx: %08x %08x %08x %08x %08x %08x %08x %08x%s\n", i,
+                                (unsigned long long)a, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
+                                w[0] ? "" : "   ← 空槽（未安装）");
+                else    fprintf(stderr, "   桩%d %#llx: 读不到\n", i, (unsigned long long)a);
+            }
+            break;
+        }
+    }
+    // np361：**现场字节 vs 文件字节**。旧现场里出现过 `入口 45f9c8=147e9432 45f9cc=a9017bfd`，
+    // 而文件里 0x45f9cc 是 `stp x29,x30,[sp,#0x10]`（a9017bfd 对应的是 `[sp,#-0x10]!`）——
+    // 内存与文件不一致 ⇒ 装载期补丁改过这段代码，这正是"静态分析（callers.py/cf_reach）一直和运行时
+    // 对不上"的原因。崩点前后各打 8 条原始字，离线与 main.patched.bin 逐字比对即可定谳。
+    // np361: live bytes vs file bytes around the fault. An old dump showed 0x45f9cc holding a different
+    // instruction than the file, i.e. a load-time patch rewrote this code -- which is why static analysis
+    // (callers.py / cf_reach) kept disagreeing with runtime. Dump 8 raw words before and after pc; compare
+    // with main.patched.bin offline to settle it.
+    if ((sig == SIGSEGV || sig == SIGBUS) && (uint64_t)UC_PC(uc) > 0x10000) {
+        uint64_t pcx = (uint64_t)UC_PC(uc) & ~3ull, base = pcx - 0x20;
+        fprintf(stderr, "[dm] np361 现场原始字（%#llx 起 16 条，pc=%s）：\n",
+                (unsigned long long)base, fmt_off((uint64_t)UC_PC(uc)));
+        for (int i = 0; i < 16; i++) {
+            uint32_t w = 0;
+            struct iovec l = { &w, 4 }, r = { (void *)(uintptr_t)(base + (uint64_t)i * 4), 4 };
+            if (process_vm_readv(getpid(), &l, 1, &r, 1, 0) != 4) { fprintf(stderr, "   +%#04x 读不到\n", i * 4); continue; }
+            fprintf(stderr, "   +%#04x %08x%s\n", i * 4, w, base + (uint64_t)i * 4 == pcx ? "   ← pc" : "");
+        }
+    }
+    // np354：**直接打印帧里的返回地址**。np330 的 `?+0` 有两种含义（值为 0 / 不在任何模块内），
+    // 而构造函数 0x45f9c8 的 5 个调用点全是 `bl`，返回地址不可能是 0 ⇒ 大概率是"落在宿主里"。
+    // 这里把 [sp+0x10]（保存的 x29）与 [sp+0x18]（保存的 x30 = 调用者返回地址）原样打出来，不再靠推断。
+    // np354: print the frame's saved return address directly. np330's "?+0" is ambiguous (zero vs not-in-any-module),
+    // and all 5 call sites of ctor 0x45f9c8 are `bl`, so the return address cannot be zero -- it is likely a host
+    // address. Dump [sp+0x10] (saved x29) and [sp+0x18] (saved x30 = caller return address) verbatim.
+    if (sig == SIGSEGV || sig == SIGBUS) {
+        uint64_t sp = (uint64_t)UC_SP(uc), v10 = 0, v18 = 0;
+        struct iovec l1 = { &v10, 8 }, r1 = { (void *)(uintptr_t)(sp + 0x10), 8 };
+        struct iovec l2 = { &v18, 8 }, r2 = { (void *)(uintptr_t)(sp + 0x18), 8 };
+        int o1 = process_vm_readv(getpid(), &l1, 1, &r1, 1, 0) == 8;
+        int o2 = process_vm_readv(getpid(), &l2, 1, &r2, 1, 0) == 8;
+        fprintf(stderr, "[dm] np354 帧 [sp+0x10]=%s  [sp+0x18](返回地址)=%s\n",
+                o1 ? fmt_off(v10) : "读不到", o2 ? fmt_off(v18) : "读不到");
+        if (o2 && v18) {
+            int inhost = 1;
+            for (int k = 0; k < g_nmod; k++) {
+                uint64_t lo = (uint64_t)(uintptr_t)g_mod[k].base, hi = lo + g_mod[k].size;
+                if (v18 >= lo && v18 < hi) { inhost = 0; break; }
+            }
+            if (inhost) {
+                fprintf(stderr, "   ⇒ 返回地址 %#llx 不在任何客体模块内（宿主/栈/堆）\n",
+                        (unsigned long long)v18);
+                // np355：把包含这个地址的 /proc/self/maps 行原样打出来 —— 直接点名是哪个库
+                // np355: print the /proc/self/maps line containing that address, naming the library directly
+                FILE *mp3 = fopen("/proc/self/maps", "r");
+                if (mp3) {
+                    char ln[512];
+                    while (fgets(ln, sizeof ln, mp3)) {
+                        unsigned long long lo3 = 0, hi3 = 0;
+                        if (sscanf(ln, "%llx-%llx", &lo3, &hi3) == 2 && v18 >= lo3 && v18 < hi3) {
+                            size_t n3 = strlen(ln);
+                            while (n3 && (ln[n3 - 1] == '\n' || ln[n3 - 1] == '\r')) ln[--n3] = 0;
+                            fprintf(stderr, "   map 行: %s\n", ln);
+                            break;
+                        }
+                    }
+                    fclose(mp3);
+                }
+            }
+        }
+    }
+    // np352：**当前是哪个客体线程**。构造函数被以 this=NULL 调用、且其栈里保存的 x30=0
+    // （线程入口特征）⇒ 必须先确认线程身份与它的 arg 是不是本来就是 0，再谈"谁传的空 this"。
+    // np352: which guest thread are we on? The ctor is entered with this=NULL and its saved x30 is 0
+    // (the thread-entry signature), so identify the thread and its arg before blaming anyone.
+    if (sig == SIGSEGV || sig == SIGBUS) {
+        extern int dm_thread_self_info(uint64_t *, uint64_t *, uint64_t *, uint32_t *);
+        uint64_t te = 0, ta = 0, ts = 0; uint32_t th = 0;
+        if (dm_thread_self_info(&te, &ta, &ts, &th))
+            fprintf(stderr, "[dm] np352 当前客体线程 h=%#x entry=%s arg=%#llx 栈顶=%#llx\n",
+                    th, fmt_off(te), (unsigned long long)ta, (unsigned long long)ts);
+        else
+            fprintf(stderr, "[dm] np352 当前不是客体线程（宿主线程里崩的）\n");
+        // np373：把全部客体线程的 entry/arg 与 ThreadType 结构打出来 —— 找"真正的每线程入口"
+        { void dm_thread_dump_all(void); dm_thread_dump_all(); }
+    }
+    // np349：**pc 落到模块外**（0 或 0xa00000002）⇒ 不是"某条指令崩"，而是"ret/br 去了垃圾地址"。
+    // 两个变体 pc=lr=0 与 pc=lr=0xa00000002 都符合 `ret`（x30 被写成垃圾）⇒ 首要嫌疑是**栈被写坏/清零**。
+    // 现场佐证：np330 的 16 帧全是 ?+0，即 [sp+0x10]/[sp+0x18] 都是 0 —— 帧链本身就断了。
+    // 这里做两件事：① sp 附近原样 dump（看是不是一片 0）；② 从 sp 向上扫 0x4000，把落在客体模块内的
+    // qword 全列出来 —— 顶层帧坏了也能重建真实调用链。全部用 process_vm_readv，不会二次崩。
+    // np349: pc outside every module (0 or 0xa00000002) means "ret/br went to garbage", not "an instruction faulted".
+    // Both variants (pc=lr=0, pc=lr=0xa00000002) fit `ret` with a corrupted x30, so a smashed/zeroed stack is the prime suspect
+    // (np330's 16 frames are all ?+0, i.e. [sp+0x10]/[sp+0x18] are 0 -- the frame chain is already broken).
+    if (sig == SIGSEGV || sig == SIGBUS) {
+        uint64_t pcn = (uint64_t)UC_PC(uc); int pcin = 0;
+        for (int k = 0; k < g_nmod; k++) {
+            uint64_t lo = (uint64_t)(uintptr_t)g_mod[k].base, hi = lo + g_mod[k].size;
+            if (pcn >= lo && pcn < hi) { pcin = 1; break; }
+        }
+        if (!pcin) {
+            uint64_t sp = (uint64_t)UC_SP(uc);
+            fprintf(stderr, "[dm] np349 pc=%#llx 不在任何模块内 —— sp 原样（sp=%#llx）\n",
+                    (unsigned long long)pcn, (unsigned long long)sp);
+            int zeros = 0;
+            for (int k = -4; k < 9; k++) {
+                uint64_t v = 0;
+                struct iovec l = { &v, 8 }, r = { (void *)(uintptr_t)(sp + (uint64_t)(k * 8)), 8 };
+                if (process_vm_readv(getpid(), &l, 1, &r, 1, 0) == 8) {
+                    if (!v) zeros++;
+                    fprintf(stderr, "   [sp%+d] = %#llx\n", k * 8, (unsigned long long)v);
+                } else fprintf(stderr, "   [sp%+d] = （读不到）\n", k * 8);
+            }
+            fprintf(stderr, "[dm] np349 sp 附近 13 个字里 %d 个是 0%s\n", zeros,
+                    zeros >= 10 ? "  ⇒ **栈被清零**" : "");
+            fprintf(stderr, "[dm] np349 栈内候选返回地址（sp..sp+0x4000，只列落在模块内的，最多 20 条）：\n");
+            int shown = 0;
+            for (uint64_t a = sp; a < sp + 0x4000 && shown < 20; a += 8) {
+                uint64_t v = 0;
+                struct iovec l = { &v, 8 }, r = { (void *)(uintptr_t)a, 8 };
+                if (process_vm_readv(getpid(), &l, 1, &r, 1, 0) != 8) break;
+                if (!v) continue;
+                for (int k = 0; k < g_nmod; k++) {
+                    uint64_t lo = (uint64_t)(uintptr_t)g_mod[k].base, hi = lo + g_mod[k].size;
+                    if (v >= lo && v < hi) {
+                        fprintf(stderr, "   +%#llx: %s\n", (unsigned long long)(a - sp), fmt_off(v));
+                        shown++; break;
+                    }
+                }
+            }
+            if (!shown) fprintf(stderr, "   （一个都没有 —— 栈里没有任何客体代码地址）\n");
+        }
+    }
+    // np350：**宿主 .so 的地址不该出现在客体寄存器/栈里**。
+    // 真机现场：x8=0x5dd1f24150、x9=0x5dd0272000、[x19+0xf8]=[x19+0x18]=0x5dd1f56f00 —— 全是 libdms2.so 内的地址。
+    // 说明某个 HLE 返回值或写进客体对象的字段把宿主指针递进了客体；客体若拿它当函数指针/对象指针用，就是
+    // "ret 到垃圾地址"（pc=lr=0 / 0xa00000002 / 0x100000000 三个变体的共同来源之一）。
+    // 这里把"落在**可执行映射**、又**不在任何客体模块内**"的寄存器与栈槽全部列出来，一次看清污染面。
+    // np350: host .so addresses must not appear in guest registers/stack. The last device run had x8/x9/[x19+0xf8]
+    // all inside libdms2.so. Classify every register and stack slot that lands in an executable mapping which is
+    // not a guest module -- that is the "host pointer leaked into the guest" surface.
+    if (sig == SIGSEGV || sig == SIGBUS) {
+        static char mbuf[65536];
+        FILE *mp2 = fopen("/proc/self/maps", "r");
+        size_t mn = mp2 ? fread(mbuf, 1, sizeof mbuf - 1, mp2) : 0;
+        if (mp2) fclose(mp2);
+        if (mn) {
+            mbuf[mn] = 0;
+            fprintf(stderr, "[dm] np350 宿主代码地址污染检查（可执行映射、且不在客体模块内）\n");
+            int shown = 0;
+            for (int r = 0; r <= 28; r++) {
+                uint64_t v = (uint64_t)UC_X(uc, r);
+                if (!v) continue;
+                char *line = mbuf;
+                while (line && *line) {
+                    char *nl = strchr(line, '\n');
+                    unsigned long long lo = strtoull(line, NULL, 16);
+                    char *dash = strchr(line, '-');
+                    if (!dash) break;
+                    unsigned long long hi = strtoull(dash + 1, NULL, 16);
+                    char *sp2 = strchr(line, ' ');
+                    int exec = (sp2 && sp2[1] && sp2[3] == 'x');   // "lo-hi perms ..."，perms[3] 是 x 位
+                    if (exec && v >= lo && v < hi) {
+                        int guest = 0;
+                        for (int k5 = 0; k5 < g_nmod; k5++) {
+                            uint64_t gl = (uint64_t)(uintptr_t)g_mod[k5].base, gh = gl + g_mod[k5].size;
+                            if (v >= gl && v < gh) { guest = 1; break; }
+                        }
+                        if (!guest) {
+                            fprintf(stderr, "   x%-2d = %#llx  ← 宿主可执行映射 %#llx-%#llx\n",
+                                    r, (unsigned long long)v, lo, hi);
+                            shown++;
+                        }
+                        break;
+                    }
+                    line = nl ? nl + 1 : NULL;
+                }
+            }
+            if (!shown) fprintf(stderr, "   寄存器里没有宿主代码地址\n");
+        }
+    }
     // np348b：**vtable 探针** —— 崩点紧接 EndRecording 之后，客体在 0x9fd1ac 做
     //   `ldr x8,[x19]; ldr x8,[x8,#0xf8]; blr x8`（虚调用）。x19 就是那个对象；
     // 把 [x19]（vtable 指针）与几个关键槽读出来，就能判断是"虚表槽是垃圾"还是"对象本身被写坏"。
@@ -419,12 +684,22 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
                 if (sscanf(line, "%llx-%llx %7s", &lo, &hi, perm) != 3) continue;
                 if (perm[0] != 'r') continue;
                 if (hi - lo > (256ull << 20)) hi = lo + (256ull << 20);   // 单段最多扫 256MB，防超时
-                const uint64_t *p = (const uint64_t *)(uintptr_t)((lo + 7) & ~7ull);
-                const uint64_t *e = (const uint64_t *)(uintptr_t)(hi & ~7ull);
-                for (; p < e; p++) {
-                    if (*p == bad) {
-                        // 判断命中位置落在哪个模块/堆
-                        uint64_t a = (uint64_t)(uintptr_t)p;
+                // np353：**绝不解引用** —— 文件映射被截断时直接读会 SIGBUS 把处理器自己打死
+                // （2026-10-26 真机：np348 扫描让 handler 崩在宿主 .so+0xb4920，sig=7，整轮读数作废）。
+                // 改用 process_vm_readv 按 64 KB 分块读，读不全就跳过这一块。
+                // np353: never dereference -- reading a truncated file mapping raises SIGBUS and kills the handler
+                // itself (device run 2026-10-26: the np348 scan crashed the handler at host .so+0xb4920, sig=7).
+                // Read in 64 KB chunks through process_vm_readv and skip any chunk that cannot be read.
+                static uint8_t vbuf[65536];
+                for (unsigned long long a0 = lo & ~7ull; a0 < hi && hits < 8; a0 += sizeof vbuf) {
+                    size_t want = (size_t)((hi - a0) < sizeof vbuf ? (hi - a0) : sizeof vbuf);
+                    struct iovec li = { vbuf, want }, ri = { (void *)(uintptr_t)a0, want };
+                    ssize_t got = process_vm_readv(getpid(), &li, 1, &ri, 1, 0);
+                    if (got <= 0) continue;
+                    for (size_t o2 = 0; o2 + 8 <= (size_t)got && hits < 8; o2 += 8) {
+                        uint64_t v; memcpy(&v, vbuf + o2, 8);
+                        if (v != bad) continue;
+                        uint64_t a = a0 + o2;
                         const char *nm = NULL; uint64_t off = 0;
                         for (int k3 = 0; k3 < g_nmod; k3++) {
                             uint64_t l2 = (uint64_t)(uintptr_t)g_mod[k3].base, h2 = l2 + g_mod[k3].size;
@@ -434,7 +709,6 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
                         else    fprintf(stderr, "   [%d] %#llx（宿主/堆区，map 段 %#llx-%#llx）\n",
                                         hits, (unsigned long long)a, lo, hi);
                         hits++;
-                        if (hits >= 8) break;
                     }
                 }
                 scanned += (hi > lo ? hi - lo : 0);
