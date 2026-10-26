@@ -206,8 +206,42 @@ HLE_FORCE("_ZNSt3__16locale8__globalEv", "宿主实现 std::locale 全局对象"
 // 宿主这份直接接宿主 libc：全进程一个分配器，跨模块 free 也安全。
 // ⚠ 已知偏差：客体用 SetHeapSize 预留的那 3110 MB 就成了摆设，游戏改用宿主堆。
 //   真要吃满客体堆，正路是复刻 rtld 的 libc 初始化（装那个 hook），后续再做。
-HLE_FORCE("malloc", "宿主提供分配器（客体的 malloc 依赖未安装的 hook，恒返回 NULL）",
-          void *, h_malloc, size_t n) { return malloc(n); }
+// np358：**大块分配的 64 KB 对齐**（移植上游 nxnative 的 `alloc_big_align`，见其
+// `dm/host/hle_os.c` 第 139–160 行与 `docs/agents/03-bringup.md` 的 13 Sentinels 条目）。
+//
+// 上游原话（同一类症状）：主线程刚开始录命令缓冲时出现**空写，构造函数在 this=0 上跑**。根因：
+// 引擎把一整块 GPU 内存池按"**相对池 GPU 地址的 64 KB 对齐**"切成几个环堆；Switch 上池的 GPU 地址是
+// 大页对齐的，而宿主的 GPU 地址就是 CPU 地址、只按 4 KB 对齐 ⇒ 前端最多丢掉 60 KB，后面的环堆装不下，
+// 子分配器返回 0。上游的修法：≥ 64 KB 的分配按 64 KB 对齐。
+//
+// 我们的真机现场与之一致：崩点正是"第一帧命令缓冲 EndRecording 返回后立刻 this=0 构造对象"，
+// 且日志里 `MemoryPool … mem=0x5e18e3d000` 只 4 KB 对齐（0xd000 尾数）。
+// 关掉用 `DM_NO_ALLOC_ALIGN=1`。
+// np358: 64 KB alignment for large allocations (port of upstream nxnative's `alloc_big_align`).
+// Upstream's entry: a null write as soon as the main thread starts recording a command buffer -- a constructor
+// runs on this=0 -- because the engine cuts ring heaps out of one GPU pool at 64 KB alignment relative to the
+// pool's GPU address, which is big-page aligned on hardware but only 4 KB aligned on the host. Allocations of
+// 64 KB or more are therefore aligned to 64 KB here. Disable with `DM_NO_ALLOC_ALIGN=1`.
+static int alloc_align_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DM_NO_ALLOC_ALIGN") == NULL;
+    return on;
+}
+HLE_FORCE("malloc", "宿主提供分配器（客体的 malloc 依赖未安装的 hook，恒返回 NULL）；np358：≥64 KB 走高 64 KB 对齐（模拟 Switch 的大页对齐池，见 hle_os.c）",
+          void *, h_malloc, size_t n) {
+    if (n >= 0x10000 && alloc_align_on()) {
+        size_t r = (n + 0xFFFF) & ~(size_t)0xFFFF;
+        void *p = aligned_alloc(0x10000, r);
+        if (p) {
+            // np358：前 6 次记一条，用来确认"池存储确实落在 64 KB 边界上"
+            // np358: log the first six so we can confirm the pool storage really lands on a 64 KB boundary
+            static int say;
+            if (say < 6) { say++; LOG("[dm] np358 大块分配 %zu 字节 → 64 KB 对齐到 %p（对齐=%d）", n, p, (int)((uintptr_t)p & 0xFFFF)); }
+            return p;
+        }
+    }
+    return malloc(n);
+}
 HLE_FORCE("calloc", "宿主提供分配器", void *, h_calloc, size_t a, size_t b) { return calloc(a, b); }
 HLE_FORCE("realloc", "宿主提供分配器", void *, h_realloc, void *p, size_t n) { return realloc(p, n); }
 HLE_FORCE("free", "宿主提供分配器", void, h_free, void *p) { free(p); }
