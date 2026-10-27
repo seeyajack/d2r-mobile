@@ -71,6 +71,9 @@ void dm_assert_hook_install(void);
 // 语言码补丁（crash.c）：把 sdk 的 nn::settings::detail::MakeLanguageCode 改跳成宿主版（不经 set 服务）
 // Language-code shim (crash.c): redirect sdk's nn::settings::detail::MakeLanguageCode to the host (no `set` service)
 void dm_lang_shim_install(void);
+// 资源处理器补丁（loader.c）：类型1/1MB 请求无处理器 → 伪造处理器让启动推进
+// Resource-handler patch (loader.c): type-1/1MB requests have no handler -> fake one to let startup advance
+void guest_handler_patch(void);
 // 判决实验（crash.c）：把 nn::ro::detail::Bind 改跳成返回 0，验证它是不是断言所在
 // Decisive experiment (crash.c): redirect nn::ro::detail::Bind to return 0 to see if the assertion lives there
 void dm_ro_bind_probe_install(void);

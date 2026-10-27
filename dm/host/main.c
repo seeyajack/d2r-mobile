@@ -157,6 +157,7 @@ static void guest_main(void) {
     // wrong for fetch" (np315-318), while runtime patching does take effect (np297). This calls the installer
     // that had never been wired up; on a hit, crash.c's null_guard_trap() prints the caller chain.
     { void guest_null_tolerant_ctor(void); guest_null_tolerant_ctor(); }
+    { void guest_handler_patch(void); guest_handler_patch(); }   // np428：类型1/1MB 请求伪造处理器（BotW 启动死循环修复） | np428: fake handler for type-1/1MB requests
     // np386：断言钩子。零售 SDK 的断言文本被裁空、svc Break 不带载荷，只能把 AbortImpl 改跳到宿主，
     // 才能知道是哪个断言（file/func/line）。装完由下面那次 guest_flush_icache 一起生效。
     // np386: assertion hook. The retail SDK's assertion text is stripped and svc Break carries no payload, so

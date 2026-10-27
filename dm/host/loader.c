@@ -1028,3 +1028,104 @@ void run_module_inits(void) {
         ((void (*)(void))(m->base + m->init))();
     }
 }
+
+// ---- np428：资源处理器缺失补丁（BotW 启动死循环的修复） --------------------------------------
+// 真机定谳（np427）：类型 1、大小 0x100000（1MB）的资源请求在管理器里没有注册处理器，
+// 0xa0dfcc 返回 0（x20=0 走 0xa0e024 no-handler 分支），上层无限重试 ⇒ 启动死循环。
+// 补丁：0xa0e018 的 `cbz x20, +0xC`（no-handler 判定）改跳空穴桩。桩逻辑：
+//   若 x2==1 且 x3==0x100000（缺失的那类请求）→ x20 = 伪造处理器对象、b 0xa0e0c8（走虚调用路径）；
+//   否则执行原 cbz（其它请求维持原语义）。
+// 伪造对象：空穴后半 0x2404d00。+0x00 = 伪造 vtable 指针（0x2404d08）；
+//   vtable+0x88 = 成功桩（mov w0,#1; ret）——0xa0e0c8 的 blr [vtable+0x88] 返回 1 ⇒ 上层认为处理成功。
+// np428: missing-handler patch for the BotW startup loop. Requests of type 1 / 0x100000 bytes have no
+// registered handler, 0xa0dfcc returns 0 and the caller retries forever. Patch the `cbz x20` at 0xa0e018
+// to a cave stub: if x2==1 && x3==0x100000, point x20 at a fake handler object and branch to 0xa0e0c8
+// (the virtual-call path); otherwise run the original cbz. The fake object's vtable slot +0x88 is a
+// "return 1" stub, so the virtual call succeeds.
+void guest_handler_patch(void) {
+    static int done;
+    if (done) return;
+    module_t *mm = NULL;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mm = &g_mod[i]; break; }
+    if (!mm || mm->size <= 0x2404a80) return;
+    uint8_t *cave = mm->base + 0x2404c00;                      // 空穴后半（守卫桩区之外） | second half of the hole
+    uintptr_t pg = (uintptr_t)cave & ~(uintptr_t)0xfff;
+    if (mprotect((void *)pg, 0x3000, PROT_READ | PROT_WRITE | PROT_EXEC)) { LOG("【红】np428 空穴不可写"); return; }
+
+    uint8_t *fake_obj = cave;                                  // 伪造处理器对象（16 字节）
+    uint64_t fake_vt  = (uint64_t)(uintptr_t)(cave + 0x100);   // 伪造虚表（0x90+ 字节）
+    uint64_t ok_stub  = (uint64_t)(uintptr_t)(cave + 0x200);   // 成功桩
+    memset(fake_obj, 0, 0x240);
+    *(uint64_t *)fake_obj = fake_vt;
+    *(uint64_t *)(cave + 0x100 + 0x88) = ok_stub;
+    uint32_t stubw[2] = { 0x52800020u /* mov w0,#1 */, 0xD65F03C0u /* ret */ };
+    memcpy((void *)(uintptr_t)ok_stub, stubw, 8);
+
+    // 判定桩：cbz x20 的目标 0xa0e024。桩里：
+    //   cmp x2,#1 / b.ne 原路径；cmp x3,#0x100000 / b.ne 原路径；
+    //   adrp+add x20 = fake_obj；b 0xa0e0c8
+    //   原路径：cbz x20,+0xC（原语义）→ … 为省事直接重放原 cbz + b 0xa0e024
+    uint8_t *st = cave + 0x300;
+    uint32_t w[12]; int n = 0;
+    w[n++] = 0xF100015Fu;                          // cmp x2, #1
+    w[n++] = arm64_b((uint64_t)(st + 4), 0);       // 占位：b.ne → 原路径（下面重编）
+    w[n++] = 0xF1009C7Fu;                          // cmp x3, #0x100000 (1<<20 = 0x100000 → imm12=0x100)
+    w[n++] = 0;                                    // 占位：b.ne → 原路径
+    w[n++] = 0x90000000u;                          // 占位：adrp x20, fake_obj 页
+    w[n++] = 0;                                    // 占位：add x20,x20,#lo
+    w[n++] = 0;                                    // 占位：b 0xa0e0c8
+    // 原路径（从"占位 b.ne"跳来）：重放原 cbz x20,+0xC 然后 b 0xa0e024
+    // 桩布局（0x30 字节）：0..7 判定，8..0x0F 原路径，0x10.. 成功路径
+    // 重排：直接线性排——
+    //   +0x00 cmp x2,#1
+    //   +0x04 b.ne +0x1C（到 +0x20）
+    //   +0x08 cmp x3,#0x100000
+    //   +0x0C b.ne +0x14（到 +0x20）
+    //   +0x10 adrp x20 / +0x14 add x20 / +0x18 b 0xa0e0c8
+    //   +0x20 cbz x20,+0x0C（原 cbz 语义，目标 +0x2C）
+    //   +0x28 b 0xa0e024（原 no-handler 路径）
+    //   +0x2C ret 之后回 0xa0e02c？原 cbz 目标 0xa0e024+0xC=0xa0e030 —— 不对，原 cbz +0xC → 0xa0e030？
+    // 核对原 cbz：0xa0e018 cbz x20, +0xC → 目标 0xa0e024？imm19=0 且 cbz 在 0xa0e018，
+    // +0xC 应该是 0xa0e030？0xb4000074: imm19 = (w>>5)&0x7fff = 2 → 目标 = 0xa0e018 + 2*4 = 0xa0e020？
+    // 不对，imm19=2 → +8 字节 = 0xa0e020。但 0xa0e024 才是 no-handler 标志。
+    // 直接看反汇编：0xa0e018 cbz x20 → 0xa0e020（不是 0xa0e024）。
+    // 0xa0e020 mov w8,#1? 让我们重放：桩 +0x20 放原 cbz（跳 +0x28），+0x28 放 b 0xa0e020。
+    w[1] = 0x540000A1u;                            // b.ne +0x14 → 0x1C+0x14? 用相对编码函数重编更稳
+    (void)w[1];
+    // 简化：全部用 arm64_b 重编，先写死各分支目标偏移
+    uint32_t ww[14]; int m = 0;
+    ww[m++] = 0xF100015Fu;                                   // +0x00 cmp x2,#1
+    ww[m++] = 0x14000000u;                                   // +0x04 b +N（原路径 0x20）——重编
+    ww[m++] = 0xF1009C7Fu;                                   // +0x08 cmp x3,#0x100000
+    ww[m++] = 0x14000000u;                                   // +0x0C b（原路径）——重编
+    ww[m++] = arm64_adrp_rt(20, (uint64_t)(uintptr_t)fake_obj, (uint64_t)(uintptr_t)(st + 0x10));
+    ww[m++] = 0x91000000u | (((uint32_t)((uintptr_t)fake_obj & 0xFFF)) << 10) | (20u << 5) | 20u;  // add x20,x20,#lo
+    ww[m++] = arm64_b((uint64_t)(uintptr_t)(st + 0x18), (uint64_t)(mm->base + 0xa0e0c8));
+    // +0x1C 起 = 原 cbz 重放，但两个出口都要回原函数：
+    //   cbz 命中（x20==0）→ 原 no-handler 路径 0xa0e024
+    //   cbz 未命中（x20!=0）→ 原顺序路径 0xa0e01c（重放原 cbz 之后的指令不可行——0xa0e01c 起
+    //   是函数收尾 ldp/ret，直接 b 回 0xa0e01c 重放即可，桩不重放收尾）
+    ww[m++] = 0xB4000094u;                                   // +0x1C cbz x20, +0x14 → +0x30（命中）
+    ww[m++] = arm64_b((uint64_t)(uintptr_t)(st + 0x20), (uint64_t)(mm->base + 0xa0e01c));   // +0x20 未命中 → 回 0xa0e01c 重放收尾
+    ww[m++] = 0xD65F03C0u;                                   // +0x24（padding）
+    ww[m++] = 0xD65F03C0u;                                   // +0x28（padding）
+    ww[m++] = arm64_b((uint64_t)(uintptr_t)(st + 0x30), (uint64_t)(mm->base + 0xa0e024));   // +0x2C 命中 → no-handler 路径
+    // 重编两处 b（目标 = 桩内 +0x1C）之后 cbz 编码检查：0xB4000094 = cbz x20, imm19=4（+16 字节 → +0x20）？
+    // imm19=4 → +16 字节 = +0x1C+0x10 = +0x2C ✓（cbz 编码 imm 在 [5..23]，0x94>>5=4 ✓）
+    // 重编两处 b（目标 = 桩内 +0x1C）
+    ww[1] = 0x14000000u | (((0x1C - 0x04) >> 2) & 0x3FFFFFF);
+    ww[3] = 0x14000000u | (((0x1C - 0x0C) >> 2) & 0x3FFFFFF);
+    memcpy(st, ww, m * 4);
+    __builtin___clear_cache((char *)st, (char *)st + m * 4);
+
+    // 原 0xa0e018 的 cbz x20 → b 桩
+    uint8_t *at = mm->base + 0xa0e018;
+    uint32_t orig; memcpy(&orig, at, 4);
+    if (orig != 0xB4000074u) { LOG("【红】np428 原值不符 %#x", orig); return; }
+    if (mprotect((void *)((uintptr_t)at & ~(uintptr_t)0xfff), 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC)) { LOG("【红】np428 代码页不可写"); return; }
+    uint32_t jmp[2] = { arm64_b((uint64_t)(uintptr_t)at, (uint64_t)(uintptr_t)st), 0xD65F03C0u };
+    memcpy(at, jmp, 4);   // 只写 4 字节（b），下一条 0xa0e01c 不动
+    __builtin___clear_cache((char *)at, (char *)at + 4);
+    LOG("np428 资源处理器补丁已装：类型1/1MB 请求 → 伪造处理器（桩 main+0x%llx）",
+        (unsigned long long)((uint64_t)(uintptr_t)st - (uint64_t)mm->base));
+}
