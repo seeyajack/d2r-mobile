@@ -601,7 +601,10 @@ int svc_thread(int num, uint64_t *regs) {
         pthread_mutex_unlock(&G);
         regs[0] = t ? 0 : R_BAD_HANDLE; return 1;
     }
-    case 0x0A: thread_exit(cur()); return 1;
+    case 0x0A: {  // np411：谁在退出（前 8 次）——np410 的"主线程等工作线程退出"要对照这里
+        static int nx; if (nx < 8) { thr_t *t0 = cur(); module_t *me_ = module_of((void *)t0->entry);
+            LOG("ExitThread #%d entry=%s+%#llx arg=%#llx", ++nx, me_ ? me_->name : "?", me_ ? (uint64_t)t0->entry - (uint64_t)me_->base : 0, (unsigned long long)t0->arg); }
+        thread_exit(cur()); return 1; }
     case 0x0B: {  // SleepThread(x0 ns)；0/-1/-2 = 各类让出 | SleepThread(x0 ns); 0/-1/-2 = the various kinds of yield
         int64_t ns = (int64_t)regs[0];
         uint64_t t0 = g_flag.bootprof ? now_ns() : 0;
@@ -739,6 +742,23 @@ int svc_thread(int num, uint64_t *regs) {
     }
     case 0x18: {  // WaitSynchronization(→w1 下标; x1 句柄数组, w2 个数, x3 超时) | WaitSynchronization(→w1 index; x1 handle array, w2 count, x3 timeout)
         thr_t *t = cur(); const uint32_t *hs = (const uint32_t *)regs[1]; int n = (int)regs[2]; int64_t ns = (int64_t)regs[3];
+        // np411：等到**线程句柄**时把目标线程的身份打出来（入口 / 参数 / 已退出否）——
+        // np410 真机：主线程无限等 0x1003/0x1007（两个工作线程），要分辨"等它退出"还是"等它出错"。
+        // np411: when waiting on a thread handle, print the target's identity (entry / arg / exited?) --
+        // np410 on device: the main thread waits forever on 0x1003/0x1007 (two workers); distinguish
+        // "waiting for it to exit" from "waiting for something that already went wrong".
+        { static int nt; if (nt++ < 6) {
+            for (int i = 0; i < n && i < 4; i++) {
+                unsigned i_ = hs[i] - 0x1000;
+                if (i_ < MAX_H && g_h[i_].type == O_THREAD) {
+                    thr_t *w = (thr_t *)g_h[i_].obj;
+                    module_t *me_ = module_of((void *)w->entry);
+                    LOG("WaitSynchronization 等线程 h=%#x entry=%s+%#llx arg=%#llx started=%d exited=%d 超时=%lld",
+                        hs[i], me_ ? me_->name : "?", me_ ? (uint64_t)w->entry - (uint64_t)me_->base : 0,
+                        (unsigned long long)w->arg, w->started, w->exited, (long long)ns);
+                }
+            }
+        } }
         { static int nc; if (nc++ < 6) LOG("WaitSynchronization 调用：n=%d 超时=%lld 首句柄=%#x", n, (long long)ns, n > 0 ? hs[0] : 0); }
         // 只在等假服务句柄时：它们永远不会有服务端来触发，**无限等就是死锁** ⇒ 上限 100 ms，之后回超时。
         // 有真句柄混在里面时不动（那种等待是靠真事件触发的）。

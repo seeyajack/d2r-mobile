@@ -62,6 +62,15 @@ static uint8_t g_unimpl_seen[NVN_NFUNC];
 uint64_t nvn_unimpl_c(nvn_slot_t *slot, uint64_t x0, uint64_t x1, uint64_t x2) {
     unsigned i = (unsigned)(slot - nvn_slot);
     if (!g_unimpl_seen[i]++) LOG("【红】NVN 未实现被调用：%s (x0=%#llx x1=%#llx x2=%#llx)", nvn_names[i], x0, x1, x2);
+    // np412：未实现桩返回 0 对有些调用是致命的（GetStorageClass ⇒ 存储类 0；GetRequiredMemorySize ⇒
+    // 分配 0 字节…）。把"这次调用者是谁"打出来，命中率高的直接升级成正式实现。
+    // np412: returning 0 is fatal for some callers (GetStorageClass -> storage class 0; GetRequiredMemorySize ->
+    // a zero-byte allocation...). Log who called it; the hot ones get promoted to real implementations.
+    if (g_unimpl_seen[i] <= 3) {   // np412：调用者归属（module_of 见 dm.h） | caller attribution
+        void *lr = __builtin_return_address(0);
+        module_t *m = module_of(lr);
+        LOG("    调用者 %s+%#llx", m ? m->name : "?", m ? (uint64_t)lr - (uint64_t)m->base : (uint64_t)lr);
+    }
     return 0;
 }
 
