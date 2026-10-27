@@ -593,6 +593,19 @@ void guest_null_tolerant_ctor(void) {   // np374：改为运行期安装（np297
     // this can never be null; it is null here, so something upstream differs -- keep the guest alive
     // first and then see where it actually uses the null object.
     static const struct { uint64_t off; uint32_t first; int mode; const char *name; } kEnt[] = {
+        // np406：**资源管理器 getter**（`ldr x8,[x0,#0x10]; ldr x0,[x8,#0x38]; ret`）。
+        // np405 真机：游戏连续跑帧后第一个裸崩点就在它（this=NULL，addr=0x38）。
+        // mode 0 的桩形正好合适：cbz x0 → NULL 时直接 ret（x0 已是 0 ⇒ 返回 NULL），
+        // 命中时 null_guard_trap() 打调用者链。上游拿到 NULL 会怎么表现，正好是我们想要的信息。
+        // np406: the resource-manager getter (ldr x8,[x0,#0x10]; ldr x0,[x8,#0x38]; ret). np405 on device: the
+        // first plain crash after the guest runs frames is right here (this=NULL, addr=0x38). Mode 0 fits: cbz x0
+        // returns immediately on NULL (x0 is already 0, so it returns NULL), and a hit makes null_guard_trap()
+        // print the caller chain. How the caller copes with NULL is exactly the information we want.
+        // np407：改 mode 3。np406b 真机：FAULT 时 x0=0x5e9e2fd908 **不是 NULL**，空的是
+        // 第一条读出来的 [x0+0x10]（x8），FAULT 在第二条 ldr x0,[x8,#0x38]。
+        // np407: switch to mode 3. On device (np406b) x0 was NOT null at the fault; the null value is what the
+        // first load read into x8, and the fault is the second load.
+        { 0x10831f8, 0xF9400808u, 3, "0x10831f8 资源管理器 getter（np405 裸崩点，两级判空）" },
         { 0x105f9e4, 0xF81E0FF3u, 0, "0x105f9e4 就地构造（np374：改回真守卫，不再无条件 ret）" },
         { 0x45f9c8,  0xF81E0FF3u, 0, "0x45f9c8 类构造器" },
         { 0x3326b8,  0xF81E0FF3u, 0, "0x3326b8 构造包装 A" },
@@ -664,6 +677,27 @@ void guest_null_tolerant_ctor(void) {   // np374：改为运行期安装（np297
         }
         if (kEnt[i].mode == 1) {   // np297 对照实验：无条件 ret（不占空穴）
             guest_patch32((uint32_t *)fn, kEnt[i].first, 0xD65F03C0u, kEnt[i].name);
+            continue;
+        }
+        if (kEnt[i].mode == 3) {   // np407：两级 getter 桩（6 条）：
+            //   cbz x0,ret        （this 为空 → 返回 0）
+            //   原第一条           （x8 = [x0+0x10]）
+            //   cbz x8,ret        （内层指针为空 → 返回 0）★ 这就是 np406b 漏掉的那次
+            //   b fn+8            （x8 非空 → 回原函数第二条）
+            //   ret / ret
+            if (*(uint32_t *)stub) { LOG("【红】空指针保护 %s：空穴槽已被占用，跳过", kEnt[i].name); continue; }
+            uint32_t gw[6];
+            gw[0] = 0xB4000060u;                          // cbz x0, +0x0C → 第 5 条 ret
+            gw[1] = kEnt[i].first;                        // 原第一条
+            gw[2] = 0u;                                   // 占位，下面重编（cbz x8 → 第 5 条 ret）
+            gw[3] = arm64_b((uint64_t)(stub + 12), (uint64_t)(fn + 8));
+            gw[4] = 0xD65F03C0u;                          // ret
+            gw[5] = 0xD65F03C0u;                          // ret
+            // cbz x8 的偏移：从 stub+8 到 stub+16（第 5 条 ret）= +8 字节 = imm19 2
+            gw[2] = 0xB4000048u | (2u << 5);              // cbz x8, +8
+            memcpy(stub, gw, sizeof gw);
+            __builtin___clear_cache((char *)stub, (char *)stub + 24);
+            guest_patch32((uint32_t *)fn, kEnt[i].first, arm64_b((uint64_t)fn, (uint64_t)stub), kEnt[i].name);
             continue;
         }
         if (*(uint32_t *)stub) { LOG("【红】空指针保护 %s：空穴槽已被占用，跳过", kEnt[i].name); continue; }
