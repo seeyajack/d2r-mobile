@@ -573,11 +573,14 @@ int svc_thread(int num, uint64_t *regs) {
                 ncreate++;
                 module_t *me_ = module_of((void *)regs[1]);
                 module_t *ml_ = module_of((void *)regs[30]);
-                LOG("[dm] np357 CreateThread#%d x0=%#llx x1(entry)=%#llx(%s+%#llx) x2(arg)=%#llx x3(sp)=%#llx x4=%#llx x5=%#llx 调用者=%s+%#llx",
+                uint64_t real_fn = 0; memcpy(&real_fn, (void *)regs[2], 8);   // np425：arg 首 8 字节 = 真实入口 | np425: arg[0] = the real entry
+                module_t *mf_ = module_of((void *)real_fn);
+                LOG("[dm] np357 CreateThread#%d x0=%#llx x1(entry)=%#llx(%s+%#llx) x2(arg)=%#llx x3(sp)=%#llx x4=%#llx x5=%#llx 真实入口=%#llx(%s+%#llx) 调用者=%s+%#llx",
                     ncreate, (unsigned long long)regs[0],
                     (unsigned long long)regs[1], me_ ? me_->name : "?", me_ ? (uint64_t)regs[1] - (uint64_t)me_->base : 0,
                     (unsigned long long)regs[2], (unsigned long long)regs[3],
                     (unsigned long long)regs[4], (unsigned long long)regs[5],
+                    (unsigned long long)real_fn, mf_ ? mf_->name : "?", mf_ ? real_fn - (uint64_t)mf_->base : real_fn,
                     ml_ ? ml_->name : "?", ml_ ? (uint64_t)regs[30] - (uint64_t)ml_->base : 0);
             }
         }
@@ -771,6 +774,11 @@ int svc_thread(int num, uint64_t *regs) {
             }
         } }
         { static unsigned nc; if (nc++ % 50 == 0) LOG("WaitSynchronization 调用：n=%d 超时=%lld 首句柄=%#x", n, (long long)ns, n > 0 ? hs[0] : 0); }
+        // np425：CreateThread 的 arg 结构首 8 字节 = 真实线程函数指针（0x8b2d8 是统一包装）。
+        // 打一次每个线程的真实入口，分辨哪个是 SystemTask 的派发线程。
+        // np425: the first 8 bytes of CreateThread's arg struct hold the REAL thread function
+        // (0x8b2d8 is just the SDK wrapper). Log each thread's real entry once, to tell which one
+        // is the SystemTask dispatcher.
         // 只在等假服务句柄时：它们永远不会有服务端来触发，**无限等就是死锁** ⇒ 上限 100 ms，之后回超时。
         // 有真句柄混在里面时不动（那种等待是靠真事件触发的）。
         // Only when every handle is a fake service handle: nothing will ever signal them, so an infinite wait
