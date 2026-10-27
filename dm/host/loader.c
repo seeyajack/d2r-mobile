@@ -606,6 +606,15 @@ void guest_null_tolerant_ctor(void) {   // np374：改为运行期安装（np297
         // np407: switch to mode 3. On device (np406b) x0 was NOT null at the fault; the null value is what the
         // first load read into x8, and the fault is the second load.
         { 0x10831f8, 0xF9400808u, 3, "0x10831f8 资源管理器 getter（np405 裸崩点，两级判空）" },
+        // np408：**场景管理器成员**（`ldr x19,[x0,#0x68]; ldr x8,[x19]...`——真实第一条是 0xF9403660）。
+        // np407 真机：`x0+0x68` 读出 0 存进 x19 ⇒ 下一条 `ldr x8,[x19]` 在 addr=0 崩（FAULT pc=0xa660ac）。
+        // 崩点之后游戏本来就有 `cbz x20` 判空（0xa660c4），所以"跳过这次虚调用、返回值=0"是调用方预期内的路径。
+        // mode 1（无条件 ret）：x0 进来时是 this，返回值寄存器恰好为 0 ⇒ 等价于"跳过虚调用"。
+        // np408: a scene-manager member (real first instruction 0xF9403660 = ldr x19,[x0,#0x68]). On device (np407)
+        // x0+0x68 read as 0 into x19, so the next ldr x8,[x19] faulted at addr=0 (FAULT pc=0xa660ac). The game checks
+        // cbz x20 after the blr anyway (0xa660c4), so skipping the virtual call with a zero result is a path the
+        // caller already expects. Mode 1 (plain ret): x0 is `this` on entry and the result register is 0.
+        { 0xa660a8, 0xF9403660u, 1, "0xa660a8 场景管理器成员（np407 裸崩点，跳过虚调用返回 0）" },
         { 0x105f9e4, 0xF81E0FF3u, 0, "0x105f9e4 就地构造（np374：改回真守卫，不再无条件 ret）" },
         { 0x45f9c8,  0xF81E0FF3u, 0, "0x45f9c8 类构造器" },
         { 0x3326b8,  0xF81E0FF3u, 0, "0x3326b8 构造包装 A" },
@@ -717,7 +726,7 @@ void guest_null_tolerant_ctor(void) {   // np374：改为运行期安装（np297
         // words right (cbz / original instruction / branch back) but the fourth was `0xD4360020 + 0x20*i`
         // instead of the intended `ret` (0xD65F03C0). Reading back distinguishes "the write itself is wrong"
         // from "something overwrote it later" -- the latter needs finding the second writer, not more guessing.
-        {
+        if (kEnt[i].mode == 0) {   // np408：回读校验只对 mode 0（mode 3 桩形是六字，另有一套形状）
             const uint32_t *rb = (const uint32_t *)stub;
             if (rb[0] != 0xB4000060u || rb[1] != kEnt[i].first || rb[3] != 0xD65F03C0u)
                 LOG("【红】np363 桩 %s 回读不符：%08x %08x %08x %08x（期望 %08x %08x ? %08x）",
