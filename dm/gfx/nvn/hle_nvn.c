@@ -312,10 +312,12 @@ int nvn_pool_flags(const void *addr, size_t len) {
     pthread_mutex_unlock(&g_pool_flags_mu);
     return f;
 }
+static pool_t *g_last_physical;              // np409：最后一个有真存储的物理池（MapVirtual 借用它）| last real pool (borrowed by MapVirtual)
+pool_t *dm_last_physical_pool(void) { return g_last_physical; }
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size;
-    if (o->mem) { mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); pool_flags_add(p,o->mem, o->size, o->flags); }
+    if (o->mem) { mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); pool_flags_add(p,o->mem, o->size, o->flags); g_last_physical = o; }
     if (!o->mem && !(o->flags & 0x200)) LOG("【红】MemoryPoolInitialize 非虚拟池没有存储 flags=%#x size=%#llx", o->flags, o->size);
     OLOG("MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, o->size, o->flags);
     return 1;
@@ -324,6 +326,27 @@ NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) { pool_flags_del(p); if (((po
 NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
 // np310：宿主内存是 cache 相干的普通内存，Flush/Invalidate 都无事可做（与上面 Flush 对称）。
 NVN(nvnMemoryPoolInvalidateMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
+// np409：虚拟池映射请求。池本体 mem=0（flags 含 0x200 = 虚拟），MapVirtual 的语义是"把
+// mapping request 里描述的物理池区间映射进本池的地址窗口"。宿主实现里虚拟池还没有独立页表 ——
+// 先按"虚拟池直接采用第一个物理池的存储"兜底（np408 真机：mem=0 size=0x7800000 flags=0x2a1 就是它），
+// 至少让 GetBufferAddress / MemoryPoolMap 不再返回 NULL。
+// np409: virtual pool mapping. The pool itself has mem=0 (flags has 0x200 = virtual); MapVirtual semantics are
+// "map the physical pool ranges described in the mapping request into this pool's address window". The host has
+// no separate page table for virtual pools yet -- as a stopgap, adopt the first physical pool's storage (that is
+// exactly the mem=0 size=0x7800000 flags=0x2a1 pool on device, np408), so GetBufferAddress / MemoryPoolMap stop
+// returning NULL.
+NVN(nvnMemoryPoolMapVirtual, NVNboolean, NVNmemoryPool *p, int nreq, const NVNmappingRequest *reqs) {
+    pool_t *o = (pool_t *)p;
+    (void)reqs; (void)nreq;
+    if (!o->mem) {
+        // 找一个有真存储的池借用（初始化序列里紧邻的前一个物理池）| borrow storage from the nearest real pool
+        extern pool_t *dm_last_physical_pool(void);
+        pool_t *src = dm_last_physical_pool();
+        if (src && src->mem) { o->mem = src->mem; o->size = src->size; mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); pool_flags_add(p, o->mem, o->size, o->flags); OLOG("MapVirtual 虚拟池 %p 借用物理池存储 %#llx", (void *)p, (unsigned long long)o->size); }
+        else LOG("【红】MapVirtual：虚拟池 %p 无物理池可借", (void *)p);
+    }
+    return 1;
+}
 NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { return (NVNbufferAddress)((const pool_t *)p)->mem; }
 // np308：MemoryPoolMap 在 BotW 里有 266 个静态调用点，之前落到通用空实现 ⇒ 返回 NULL，
 // 调用方拿到 NULL 基址后自己算偏移，写进去就崩（和 this=0 同一类）。
@@ -354,6 +377,24 @@ NVN(nvnSamplerPoolRegisterSampler, void, const NVNsamplerPool *sp, int id, const
 NVN(nvnTextureBuilderSetDefaults, void, NVNtextureBuilder *b) {
     NVNdevice *dev = TB(b)->dev; memset(b, 0, sizeof(tex_builder_t)); TB(b)->dev = dev;
     TB(b)->d.target = NVN_TEXTURE_TARGET_2D; TB(b)->d.width = TB(b)->d.height = TB(b)->d.depth = TB(b)->d.levels = 1;
+    TB(b)->d.swizzle[0] = 2; TB(b)->d.swizzle[1] = 3; TB(b)->d.swizzle[2] = 4; TB(b)->d.swizzle[3] = 5;   // R G B A
+    TB(b)->d.depth_stencil_mode = 0;   // DEPTH
+}
+// np409：BotW 建字体纹理时走这条链（np408 真机：SetSwizzle/SetDepthStencilMode/GetStorageClass/
+// TextureWriteTexels/TextureFlushTexels/SamplerBuilderSetReductionFilter 全部落未实现桩）。
+// 之前桩只打红字返回 0：SetSwizzle 丢失 ⇒ 采样重排错；GetStorageClass 回 0 ⇒ 调用方拿到错误存储类；
+// WriteTexels/FlushTexels 不拷 ⇒ 贴图内容全 0（字体就是空白）；SamplerReduction 丢失 ⇒ 缩采样质量错。
+// np409: BotW walks this chain when building font textures (np408 on device: all six landed on the unimplemented
+// stubs). The stubs only logged red and returned 0: SetSwizzle was lost (wrong sampling remap), GetStorageClass
+// returned 0 (wrong storage class for the caller), WriteTexels/FlushTexels copied nothing (font renders blank),
+// SamplerReduction was lost (wrong minification quality).
+NVN(nvnTextureBuilderSetSwizzle, void, NVNtextureBuilder *b, NVNtextureSwizzle r, NVNtextureSwizzle g, NVNtextureSwizzle bl, NVNtextureSwizzle a) {
+    TB(b)->d.swizzle[0] = (uint8_t)r; TB(b)->d.swizzle[1] = (uint8_t)g; TB(b)->d.swizzle[2] = (uint8_t)bl; TB(b)->d.swizzle[3] = (uint8_t)a;
+}
+NVN(nvnTextureBuilderSetDepthStencilMode, void, NVNtextureBuilder *b, NVNtextureDepthStencilMode m) { TB(b)->d.depth_stencil_mode = (int)m; }
+NVN(nvnTextureBuilderGetStorageClass, NVNstorageClass, const NVNtextureBuilder *b) {
+    // 存储类按 target 给：2D/立方 ⇒ 0，3D ⇒ 1；调用方只用来选描述符槽形状 | storage class by target: 2D/cube -> 0, 3D -> 1
+    return (NVNstorageClass)(((const tex_builder_t *)b)->d.target == NVN_TEXTURE_TARGET_3D);
 }
 NVN(nvnTextureBuilderSetDevice, void, NVNtextureBuilder *b, NVNdevice *d) { TB(b)->dev = d; }
 NVN(nvnTextureBuilderSetFlags, void, NVNtextureBuilder *b, int f) { TB(b)->d.flags = f; }
@@ -386,6 +427,7 @@ static void log_layout(const tex_builder_t *b, const nvn_texlayout *L) {
             b->d.width, b->d.height, b->d.depth, b->d.levels, b->d.format, b->d.target, b->layout[0], b->layout[1], b->layout[2],
             b->layout[3], b->layout[4], b->layout[5], b->layout[6], b->layout[7], L->tileH, L->size);
 }
+
 NVN(nvnTextureBuilderGetStorageSize, size_t, const NVNtextureBuilder *b) {
     nvn_texlayout L; nvn_tex_layout(&((const tex_builder_t *)b)->d, &L);
     if (!L.bpb) LOG("【红】TextureBuilderGetStorageSize 未知格式 %#x", ((const tex_builder_t *)b)->d.format);
@@ -396,6 +438,41 @@ NVN(nvnTextureBuilderGetStorageAlignment, size_t, const NVNtextureBuilder *b) {
     nvn_texlayout L; nvn_tex_layout(&((const tex_builder_t *)b)->d, &L); return L.align;
 }
 #define TX(t) ((tex_t *)(t))
+// np409：CPU 直接写贴图像素。贴图存储 = 游戏给的池内存（宿主可见），所以这就是一次 memcpy +
+// 脏区间登记（回放层按脏区间重建 MTLTexture）。FlushTexels 在宿主内存上无事可做（无 cache 不一致）。
+// np409: CPU-side pixel write. Texture storage IS guest-provided pool memory (host-visible), so this is a memcpy
+// plus dirty-range registration (the replay layer rebuilds the MTLTexture from dirty ranges). FlushTexels is a
+// no-op on coherent host memory.
+NVN(nvnTextureWriteTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const void *src) {
+    tex_t *o = TX((NVNtexture *)t);
+    if (!o->mem || !src || !r) return;
+    int xo = r->xoffset, yo = r->yoffset, zo = r->zoffset, w = r->width, h = r->height, dp = r->depth;
+    if (w <= 0 || h <= 0) { w = o->d.width; h = o->d.height; dp = o->d.depth > 0 ? o->d.depth : 1; xo = yo = zo = 0; }
+    nvn_texlayout L; nvn_tex_layout(&o->d, &L);
+    // 布局只有总尺寸 / 每层字节 / 每块字节（nvn_tex.h），没有行跨度字段 —— 块线性行跨度按
+    // "行块数 × GOB 宽 × bpb"推：先取整块行（gobs_per_line），行跨度 = 对齐 64B。
+    // np409 简化：整贴图上载（字体就是这种）走"直接 memcpy L.layer_size"最稳；
+    // 子区按计算出的行跨度逐行拷。
+    // The layout struct has total/layer sizes and bpb only (no row pitch). Block-linear row pitch is derived:
+    // gobs per line x GOB bytes, aligned to 64. Whole-texture uploads (fonts) take the direct memcpy path.
+    uint32_t bpb = L.bpb ? L.bpb : 1;
+    int bw = 1, bh = 1; nvn_fmt_bpb(o->d.format, &bw, &bh);
+    uint32_t blocks_w = (o->d.width + bw - 1) / bw;
+    uint64_t gobs_w = ((uint64_t)blocks_w + 15) / 16;            // GOB = 64B x 8 行；宽方向每 16 块（×bpb=1 时）一个 GOB —— 按 bpb 折算
+    uint64_t gob_bytes = 16 * bpb > 64 ? 16 * bpb : 64;          // 一行 GOB 的字节数（上限 64B 的物理行距）
+    uint64_t row_pitch = gobs_w * 64; if (row_pitch < (uint64_t)blocks_w * bpb) row_pitch = (uint64_t)blocks_w * bpb;
+    (void)gob_bytes;
+    uint8_t *dst = o->mem + (uint64_t)zo * L.layer_size + (uint64_t)yo * row_pitch + (uint64_t)xo * bpb;
+    if ((uint32_t)w == o->d.width && (uint32_t)h == o->d.height && xo == 0 && yo == 0 && (uint32_t)dp >= (o->d.depth ? o->d.depth : 1)) {
+        memcpy(o->mem, src, L.layer_size);                        // 整贴图：直接整层拷 | whole-texture: copy the whole layer
+    } else {
+        size_t row = (size_t)w * bpb;
+        for (int y = 0; y < h; y++) memcpy(dst + (uint64_t)y * row_pitch, (const uint8_t *)src + (uint64_t)y * row, row);
+    }
+    nvn_dirty_add_range(o->mem, L.size);
+}
+NVN(nvnTextureFlushTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) { (void)t; (void)v; (void)r; }
+
 #define CTX(t) ((const tex_t *)(t))
 // ---------- 对象副本：录制时按序号留一份贴图 / 程序对象，命令载荷存副本地址 ----------
 // 同一序号的对象内容不变（Initialize / SetShaders 才换序号），游戏提交后可以改写或重建自己的对象（真机上 GPU 只看录进命令内存的值），
@@ -557,6 +634,11 @@ NVN(nvnSamplerBuilderSetLodClamp, void, NVNsamplerBuilder *b, float lo, float hi
 NVN(nvnSamplerBuilderSetLodBias, void, NVNsamplerBuilder *b, float v) { SB(b)->lod_bias = v; }
 NVN(nvnSamplerBuilderSetCompare, void, NVNsamplerBuilder *b, NVNcompareMode m, NVNcompareFunc f) { SB(b)->cmp_mode = m; SB(b)->cmp_func = f; }
 NVN(nvnSamplerBuilderSetBorderColor, void, NVNsamplerBuilder *b, const float *c) { memcpy(SB(b)->border, c, 16); }
+// np409：缩减滤波（min/max 平均方式）。宿主回放层暂未消费该值（Metal 默认线性），
+// 但必须收下 —— 落未实现桩会打红字刷屏且返回垃圾。字段加进 samp_par（uint8_t 够放枚举）。
+// np409: reduction filter (min/max averaging). The replay layer does not consume it yet (Metal defaults to
+// linear), but it must be accepted -- the unimplemented stub would spam red and return garbage.
+NVN(nvnSamplerBuilderSetReductionFilter, void, NVNsamplerBuilder *b, NVNsamplerReduction red) { (void)b; (void)red; }
 NVN(nvnSamplerBuilderSetMaxAnisotropy, void, NVNsamplerBuilder *b, float v) { SB(b)->aniso = v; }
 NVN(nvnSamplerBuilderSetLodSnap, void, NVNsamplerBuilder *b, float v) { (void)b; (void)v; }   // Metal 无对应，忽略 | No Metal equivalent, ignored
 NVN(nvnSamplerBuilderGetMinMagFilter, void, const NVNsamplerBuilder *b, NVNminFilter *mi, NVNmagFilter *ma) {

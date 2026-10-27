@@ -7,6 +7,8 @@ typedef struct {
     int target, format, flags, samples;   // NVNtextureTarget / NVNformat / NVNtextureFlags / 采样数（0 或 1 = 单采样） | NVNtextureTarget / NVNformat / NVNtextureFlags / sample count (0 or 1 = single-sampled)
     uint32_t width, height, depth, levels, stride;
     int pkg_block_h;                      // 预排布贴图布局参数第 0 字节（块高 log2）+ 1；0 = 按自动算法 | Byte 0 of the packaged texture layout parameters (log2 of block height) + 1; 0 = use the automatic algorithm
+    uint8_t swizzle[4];                   // np409：RGBA 分量重映射（NVNtextureSwizzle，默认 R/G/B/A = 2/3/4/5）；Metal 侧采样前重排 | np409: RGBA component remap (NVNtextureSwizzle; default R/G/B/A = 2/3/4/5); applied before sampling on the Metal side
+    int depth_stencil_mode;               // np409：NVNtextureDepthStencilMode（0=DEPTH 1=STENCIL）；影响读回哪个面 | np409: which facet reads back
 } nvn_texdesc;
 
 typedef struct {
