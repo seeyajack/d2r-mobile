@@ -1161,6 +1161,12 @@ static void dm_abort_hook(const char *expr, const char *file, const char *func, 
     if (lm) snprintf(where, sizeof where, "%s+%#llx", lm->name, (unsigned long long)(lr - (uint64_t)lm->base));
     LOG("【断言】调用者 %s  %s  (%s:%d)  Result=%#x%s%s", where, fn[0] ? fn : "?", ff[0] ? ff : "?", line, rv,
         fe[0] ? "  expr=" : "", fe);
+    // np402：**在断言这一刻**扫栈。Break 时链上已经压了 AbortImpl→Break→信号 好几层，FP 早被跳板搅乱；
+    // 这里我们是客体直接调用进来的，本帧第一个槽就是客体的 x29，扫它最干净。
+    // np402: scan the stack AT the assertion. By the time Break runs, several layers (AbortImpl -> Break -> the
+    // signal) are on top and the FP is already scrambled by the trampolines; here the guest called us directly, so
+    // slot 0 of our frame is the guest's x29 -- the cleanest point to scan from.
+    { void dm_backtrace_scan(uint64_t); dm_backtrace_scan(((uint64_t *)__builtin_frame_address(0))[0]); }
     if (fm[0]) LOG("        格式：%s", fm);
     // 软断言：还原原指令后**直接返回**，让调用方继续走（断言在 SDK 里是"不该发生"的路径，
     // 但移植期我们宁愿继续跑、把后面还有多少关卡一次看清；每一条都记了日志，不会静默）。
