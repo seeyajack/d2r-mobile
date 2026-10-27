@@ -162,11 +162,12 @@ static void guest_main(void) {
     // np386: assertion hook. The retail SDK's assertion text is stripped and svc Break carries no payload, so
     // AbortImpl is redirected to the host to learn which assertion fired (file/func/line). The guest_flush_icache
     // call below makes it take effect on this thread.
-    // dm_assert_hook_install();   // np394 A/B：临时摘掉，验证「软断言」是否自己造成了 Break | np394 A/B: temporarily off, to check whether the soft assert itself causes the Break
+    dm_assert_hook_install();   // np401：重新打开——np394 的 A/B 已证明它不影响 Break，而它能给出断言的 fmt 串 | np401: back on -- the np394 A/B proved it does not affect the Break, and it yields the assertion's fmt string
     // np393：语言码补丁。`nn::settings::detail::MakeLanguageCode` 要经 set 服务查语言表，宿主只有假句柄 ⇒ 断言。
     // np393: language-code shim. MakeLanguageCode queries the language table through the `set` service and the
     // host only has a fake handle, which ends in an assertion.
     dm_lang_shim_install();
+    // np398 判决：nn::ro::detail::Bind 从未被调用（0 次）⇒ bt 上的 0x8dd58 是假象，实验已删 | np398 verdict: ro::detail::Bind was never called, so 0x8dd58 on the bt was an artefact; probe removed
     // np376：**装完补丁立刻在"将要执行客体的这个线程"上清 icache**。
     // 为什么必须有这一步：aarch64 的 `ic ivau` 只影响本核；`guest_flush_icache()` 原来只在
     // worker 线程（thread_main）里被调，**主线程从不经过那里**——而崩溃正发生在主线程（h=0x1001）。

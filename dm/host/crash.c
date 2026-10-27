@@ -105,6 +105,46 @@ void crash_off(const char *tag, uint64_t a) {   // diag.c 也用 | Also used by 
     else if (dladdr((void *)a, &di) && di.dli_sname) fprintf(stderr, " %s%s%s+%#lx", tag, *tag ? "=" : "", di.dli_sname, (unsigned long)(a - (uint64_t)di.dli_saddr));
     else fprintf(stderr, " %s%s%#llx", tag, *tag ? "=" : "", a);
 }
+// np397：**栈扫描回溯**。为什么不能只靠 x29 链：sdk 的导入跳板（sdk+0x7b1474 那一段）会
+// `adrp x29; ldr x29,[x29,#0x18]` **改写帧指针**，一过跳板 FP 链就断，打出来的"帧"是垃圾
+// （np384/385/391 三次被误导）。栈扫描不受影响：在 [fp, fp+0x600) 里找落在模块**代码段**里的 8 字节值，
+// 按出现顺序当成返回地址。会多几个假阳性，但**不会漏掉真的调用者**。
+// np397: stack-scan backtrace. The x29 chain alone is not usable: the sdk's import trampolines
+// (the block at sdk+0x7b1474) do `adrp x29; ldr x29,[x29,#0x18]`, i.e. they REWRITE the frame pointer, so the
+// chain breaks as soon as it crosses a trampoline and the printed frames are garbage (np384/385/391 were all
+// misled). A stack scan is immune: look for 8-byte values inside module CODE ranges in [fp, fp+0x600) and treat
+// them, in order, as return addresses. A few false positives, but it never misses the real caller.
+static int in_code(uint64_t a) {
+    for (int i = 0; i < g_nmod; i++) {
+        uint64_t lo = (uint64_t)g_mod[i].base, hi = lo + (g_mod[i].text_end ? g_mod[i].text_end : g_mod[i].size);
+        if (a >= lo && a < hi) return 1;
+    }
+    return 0;
+}
+void dm_backtrace_scan(uint64_t fp) {
+    if (!fp || (fp & 7)) return;
+    fprintf(stderr, "[dm] bt(栈扫描):");
+    int shown = 0;
+    for (int k = 0; k < 0x600 && shown < 16; k += 8) {   // 变量名不能叫 off：那是个宏（crash_off） | do not name it `off`, that is a macro
+        uint64_t v = *(volatile uint64_t *)(fp + k);
+        if (!in_code(v)) continue;
+        // np400：**候选返回地址必须"前一条是 bl/blr"**。栈上还会放函数地址（vtable、函数指针表），
+        // 它们落在代码段里但不是返回地址 —— np397 的 `sdk+0x8dd58`（ro::Bind）就是这么来的，
+        // 判决实验（np398）证明它一次都没被调用。加这一条能把假象滤掉。
+        // np400: a candidate return address must be preceded by a bl/blr. The stack also holds plain function
+        // addresses (vtables, pointer tables) that live in code but are not return addresses -- that is exactly how
+        // np397 produced sdk+0x8dd58 (ro::Bind), which the np398 experiment proved is never called.
+        if (v < 4) continue;
+        uint32_t prev = *(volatile uint32_t *)(v - 4);
+        int is_bl = (prev & 0xFC000000u) == 0x94000000u;          // bl  #imm26
+        int is_blr = (prev & 0xFFFFFC1Fu) == 0xD63F0000u;         // blr xN
+        if (!is_bl && !is_blr) continue;
+        off("", v);
+        shown++;
+    }
+    if (!shown) fprintf(stderr, " （栈上没有任何代码地址：fp 可能已被跳板改写）");
+    fputc('\n', stderr);
+}
 // 帧指针回溯：x29 链 [fp]=上一帧 fp、[fp+8]=返回地址；只走 8 字节对齐、单调上升的帧
 // Frame pointer backtrace: x29 chain [fp]=previous frame's fp, [fp+8]=return address; only 8-byte aligned, monotonically increasing frames are walked
 void dm_backtrace(uint64_t fp) {
@@ -1182,6 +1222,7 @@ void dm_assert_hook_install(void) {
 static uint32_t dm_make_lang_code(void *out, int value) {   // LanguageCode = 8 字节定长串（"zh-Hans" / "en-US"…） | a fixed 8-byte string
     (void)value;
     if (!out) return 0xDA690400u;              // 与 SDK 对空指针的回法一致 | same as the SDK's null-pointer result
+    static int n; if (n++ < 4) LOG("语言码补丁被调用（第 %d 次）→ 写 zh-Hans，返回 0", n);
     const char *e = getenv("DM_LANG");
     char code[8] = {0};
     strncpy(code, e ? e : "zh-Hans", sizeof code - 1);
@@ -1195,6 +1236,32 @@ void dm_lang_shim_install(void) {
         uint8_t *at = g_mod[i].base + 0x192074;   // nn::settings::detail::MakeLanguageCode（sdk 导出符号表实测）
         uint32_t first; memcpy(&first, at, 4);
         dm_guest_redirect(at, (void *)dm_make_lang_code, first, "语言码补丁 MakeLanguageCode");
+        done = 1;
+        return;
+    }
+}
+
+// ---- np398：判决实验：nn::ro::detail::Bind 是不是那个断言 ----------------------------------
+// 栈扫描与 FP 链都指到 sdk+0x8dd58（nn::ro::detail::Bind），但它的反汇编里没有断言块。
+// 所以直接做判决：把它改跳成"返回 0"，看 Break 消不消失。消失 ⇒ 断言就在这条链上（再想怎么正确实现）；
+// 不消失 ⇒ 两套回溯都被同一个假象骗了，得换手段（PC 环形缓冲）。
+// ---- np398: decisive experiment: is nn::ro::detail::Bind the assertion? ----------------------
+// Both the stack scan and the FP chain point at sdk+0x8dd58 (nn::ro::detail::Bind), yet its disassembly
+// contains no assert block. So make it a decisive test: redirect it to "return 0" and see whether the Break
+// goes away. If it does, the assertion is on this path (then implement it properly); if not, both backtracers
+// were fooled by the same artefact and a PC ring buffer is needed instead.
+static uint64_t dm_ro_bind(void *mod, unsigned idx) {
+    static int n;
+    if (n++ < 8) LOG("nn::ro::detail::Bind(%p, %u) → 返回 0（判决实验）", mod, idx);
+    return 0;
+}
+void dm_ro_bind_probe_install(void) {
+    static int done;
+    if (done) return;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "sdk")) {
+        uint8_t *at = g_mod[i].base + 0x8dd58;
+        uint32_t first; memcpy(&first, at, 4);
+        dm_guest_redirect(at, (void *)dm_ro_bind, first, "判决实验 ro::Bind");
         done = 1;
         return;
     }

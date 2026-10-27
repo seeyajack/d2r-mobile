@@ -443,6 +443,10 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
             LOG("Break 消息：%s", msg);
         }
         dm_backtrace(regs[29]);
+        // np397：FP 链过 sdk 的导入跳板就断（跳板改写 x29）⇒ 再打一份栈扫描，那才是可信的调用者
+        // np397: the FP chain breaks at the sdk's import trampolines (they rewrite x29), so also print a stack
+        // scan -- that is the trustworthy caller list.
+        { void dm_backtrace_scan(uint64_t); dm_backtrace_scan(regs[29]); }
         if (regs[0] & 0x80000000ull) return 0;   // 仅通知，可继续 | notification only, can continue
         // ⚠ 退出前必须把日志冲出去：LOG 走 stderr → 管道 → 泵线程 → hilog，
         //   而 _exit() 不会等泵线程，最后几行（正好是 panic 原因）会被掐掉。
@@ -460,10 +464,17 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // through this path; hiding it behind DM_DBG means "it crashed but will not say why" -- exactly what
         // swallowed the np382 Break#1. Capped: the first 4000 messages are logged, later ones are only counted.
         { static unsigned n; if (n < 4000) { if (!n) LOG("客体调试输出（svc #0x27）开始：");
-            char m[512]; size_t len = regs[1] < 511 ? (size_t)regs[1] : 511;
+            // np399：**不能截断**。SDK 的 "User Backtrace" 后面跟着整条调用链，原来只留 511 字节 ⇒ 链被吃掉，
+            // 于是只能靠 FP 链/栈扫描猜（两者都被同一个假象骗过，np384/385/391/398 四次）。
+            // 现在整段留 4 KB，按 900 字节一段打（hilog 单行有限制）。
+            // np399: do NOT truncate. The SDK's "User Backtrace" is followed by the whole call chain, and keeping
+            // only 511 bytes ate it -- which is why the FP chain / stack scan had to be guessed from, and both were
+            // fooled by the same artefact (np384/385/391/398). Keep 4 KB and print it in 900-byte chunks.
+            static char m[4096];
+            size_t len = regs[1] < sizeof m - 1 ? (size_t)regs[1] : sizeof m - 1;
             memcpy(m, (void *)regs[0], len); m[len] = 0;
             for (size_t k = 0; k < len; k++) if (!m[k]) m[k] = ' ';
-            LOG("[guest] %s", m); }
+            for (size_t o = 0; o < len; o += 900) { char seg[901]; size_t c = len - o < 900 ? len - o : 900; memcpy(seg, m + o, c); seg[c] = 0; LOG("[guest] %s", seg); } }
           else if (n == 4000) LOG("客体调试输出已达 4000 条，后续只计数");
           n++; }
         regs[0] = 0; return 0;
