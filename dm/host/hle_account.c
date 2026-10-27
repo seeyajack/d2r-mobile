@@ -28,6 +28,23 @@ HLE_FORCE("_ZN2nn7account22TryOpenPreselectedUserEPNS0_10UserHandleE", "启动�
 HLE_FORCE("_ZN2nn7account8OpenUserEPNS0_10UserHandleERKNS0_3UidE", "打开用户；句柄内直接存 Uid", Result, h_acc_OpenUser, UserHandle *h, const Uid *uid) {
     h->v[0] = uid->v[0]; h->v[1] = uid->v[1]; h->v[2] = HANDLE_MAGIC; return RES_OK;
 }
+// np405：BotW 还导入 `ListAllUsers` / `OpenPreselectedUser` / `CloseUser`，宿主原来只接了 ListOpenUsers /
+// TryOpenPreselectedUser / OpenUser ⇒ CloseUser 走 SDK 自己的实现，它内部问 acc:u0（假句柄）⇒ 断言。
+// 真机链（np404 断言时刻栈扫描）：nn::account::CloseUser ← 游戏收尾路径。
+// np405: BotW also imports ListAllUsers / OpenPreselectedUser / CloseUser, and the host only took over
+// ListOpenUsers / TryOpenPreselectedUser / OpenUser -- so CloseUser ran the SDK's own implementation, which
+// asks the acc:u0 service (a fake handle) and asserts. Device chain (stack scan at the assertion, np404):
+// nn::account::CloseUser <- the game's shutdown path.
+HLE_FORCE("_ZN2nn7account12ListAllUsersEPiPNS0_3UidEi", "全部用户；恒为本地用户 1 个（与 ListOpenUsers 同一口径）", Result, h_acc_ListAll, int *n, Uid *out, int max) {
+    return h_acc_ListOpen(n, out, max);
+}
+HLE_FORCE("_ZN2nn7account19OpenPreselectedUserEPNS0_10UserHandleE", "打开预设用户（返回 Result）；写同一个本地用户", Result, h_acc_OpenPre, UserHandle *h) {
+    h->v[0] = k_uid.v[0]; h->v[1] = k_uid.v[1]; h->v[2] = HANDLE_MAGIC; return RES_OK;
+}
+HLE_FORCE("_ZN2nn7account9CloseUserERKNS0_10UserHandleE", "关闭用户；宿主的句柄没有服务端资源，直接成功", Result, h_acc_CloseUser, const UserHandle *h) {
+    if (h->v[2] != HANDLE_MAGIC) { LOG("account::CloseUser：句柄无效"); return RES_FAIL; }
+    return RES_OK;
+}
 HLE_FORCE("_ZN2nn7account9GetUserIdEPNS0_3UidERKNS0_10UserHandleE", "从句柄取 Uid", Result, h_acc_GetUserId, Uid *out, const UserHandle *h) {
     if (h->v[2] != HANDLE_MAGIC) die("account::GetUserId 句柄不是宿主发的（%#llx）", h->v[2]);
     out->v[0] = h->v[0]; out->v[1] = h->v[1]; return RES_OK;
