@@ -38,6 +38,7 @@ HLE_FORCE("isalpha", "离线角色名放行非 ASCII：只对角色名三处校�
 // The filter in the keyboard request (from main+0x3213dd8) is a function object with a tag bit: value 1 = empty (no filtering); otherwise it is an inline / heap callable object,
 // and when inline the word right after it is the wrapped function pointer. Clear it only when what it wraps is exactly the naming filter function main+0xe09190; returns 1 = cleared
 int dm_charname_unfilter(void) {
+    if (!dm_game_is_d2r()) return 0;   // np382：请求对象的字段布局与起名过滤函数地址都是 D2R 的（main+0x3213dd8 / main+0xe09190） | both the request object layout and the naming filter address are D2R's (main+0x3213dd8 / main+0xe09190)
     uintptr_t b = main_base(); if (!b) return 0;
     uint64_t *fn = (uint64_t *)(b + 0x3213dd8);
     if (fn[0] == 1 || fn[1] != b + 0xe09190) return 0;

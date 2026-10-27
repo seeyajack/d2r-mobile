@@ -94,6 +94,7 @@ void *dm_guest_malloc(size_t n, size_t align);   // np320
 static module_t *mod_named(const char *n) { for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, n)) return &g_mod[i]; return NULL; }
 static _Atomic unsigned long long g_gheap_last[3];
 int dm_guest_heap_stat(unsigned long long *total_mb, unsigned long long *free_mb, unsigned long long *maxblk_kb) {
+    if (!dm_game_is_d2r()) return 0;   // np382：主堆对象在 main+0x32137a0，是 **D2R 的布局**；别的游戏这个地址在镜像之外，不能读 | the main heap object lives at main+0x32137a0, the D2R layout; for another game that address is outside the image and must not be read
     module_t *mm = mod_named("main"), *ms = mod_named("sdk"); if (!mm || !ms || !g_heap_cur) return 0;
     uint8_t *al = mm->base + 0x32137a0; if (!al[0]) return 0;   // 首字节 = 已初始化（sdk+0x2f9898 写） | First byte = initialized (written by sdk+0x2f9898)
     uint64_t fr = ((uint64_t (*)(void *))(ms->base + 0x2f9d78))(al), mx = ((uint64_t (*)(void *))(ms->base + 0x2f9dbc))(al);
@@ -342,7 +343,12 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
             for (int i = 0; i < 0x100; i += 4)
                 if (!memcmp(tlr + i, "SFCI", 4)) { from = tlr + i; break; }
         }
-        if (!from && msg && msg >= g_as && msg < g_as + g_reserve && !memcmp(msg, "SFCI", 4)) { from = msg; }
+        // np395：**去掉 g_as 范围检查**。np388 的转储显示"请求缓冲全是 0"，其实是范围检查没通过、
+        // 根本没读（打印的是初值 0）。请求缓冲在客体刚写过的页上，直接比较 magic 即可。
+        // np395: drop the g_as range test. The np388 dump showed "the request buffer is all zero" only because the
+        // range test failed and nothing was read (the printed zeros were the initial value). The buffer sits on a
+        // page the guest just wrote, so comparing the magic directly is enough.
+        if (!from && msg && !memcmp(msg, "SFCI", 4)) { from = msg; }
         if (!from && tlr) {
             for (int i = 0; i < 0x40; i += 8) {
                 uint8_t *q = (uint8_t *)(uintptr_t)*(volatile uint64_t *)(tlr + i);
@@ -350,6 +356,14 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
             }
         }
         if (from) {
+            // np396：命中时把**请求头**也打出来（命令号在里面）—— 应答内容要按号回，先把号看清楚。
+            // np396: on a hit also dump the REQUEST header (the command id lives there) -- the reply must be
+            // built per command id, so first see what the ids are.
+            { static int nshow; if (nshow < 6) {
+                nshow++;
+                LOG("    CMIF 请求头 %p：", (void *)from);
+                for (int i = 0; i < 48; i += 8) { uint64_t v = 0; memcpy(&v, from + i, 8); LOG("      +%#x = %#llx", i, (unsigned long long)v); }
+            } }
             uint32_t magic = 0x4F434653u;              // 'SFCO'
             uint32_t res = 0;
             memcpy(from, &magic, 4); memcpy(from + 4, &res, 4);
@@ -362,6 +376,15 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
                 // 没命中也把 TLR 头 0x40 字节打出来 —— 第二发 IPC 的请求头不在 +0x10 了，
                 // 得看它到底长什么样（也许换成了 WithUserBuffer 或者已被我们上一发覆写成 SFCO）。
                 static int bad;
+                // np388：把 regs[1] 指的缓冲前 32 字节也打出来 —— 真机这一发 x1=指针、x2=句柄，
+                // 与我们假设的"x1=缓冲、首 4 字节 'SFCI'"不一定一致；看到真实布局才知道该按哪种 CMIF 应答。
+                if (bad < 3 && regs[1]) {
+                    LOG("    请求缓冲 %p 前 48 字节：", (void *)regs[1]);
+                    for (int i = 0; i < 48; i += 8) {
+                        uint64_t v = 0; memcpy(&v, (void *)(uintptr_t)(regs[1] + i), 8);   // 客体刚写过，直接读 | the guest just wrote it, read directly
+                        LOG("      +%#x = %#llx", i, (unsigned long long)v);
+                    }
+                }
                 if (bad++ < 3) {
                     LOG("SendSyncRequest h=%#llx 未命中：x0..x3=%#llx %#llx %#llx %#llx", (unsigned long long)regs[0],
                         (unsigned long long)regs[1], (unsigned long long)regs[2], (unsigned long long)regs[3], (unsigned long long)regs[4]);
@@ -403,7 +426,15 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         uint32_t res = (regs[1] && regs[2] >= 4) ? *(uint32_t *)regs[1] : 0;
         module_t *mm = module_of((void *)regs[30]);
         static int nb;
-        LOG("Break#%d reason=%#llx Result=%#x svc 位于 %s+%#llx", ++nb, regs[0], res, mm ? mm->name : "?", orig_addr);
+        { module_t *ml = module_of((void *)regs[30]);
+          LOG("Break#%d reason=%#llx Result=%#x svc 位于 %s+%#llx，lr = %s+%#llx", ++nb, regs[0], res, mm ? mm->name : "?", orig_addr,
+              ml ? ml->name : "?", ml ? (uint64_t)regs[30] - (uint64_t)ml->base : (uint64_t)regs[30]); }
+        // np383：先把两个参数原样打出来——np382 那轮 reason=0 时 ptr/size 都是 0，说明这个重载不带载荷，
+        // 断言文本走的是 svc #0x27（见下）。留着这行，下次一眼能看出是哪种。
+        // np383: print both arguments as-is first -- in the np382 run reason=0 came with ptr/size = 0, i.e. this
+        // overload carries no payload and the assertion text goes through svc #0x27 (below).
+        LOG("Break 参数：ptr=%#llx size=%#llx（%s）", (unsigned long long)regs[1], (unsigned long long)regs[2],
+            regs[1] && regs[2] ? "带载荷" : "无载荷，断言文本应已从 svc #0x27 打出");
         // np242：panic 的载荷里带消息（nn::os::Break 的第 2/3 参），打出来才知道是哪个断言
         if (regs[1] && regs[2]) {
             char msg[257]; size_t n = regs[2] < 256 ? (size_t)regs[2] : 256;
@@ -422,7 +453,19 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
     }
     case 0x1E: regs[0] = 0; regs[1] = guest_ns() * 12 / 625; return 0;   // GetSystemTick
     case 0x27: {  // OutputDebugString(str, len)
-        if (g_flag.dbg) fprintf(stderr, "[guest] %.*s\n", (int)regs[1], (char *)regs[0]);
+        // np383：**默认就记**。NintendoSDK 的断言文本（`nn::diag::detail::AbortImpl` → 这里）只走这条路，
+        // 藏在 DM_DBG 后面等于"崩了但不说为什么"——np382 那轮 `Break#1` 就是这么被吞掉的。
+        // 有上限：前 4000 条全记，之后只计数，免得刷屏把关键行挤掉。
+        // np383: log by default. The NintendoSDK assertion text (nn::diag::detail::AbortImpl -> here) only goes
+        // through this path; hiding it behind DM_DBG means "it crashed but will not say why" -- exactly what
+        // swallowed the np382 Break#1. Capped: the first 4000 messages are logged, later ones are only counted.
+        { static unsigned n; if (n < 4000) { if (!n) LOG("客体调试输出（svc #0x27）开始：");
+            char m[512]; size_t len = regs[1] < 511 ? (size_t)regs[1] : 511;
+            memcpy(m, (void *)regs[0], len); m[len] = 0;
+            for (size_t k = 0; k < len; k++) if (!m[k]) m[k] = ' ';
+            LOG("[guest] %s", m); }
+          else if (n == 4000) LOG("客体调试输出已达 4000 条，后续只计数");
+          n++; }
         regs[0] = 0; return 0;
     }
     case 0x29: {  // GetInfo(out*, id, handle, subid) → x1 = value

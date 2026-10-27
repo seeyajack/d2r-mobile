@@ -1067,3 +1067,135 @@ void crash_install(void) {
     }
     sigaction(SIGSEGV, &sa, 0); sigaction(SIGBUS, &sa, 0); sigaction(SIGILL, &sa, 0); sigaction(SIGTRAP, &sa, 0);
 }
+
+// ---- np386：断言钩子 --------------------------------------------------------------
+// 零售 SDK 把断言文本裁空了（expr 是空串，见 sdk+0x5c77ef），`svc Break` 也不带载荷 ⇒
+// 从日志里完全看不出"哪个断言"。唯一还带着"是谁"的信息在 `nn::diag::detail::AbortImpl` 的参数里：
+//   AbortImpl(expr, file, func, line, const Result* r, const UserExceptionInfo*, const char* fmt, ...)
+// 所以把这个函数入口改成跳到宿主：先打 file/func/line/Result，再把原指令写回去、按原路径继续自杀。
+// 这样每一轮真机都能直接读到断言位置，不用再靠 fp 链猜（np384/385 就被 fp 链坑过两次）。
+// ---- np386: assertion hook -------------------------------------------------------
+// The retail SDK strips the assertion text (expr is an empty string, see sdk+0x5c77ef) and svc Break
+// carries no payload, so the log cannot say WHICH assertion fired. The only remaining "who" is in the
+// arguments of nn::diag::detail::AbortImpl(expr, file, func, line, Result*, UserExceptionInfo*, fmt, ...).
+// So its entry is redirected to the host: print file/func/line/Result, then put the original instructions
+// back and continue on the original path (which aborts by itself). From now on every device round can
+// read the assertion site directly instead of guessing from the frame-pointer chain (np384/385 were both
+// misled by that chain).
+static uint8_t *g_abort_site[4];     // 断言入口可以有多处（sdk 里至少两个：0x3442c4 与 0x443f8） | there can be several assert entries in the sdk
+static uint32_t g_abort_save[4][4];
+static int g_nabort;
+
+static int guest_readable(const void *p, size_t n) {   // 只认落在已装载模块映像里的指针 | only pointers inside a loaded module image
+    uintptr_t a = (uintptr_t)p;
+    if (!a) return 0;
+    for (int i = 0; i < g_nmod; i++) {
+        uintptr_t lo = (uintptr_t)g_mod[i].base, hi = lo + g_mod[i].size;
+        if (a >= lo && a + n <= hi) return 1;
+    }
+    return 0;
+}
+static void guest_str(const void *p, char *out, size_t cap) {   // 断言串都是 ASCII；不可读就给空 | assertion strings are ASCII; unreadable -> empty
+    out[0] = 0; if (!p || cap < 2) return;
+    for (size_t i = 0; i + 1 < cap; i++) {
+        if (!guest_readable((const char *)p + i, 1)) break;
+        char c = ((const char *)p)[i];
+        if (!c) break;
+        out[i] = (c >= 0x20 && c < 0x7f) ? c : '.';
+        out[i + 1] = 0;
+    }
+}
+
+static void dm_abort_hook(const char *expr, const char *file, const char *func, int line,
+                          const void *res, const void *exc, const char *fmt, ...) {
+    char fe[200], ff[200], fn[200], fm[200];
+    guest_str(expr, fe, sizeof fe); guest_str(file, ff, sizeof ff);
+    guest_str(func, fn, sizeof fn); guest_str(fmt, fm, sizeof fm);
+    unsigned rv = (res && guest_readable(res, 4)) ? *(const unsigned *)res : 0;
+    // 调用者地址才是"哪个断言"的真答案：断言入口是共用尾块，fp 链又不可靠（np384/385 被坑过两次）。
+    // The caller address IS the answer to "which assertion": the assert entries are shared tail blocks and the
+    // frame-pointer chain is unreliable (np384/385 were misled twice).
+    uint64_t lr = (uint64_t)(uintptr_t)__builtin_return_address(0);
+    module_t *lm = module_of((void *)lr);
+    char where[64] = "?";
+    if (lm) snprintf(where, sizeof where, "%s+%#llx", lm->name, (unsigned long long)(lr - (uint64_t)lm->base));
+    LOG("【断言】调用者 %s  %s  (%s:%d)  Result=%#x%s%s", where, fn[0] ? fn : "?", ff[0] ? ff : "?", line, rv,
+        fe[0] ? "  expr=" : "", fe);
+    if (fm[0]) LOG("        格式：%s", fm);
+    // 软断言：还原原指令后**直接返回**，让调用方继续走（断言在 SDK 里是"不该发生"的路径，
+    // 但移植期我们宁愿继续跑、把后面还有多少关卡一次看清；每一条都记了日志，不会静默）。
+    // 不调原函数的原因：0x3442c4 的参数约定我们并不知道（真机实测传进去就 SIGSEGV，addr 是 x0 里的客体地址）。
+    // Soft assert: restore the original instructions and RETURN, letting the caller continue. In the SDK an
+    // assertion is a "should never happen" path, but during a port we would rather keep running and see how many
+    // more gates are left; every one is logged, so nothing is silent. The original is not called because its
+    // calling convention is unknown (on device it segfaulted immediately, addr = the guest pointer in x0).
+    // 不还原、也不调原函数：入口一直保持改跳，这样**每一条**断言都被接住（还原只会在第一条之后失效，
+    // 第二条就按原路径自杀）。要恢复致命行为，删掉 main.c 里的 dm_assert_hook_install() 即可。
+    // Neither restore nor call the original: the entry stays redirected so EVERY assertion is caught (restoring
+    // would only work for the first one, the second would abort as before). To get the fatal behaviour back,
+    // drop the dm_assert_hook_install() call in main.c.
+}
+
+void dm_assert_hook_install(void) {
+    if (g_nabort) return;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "sdk")) {
+        // np388：钩 0x3442c4 而不是 0x442b4 —— 断言块里 `bl` 的是前者（见 sdk+0x237100 的反汇编：
+        // 断言分支末尾 `bl #0x3442c4`，参数 x0..x2 = expr/file/func 三个空串、w3 = 0、x4 = &Result）。
+        // 0x442b4 那次钩子从未被调用，说明它不是断言主路径。
+        // np388: hook 0x3442c4, not 0x442b4 -- the assert blocks `bl` the former (see the disassembly of
+        // sdk+0x237100: the assert branch ends with `bl #0x3442c4`, x0..x2 = the three empty strings,
+        // w3 = 0, x4 = &Result). The 0x442b4 hook was never called, so that is not the main assert path.
+        // 两处都钩：0x3442c4 是断言块直接 bl 的那个（np390 拿到 MakeLanguageCode 就是靠它），
+        // 0x443f8 是 nn::diag::detail::OnAssertionFailure（np391 那轮的 bt 里出现、没被接住所以仍 Break）。
+        // Both are hooked: 0x3442c4 is what the assert blocks `bl` (it gave us MakeLanguageCode in np390), and
+        // 0x443f8 is nn::diag::detail::OnAssertionFailure (seen in the np391 backtrace; unhooked, so it still broke).
+        // 只钩 0x3442c4。0x443f8（OnAssertionFailure）np392 试过：它是**重试循环里**的一环，
+        // 返回不退出 ⇒ 同一断言每 12 ms 刷一次（一场 2994 行），流程反而更早卡死。
+        // Only 0x3442c4 is hooked. np392 tried 0x443f8 (OnAssertionFailure) too: it sits inside a retry loop,
+        // so returning instead of aborting made the same assertion fire every 12 ms (2994 lines) and blocked
+        // progress earlier.
+        static const uint64_t kSite[] = {0x3442c4};
+        for (unsigned k = 0; k < sizeof kSite / sizeof *kSite && g_nabort < 4; k++) {
+            uint8_t *at = g_mod[i].base + kSite[k];
+            memcpy(g_abort_save[g_nabort], at, 16);
+            g_abort_site[g_nabort] = at;
+            char why[48]; snprintf(why, sizeof why, "断言钩子 sdk+%#llx", (unsigned long long)kSite[k]);
+            dm_guest_redirect(at, (void *)dm_abort_hook, g_abort_save[g_nabort][0], why);
+            g_nabort++;
+        }
+        return;
+    }
+    LOG("【黄】断言钩子：没有 sdk 模块，装不上");
+}
+
+// ---- np393：语言码补丁（行为补丁，不是仪器） --------------------------------------
+// 真机定谳（np390/392）：`nn::settings::detail::MakeLanguageCode(&code, value)` 内部要去查 set 服务的语言表，
+// 我们只有假句柄 ⇒ 它返回错误 Result ⇒ 上层断言（而且那个断言在重试循环里，软断言会变成风暴）。
+// 移植期只认一个语言，所以直接接管它：把宿主自己的 LanguageCode（与 nn::oe::GetDesiredLanguage 同一个值）
+// 写进 *out，返回 0（成功）。这是**行为补丁**——出画面后应改成按 profile 配语言。
+// ---- np393: language-code shim (a behaviour patch, not instrumentation) --------------
+// Settled on device (np390/392): nn::settings::detail::MakeLanguageCode(&code, value) looks the language table
+// up through the `set` service, which we only have as a fake handle, so it returns an error Result and the
+// caller asserts (and that assert sits in a retry loop, so a soft assert turns into a storm). A port needs only
+// one language, so it is taken over: write the host's own LanguageCode (the same value nn::oe::GetDesiredLanguage
+// returns) into *out and return 0. This is a BEHAVIOUR PATCH -- once a frame shows, make it profile-driven.
+static uint32_t dm_make_lang_code(void *out, int value) {   // LanguageCode = 8 字节定长串（"zh-Hans" / "en-US"…） | a fixed 8-byte string
+    (void)value;
+    if (!out) return 0xDA690400u;              // 与 SDK 对空指针的回法一致 | same as the SDK's null-pointer result
+    const char *e = getenv("DM_LANG");
+    char code[8] = {0};
+    strncpy(code, e ? e : "zh-Hans", sizeof code - 1);
+    memcpy(out, code, sizeof code);
+    return 0;
+}
+void dm_lang_shim_install(void) {
+    static int done;
+    if (done) return;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "sdk")) {
+        uint8_t *at = g_mod[i].base + 0x192074;   // nn::settings::detail::MakeLanguageCode（sdk 导出符号表实测）
+        uint32_t first; memcpy(&first, at, 4);
+        dm_guest_redirect(at, (void *)dm_make_lang_code, first, "语言码补丁 MakeLanguageCode");
+        done = 1;
+        return;
+    }
+}

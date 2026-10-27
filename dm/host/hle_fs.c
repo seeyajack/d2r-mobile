@@ -615,6 +615,19 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
     if (g_flag.fs) LOG("fs open [%.2fs] %s mode=%d → fd %d", (now_ns() - g_t0_ns) / 1e9, path, mode, fd);
     return RES_OK;
 }
+// np387：BotW 的 main 导入、而宿主原来**没接管**的四个 fs 符号（真机实测：不接管就走 SDK 自己的
+// fssrv 客户端 ⇒ 连 fsp-srv（假句柄）⇒ `svc Break` 自杀，进程退出）。
+// 前两个是启动期就调的"设置类"，后两个是存档提交 / 带 ReadOption 的读，语义与已有实现一致。
+// np387: four fs symbols BotW's main imports that the host did NOT take over (measured on device: without the
+// takeover the SDK's own fssrv client runs, connects to fsp-srv (a fake handle) and aborts via svc Break,
+// killing the process). The first two are startup-time setters; the last two are save commit / read with a
+// ReadOption, both with the same semantics as the existing implementations.
+static Result h_fs_ReadFile(size_t *out, uint64_t h, int64_t off, void *buf, size_t sz);   // 下面的 ReadOption 重载要调它（定义在本块之后） | the ReadOption overload below calls it (defined after this block)
+HLE_FORCE("_ZN2nn2fs17SetLocalAccessLogEb", "只影响日志；宿主不记 fsp 访问日志", Result, h_fs_SetAccessLog, unsigned on) { (void)on; return 0; }
+HLE_FORCE("_ZN2nn2fs29SetResultHandledByApplicationEb", "结果码由应用自己处理；宿主直接成功", Result, h_fs_SetResultHandled, unsigned on) { (void)on; return 0; }
+HLE_FORCE("_ZN2nn2fs14CommitSaveDataEPKc", "存档提交 = 已有 Commit（同一个事务式互换）", Result, h_fs_CommitSaveData, const char *name) { return h_fs_Commit(name); }
+HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvmRKNS0_10ReadOptionE", "带 ReadOption 的读：宿主忽略选项，走同一条 pread", Result, h_fs_ReadFileOpt,
+          size_t *out, uint64_t h, int64_t off, void *buf, size_t sz, const void *opt) { (void)opt; return h_fs_ReadFile(out, h, off, buf, sz); }
 HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", Result, h_fs_ReadFile, size_t *out, uint64_t h, int64_t off, void *buf, size_t sz) {
     if (!h) { *out = 0; return RES_FAIL; }   // 文件句柄就是 fd，0 是标准输入、不会是游戏打开的文件：打开失败后照用的空句柄 | A file handle is an fd; 0 is standard input and never a file the game opened: it is the null handle the game keeps using after a failed open
     size_t got = 0; uint64_t t0 = g_flag.bootprof ? now_ns() : 0;

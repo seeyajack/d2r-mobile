@@ -69,6 +69,7 @@ void dm_input_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t 
 // Test switch DM_UI_TAPS="frame:x,y[:action];..." (x / y = per-mille of the picture). Default action = one tap (via dm_ui_touch: press, lift 6 frames later); the others go through dm_ui_ptr (for probing / UI cases):
 //   k tap a tab / dialog menu item (the host presses keys to switch to it); t<frames> finger held this many frames then lifted (via dm_ui_touch); h<frames> hover; p<frames> left button held this many frames then released; r right button; l left button (pointer path); d<x2>,<y2> hold and drag to another point (done in 20 frames); g<x2>,<y2> continuous gesture (dm_ui_drag_*: typed as scroll / slider by the start-to-end direction, done in 60 frames); W tap the game world (dm_world_tap); N<value> set the quantity box value (dm_num_set); A<number> buy/sell / stat point entries (dm_actions.c); w<amount> wheel (120 per notch, negative = down); m<0|1> map back to minimap / to full screen (dm_ui_map_full); prefix s / c = holding Shift / Ctrl (VK 0x10 / 0x11)
 static void ui_taps_step(void) {
+    if (!dm_game_is_d2r()) return;   // np382：整套 DM_UI_TAPS 触点脚本点的都是 D2R 界面（dm_cursor / dm_uiscreen），别的游戏不发 | the whole DM_UI_TAPS touch script taps D2R UI (dm_cursor / dm_uiscreen); never sent for another game
     static struct { uint64_t fr; float x, y, x2, y2; int st, kind, arg, shift; } tp[128]; static int n = -1;
     if (n < 0) { n = 0; const char *e = getenv("DM_UI_TAPS"); char buf[4096]; if (e) { strlcpy(buf, e, sizeof buf); for (char *t = strtok(buf, ";"); t && n < 128; t = strtok(NULL, ";")) {
         unsigned long long f; int x, y, c = 0; if (sscanf(t, "%llu:%d,%d%n", &f, &x, &y, &c) < 3) continue;
@@ -203,6 +204,7 @@ static void step_chain(void) {             // 持 g_klock：当前步前置留�
     if (g_kcur < g_nsteps && !g_steps[g_kcur].pre[0] && !g_steps[g_kcur].seen_pre) { script_clock c = script_clock_now(); g_steps[g_kcur].seen_pre = 1; g_steps[g_kcur].seen_at = now_ns(); g_steps[g_kcur].seen_clock = c.value; g_steps[g_kcur].seen_server = c.server; }
 }
 static void keys_on_uimsg(const char *cat, const char *act, const char *arg) {
+    if (!dm_game_is_d2r()) return;   // np382：这一整段是 D2R 的按键脚本 + 光标用例（dm_cursor / dm_ui_touch），别的游戏没有这套界面 | this whole block belongs to D2R's key script and cursor cases (dm_cursor / dm_ui_touch); another game has no such UI
     char m[256]; snprintf(m, sizeof m, "%s:%s:%s", cat, act, arg);
     pthread_mutex_lock(&g_klock);
     if (g_cursor_cur < g_ncursor_tests && strstr(m, g_cursor_tests[g_cursor_cur].msg)) {
@@ -232,7 +234,7 @@ static void keys_on_uimsg(const char *cat, const char *act, const char *arg) {
     pthread_mutex_unlock(&g_klock);
 }
 static uint32_t steps_now(void) {
-    if (!g_nsteps) return 0;
+    if (!g_nsteps || !dm_game_is_d2r()) return 0;   // np382：按键脚本每一步都是 D2R 的界面动作（dm_ui_send_queue / dm_ui_touch），别的游戏一律不发 | every key-script step is a D2R UI action (dm_ui_send_queue / dm_ui_touch); never send them for another game
     uint64_t t = now_ns(); uint32_t m = 0;
     pthread_mutex_lock(&g_klock);
     if (g_kcur < g_nsteps) {
@@ -377,15 +379,16 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
     // 是 D2R 的"取玩家对象"，硬编码 D2R 地址；在 BotW 镜像里 0x45f9d0 正好是某个构造函数中段的
     // `add x29,sp,#0x10`，被当函数指针调用、x0 取自 D2R 的数据字段（本次 0）⇒ 门票① 的全部现场
     // （this=0、从中段进入、lr=dm_actions_pump+0x7c）都由这一串造成。
-    // 这些 pump 只对 D2R 有意义，换游戏必须全部不跑：默认关，要跑设 DM_D2R_PUMPS=1。
+    // 这些 pump 只对 D2R 有意义 ⇒ 按游戏身份闸住（np382 起由 dm_game_is_d2r() 统一裁决，
+    // np381 的 DM_D2R_PUMPS 环境变量已取消：换成 DM_GAME=d2r 手动放行）。
     // np380: this whole list is Diablo 2 UI/gameplay automation and must not run on BotW. Device evidence
     // (np379 probe): dm_actions_pump() calls ((...)(b + 0x45f9d0))(...) -- D2R's "get player", a hard-coded D2R
     // address; in the BotW image 0x45f9d0 is the middle of a constructor (`add x29,sp,#0x10`), so it gets
     // called as a function with x0 from a D2R data field (0 here) -- which produced every 门票① symptom
-    // (this=0, entered mid-function, lr=dm_actions_pump+0x7c). Default off; set DM_D2R_PUMPS=1 to enable.
-    static int d2r_pumps = -1;
-    if (d2r_pumps < 0) d2r_pumps = getenv("DM_D2R_PUMPS") != NULL;
-    if (d2r_pumps) {
+    // (this=0, entered mid-function, lr=dm_actions_pump+0x7c). np382 replaces the DM_D2R_PUMPS switch with
+    // dm_game_is_d2r(); use DM_GAME=d2r to force them on.
+    int d2r = dm_game_is_d2r();
+    if (d2r) {
     DM_PROF(0, "taps", ui_taps_step());
     DM_PROF(0, "ui_frontend", dm_ui_frontend_pump());
     { void dm_textinput_pump(void); DM_PROF(0, "textinput", dm_textinput_pump()); }   // 文本框补「弹键盘」那一下、数量框设值（dm_textinput.c） | the extra "bring up keyboard" press for text boxes, setting the value of quantity boxes (dm_textinput.c)
@@ -394,7 +397,7 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
     { void dm_world_pump(void); DM_PROF(0, "world", dm_world_pump()); }   // 点世界目标 = 交互（dm_world.c） | tapping a world target = interact (dm_world.c)
     DM_PROF(0, "ui_mouse", dm_ui_mouse_pump());   // 界面鼠标消息（原生点击）在取手柄处发：主线程、每帧一条 | UI mouse messages (native clicks) are sent at the controller read: main thread, one per frame
     { void dm_aim_cone_pump(void); DM_PROF(0, "aim_cone", dm_aim_cone_pump()); dm_ipf_frame(0); }   // 手指方向选目标：右摇杆归零时恢复（hle_private_aim.c） | target selection by finger direction: restored when the right stick returns to zero (hle_private_aim.c)
-    }   // np380：D2R 专属 pump 到此结束（DM_D2R_PUMPS=1 才跑）
+    }   // np382：D2R 专属 pump 到此结束（dm_game_is_d2r() 为真才跑） | the D2R-only pumps end here (they run only when dm_game_is_d2r())
     if (atomic_load(&g_stall_due) && atomic_exchange(&g_stall_due, 0)) usleep((useconds_t)g_stall_ms * 1000);   // DM_TEST_HID_STALL_MS
     uint64_t read_start_ns = g_receipt_file ? now_ns() : 0; // 覆盖整个多原子字段读取区间 | covers the whole read interval of the multi-atomic fields
     memset(s, 0, sizeof *s);
@@ -407,27 +410,37 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
     // "exclusive press": the press made on the player's behalf must look at what the game will actually receive this time,
     // not at one single channel (previously only the touch channel was checked, so a controller player pressing + to open the inventory in the first 1.5
     // seconds after joining would still turn the exclusive L into a tab switch)
+    // np382：下面三个 D2R 助手（dm_cursor.c 的独占按键 / 自动松手 / 自动按键）换个游戏就是错的语义，
+    // 不是 D2R 时按 0 处理（等价于"没有这些机制"，与 DM_D2R_PUMPS 时代的行为一致）。
+    // np382: the three D2R helpers below (dm_cursor.c exclusive press / auto release / auto buttons) mean nothing
+    // for another game, so they act as 0 when this is not D2R (equivalent to "these mechanisms are absent").
     { uint64_t dm_ui_alone_take(uint64_t);
-      uint64_t tb = ((g_in.buttons | atomic_load(&g_press_latch)) & ~dm_ui_auto_release()) | (km & ~(uint64_t)PK_MASK) | dm_ui_auto_buttons(), pb = atomic_load(&g_pad_btn) | atomic_load(&g_pad_latch);
+      uint64_t tb = ((g_in.buttons | atomic_load(&g_press_latch)) & ~(d2r ? dm_ui_auto_release() : 0)) | (km & ~(uint64_t)PK_MASK) | (d2r ? dm_ui_auto_buttons() : 0), pb = atomic_load(&g_pad_btn) | atomic_load(&g_pad_latch);
       static int t_old = -1; if (t_old < 0) t_old = getenv("DM_TEST_ALONE_NOPAD") != NULL;   // 测试对照：复刻改前的做法（裁决不看手柄键、独占时手柄键照样并进去） | Test control: reproduces the pre-change behavior (the arbitration ignores controller buttons, and controller buttons are still merged in during an exclusive press)
-      uint64_t alone = dm_ui_alone_take(t_old ? tb : tb | pb);
+      uint64_t alone = d2r ? dm_ui_alone_take(t_old ? tb : tb | pb) : 0;
       if (alone) s->buttons = t_old ? alone | atomic_load(&g_pad_btn) | atomic_exchange(&g_pad_latch, 0) : alone;   // 独占的一下（dm_cursor.c）：别的键这几帧不交，两条按下沿锁存都不清，之后照常给出 | The exclusive press (dm_cursor.c): other buttons are withheld for these few frames, neither press-edge latch is cleared, and they are delivered as usual afterwards
-      else s->buttons = ((g_in.buttons | atomic_exchange(&g_press_latch, 0)) & ~dm_ui_auto_release()) | (km & ~(uint64_t)PK_MASK) | dm_ui_auto_buttons() | atomic_load(&g_pad_btn) | atomic_exchange(&g_pad_latch, 0); }
+      else s->buttons = ((g_in.buttons | atomic_exchange(&g_press_latch, 0)) & ~(d2r ? dm_ui_auto_release() : 0)) | (km & ~(uint64_t)PK_MASK) | (d2r ? dm_ui_auto_buttons() : 0) | atomic_load(&g_pad_btn) | atomic_exchange(&g_pad_latch, 0); }
     s->lx = g_in.lx; s->ly = g_in.ly; s->rx = g_in.rx; s->ry = g_in.ry;
     // 摇杆：触屏摇杆有值就用触屏的，否则用手柄的。手柄那边只在手柄模式、且摇杆确实推出来了才给非零值（dm_gamepad.m），放在一边有点漂移的手柄到不了这里
     // Sticks: if the touch stick has a value use it, otherwise use the controller's. The controller side only gives a non-zero value in controller mode and when the
     // stick has actually been pushed out (dm_gamepad.m), so a slightly drifting controller left lying aside never reaches here
     { uint64_t ax = atomic_load(&g_pad_axes); int16_t plx = (int16_t)ax, ply = (int16_t)(ax >> 16), prx = (int16_t)(ax >> 32), pry = (int16_t)(ax >> 48);
       if (!(s->lx || s->ly) && (plx || ply)) { s->lx = plx; s->ly = ply; } if (!(s->rx || s->ry) && (prx || pry)) { s->rx = prx; s->ry = pry; } }
+    if (dm_pad_hook) dm_pad_hook(guest_ns(), &s->buttons, &s->lx, &s->ly, &s->rx, &s->ry);   // 前端替按的钩子（dm_input.h）：通用，不随游戏身份关 | hook for front-end presses (dm_input.h): generic, not gated by game identity
+    // np382：下面四个是 D2R 的手指/手柄界面逻辑（触屏布局切换、符文之语清单、副手组技能），
+    // 换游戏时一条都不能跑——它们会按 D2R 的界面状态改写按键与摇杆。
+    // np382: the four below are D2R's touch/controller UI logic (layout switch, runeword list, off-hand skill set);
+    // for another game none may run -- they rewrite buttons and sticks by D2R UI state.
+    if (d2r) {
     { int dm_padmode_input_gate(uint64_t *); if (dm_padmode_input_gate(&s->buttons)) s->lx = s->ly = s->rx = s->ry = 0; }   // 手柄 / 触屏切换事务进行中：键和摇杆都不交给游戏；触发切换时按着的键松开前也不交（dm_padmode.c） | Controller / touch switch transaction in progress: neither keys nor sticks are handed to the game; keys held when the switch was triggered are not handed over either until released (dm_padmode.c)
-    if (dm_pad_hook) dm_pad_hook(guest_ns(), &s->buttons, &s->lx, &s->ly, &s->rx, &s->ry);
     { uint64_t dm_runeword_pad_filter(uint64_t); s->buttons = dm_runeword_pad_filter(s->buttons); }   // 手柄模式符文之语清单开着时十字键 / A / B / L / R 归清单（dm_runeword.c） | While the runeword list is open in controller mode, the D-pad / A / B / L / R belong to the list (dm_runeword.c)
     { uint64_t dm_padmode_page_filter(uint64_t); s->buttons = dm_padmode_page_filter(s->buttons); }   // 手柄模式我们自己的页（自定义页等）开着时，页声明的键归页（dm_padmode.c） | While one of our own pages (the Custom page etc.) is open in controller mode, the buttons the page declares belong to the page (dm_padmode.c)
     { uint64_t dm_swapskill_filter(uint64_t); s->buttons = dm_swapskill_filter(s->buttons); }   // 副手组技能：换武器好之前压住那个键（dm_actions.c） | off-hand set skill: hold that key back until the weapon swap is done (dm_actions.c)
+    }
     { static int trx, tryy, tdelay, held, tset = -1; if (tset < 0) { const char *e = getenv("DM_TEST_RSTICK"); tset = e && sscanf(e, "%d,%d,%d", &trx, &tryy, &tdelay) >= 2; }   // 测试开关 DM_TEST_RSTICK=rx,ry[,延迟次数]：按键脚本按着 A / B / X / Y 时把右摇杆置成这个值（模拟「按住技能钮拖动」，游戏自己也看得到右摇杆）；延迟 = 按下后第几次取手柄才开始给（真手指是先按下、再拖出方向） | test switch DM_TEST_RSTICK=rx,ry[,delay count]: while the key script holds A / B / X / Y, set the right stick to this value (simulates "hold a skill button and drag", the game itself also sees the right stick); delay = on which controller read after the press it starts being given (a real finger presses first, then drags out a direction)
       if (tset > 0) { held = (s->buttons & 0xf) ? held + 1 : 0; if (held > tdelay) { s->rx = trx; s->ry = tryy; } } }
     if (s->lx || s->ly || (km & PK_MASK & ~(uint64_t)PK_TOUCH)) atomic_store(&g_stick_ns, now_ns());   // 玩家的摇杆（前端 / 脚本伪键）最近一次非零；光标改写的摇杆不算 | the last time the player's stick (front end / script pseudo-keys) was non-zero; a stick rewritten by the cursor does not count
-    dm_cursor_apply(&s->buttons, &s->lx, &s->ly);   // 指针目标：本次采样内按原版光标位置改写左摇杆 / A（见 dm_cursor.h） | pointer target: within this sample, rewrite the left stick / A according to the original game's cursor position (see dm_cursor.h)
+    if (d2r) dm_cursor_apply(&s->buttons, &s->lx, &s->ly);   // 指针目标：本次采样内按原版光标位置改写左摇杆 / A（见 dm_cursor.h）；D2R 专属（np382 按身份闸） | pointer target: within this sample, rewrite the left stick / A according to the original game's cursor position (see dm_cursor.h); D2R-only, gated by game identity (np382)
     { static uint64_t prev; if ((s->buttons & DM_BTN_L) && !(prev & DM_BTN_L)) { int n = atomic_fetch_add(&g_dm_l_presses, 1) + 1; if (n <= 3) LOG("取手柄处：「显示物品」键（L）交给了游戏，本进程第 %d 次", n); } prev = s->buttons; }   // 「显示物品」键（L）交给游戏的按下次数（首领掉落读数用，dm_bossrush.c） | number of presses of the 「显示物品」(Show Items) key (L) delivered to the game (used by the boss drop readout, dm_bossrush.c)
     if (km & PK_LSL) s->lx = -32767; if (km & PK_LSR) s->lx = 32767;   // 脚本摇杆伪键：推满（Horizon 摇杆 ±32767，上为正） | script stick pseudo-keys: push to full (Horizon stick ±32767, up is positive)
     if (km & PK_LSU) s->ly = 32767;  if (km & PK_LSD) s->ly = -32767;
@@ -474,6 +487,27 @@ HLE_FORCE("_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiR
           "震动设备；宿主 0 个", int, h_hid_GetVibHandles, void *out, int max, const uint32_t *id, uint32_t style) { (void)out; (void)max; (void)id; (void)style; return 0; }
 HLE_FORCE("_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", "震动；宿主不支持", void, h_hid_InitVib, const void *h) { (void)h; }
 HLE_FORCE("_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE", "震动；宿主不支持", void, h_hid_SendVib, const void *h, const void *v) { (void)h; (void)v; }
+
+// 六轴（体感）：**宿主没有传感器，一律 0 个句柄**——照震动的做法。
+// 为什么必须接管（np384 真机定谳）：hid 服务在宿主里只是**假句柄**（sm::GetServiceHandle 发 0x5001），
+// 于是 SDK 自己的 `nn::hid::IsSixAxisSensorAtRest` 里那句 detail 调用必然返回错误 Result，紧跟着
+// `nn::diag::OnAssertionFailure` 断言自杀（`svc Break`），进程退出 —— np383 的 `Break#1` 就是它。
+// 断言原文在零售 SDK 里被裁空，是从 `sdk+0x237100` 的断言块反读出来的（x5/x6 指向 "Failed: %s…" 与
+// "detail::IsSixAxisSensorAtRest(&isAtRest, handle)"）。main 只导入这四个符号，堵住就等于切掉整棵子树。
+// Six-axis (motion): the host has no sensor, so always 0 handles -- same trick as vibration.
+// Why it must be taken over (np384, settled on device): the hid service is only a FAKE handle here
+// (sm::GetServiceHandle hands out 0x5001), so the detail call inside the SDK's own
+// nn::hid::IsSixAxisSensorAtRest always returns an error Result, and nn::diag::OnAssertionFailure kills
+// the process with svc Break -- that was np383's Break#1. The assertion text is stripped in the retail SDK;
+// it was recovered by reading the assert block at sdk+0x237100 (x5/x6 point at "Failed: %s..." and
+// "detail::IsSixAxisSensorAtRest(&isAtRest, handle)"). main imports only these four symbols, so taking
+// them over cuts the whole subtree.
+HLE_FORCE("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE",
+          "体感：宿主 0 个句柄（同震动），游戏随后不会 Start / GetStates", int, h_hid_SixHandles,
+          void *out, int max, const uint32_t *id, uint32_t style) { (void)out; (void)max; (void)id; (void)style; return 0; }
+HLE_FORCE("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", "体感：空转（0 个句柄时本来也不会调）", void, h_hid_SixStart, const void *h) { (void)h; }
+HLE_FORCE("_ZN2nn3hid25SetGyroscopeZeroDriftModeERKNS0_19SixAxisSensorHandleERKNS0_22GyroscopeZeroDriftModeE",
+          "体感：空转，回 0（成功）", int, h_hid_SixZeroDrift, const void *h, const void *m) { (void)h; (void)m; return 0; }
 
 // 触屏：nn::hid::TouchScreenState<16> = { int64 sampling; int32 count; int32 _r; TouchState touches[16]（各 0x28） }
 // 内容由 hle_touch.c 按前端推来的触点填（布局与短按锁存见该文件）；游戏只看第 0 份，返回写入的状态份数 1

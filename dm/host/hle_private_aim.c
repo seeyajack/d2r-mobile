@@ -53,6 +53,7 @@ static void cone_restore(void) {
 // 取手柄处每帧调（hle_hid.c）：右摇杆归零了就把动过的两处恢复（拖完之后没有再施放时，不能把指定目标留在槽里）
 // Called every frame at the controller read (hle_hid.c): once the right stick returns to zero, restore the two places that were changed (when there is no further cast after the drag ends, the designated target must not be left in the slot)
 void dm_aim_cone_pump(void) {
+    if (!dm_game_is_d2r()) return;   // np382：整个瞄准锥是 D2R 的单位表 / 类别号（main+0x2d603a0 起） | the whole aim cone is D2R's unit table and class ids (from main+0x2d603a0)
     if (!atomic_load(&g_cone_set)) return; int32_t rx = 0, ry = 0; dm_input_sampled_right(&rx, &ry);
     if (!(getenv("DM_TEST_AIM") || getenv("DM_TEST_AIM_AT")) && !rx && !ry) { cone_restore(); return; }
 }
@@ -92,6 +93,7 @@ static int cone_test_dir(const module_t *m, uint64_t pl, const float pos[2], int
     *rx = (int32_t)(32767.0f * cosf(a)); *ry = (int32_t)(32767.0f * sinf(a)); return 1;
 }
 void svc_private_skill_aim(uint64_t *regs) {
+    if (!dm_game_is_d2r()) return;   // np382：先跳 main+0x2b4ef8（D2R 的原版瞄准）再改，别的游戏不能进 | it first jumps to main+0x2b4ef8 (D2R's original aiming) and then rewrites; another game must not enter
     const module_t *m=NULL;for(int i=0;i<g_nmod;i++)if(!strcmp(g_mod[i].name,"main"))m=&g_mod[i];
     if(!m)die("skill-aim缺main");
     typedef void (*Original)(uint64_t,uint64_t,float *,float *);

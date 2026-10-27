@@ -56,6 +56,21 @@ extern int g_nmod;
 extern pthread_key_t g_key18, g_keytls, g_keytlr, g_keygate;
 extern pthread_key_t g_keyres[2], g_keyaspect, g_keyaspectui;
 
+// 游戏身份（dm_game.c，np382）：D2R 专属模块的每个宿主侧入口，第一行都要问过它。
+// 判据 = DM_GAME 环境变量 → 编译期 profile（DM_GAME_ID）→ 镜像装不装得下 D2R 的地址布局；都不成立按「不是 D2R」处理。
+// Game identity (dm_game.c, np382): every host-side entry into a D2R-only module asks this first.
+// Criteria = DM_GAME env -> compile-time profile (DM_GAME_ID) -> whether the image can hold the D2R address
+// layout at all; when none applies it is treated as "not D2R". 结果缓存，可随便调（每帧调也没关系）。
+int dm_game_is_d2r(void);
+// 客体改跳（loader.c）：把客体某个函数入口改成跳到宿主函数（16 字节尾跳，跨 ±128MB 也行）
+// Redirect a guest function entry to a host function (16-byte tail jump, works beyond +-128MB)
+void dm_guest_redirect(uint8_t *at, void *fn, uint32_t expect0, const char *why);
+// 断言钩子（crash.c）：把 sdk 的 nn::diag::detail::AbortImpl 改跳到宿主，打出 file/func/line
+// Assertion hook (crash.c): redirect sdk's nn::diag::detail::AbortImpl to the host and print file/func/line
+void dm_assert_hook_install(void);
+// 语言码补丁（crash.c）：把 sdk 的 nn::settings::detail::MakeLanguageCode 改跳成宿主版（不经 set 服务）
+// Language-code shim (crash.c): redirect sdk's nn::settings::detail::MakeLanguageCode to the host (no `set` service)
+void dm_lang_shim_install(void);
 void load_modules(const char *dir, const char **names, int n);
 void run_module_inits(void);
 void *module_sym(module_t *m, const char *name);

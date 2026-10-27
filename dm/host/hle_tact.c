@@ -270,6 +270,12 @@ __attribute__((weak)) int dm_touch_game_hide_own_glyph(uint64_t widget) { (void)
 // svc_dispatch in hle_svc.c calls here for 0x80 and up; 0x85 preserves x0.
 
 uint64_t svc_host_call(int num, uint64_t *regs) {
+    // np382：这两个 svc 是**改写器为 D2R 插的**宿主调用号（技能瞄准 / 技能格图标），实现里直接跳 D2R 硬编码地址；
+    // 别的游戏即便产物里恰好有同一个号，也一律不接管（返回 0 = 没处理，交回原路径）。
+    // np382: these two svc numbers are host calls the rewriter inserts FOR D2R (skill aim / skill slot icons) and their
+    // implementations jump to hard-coded D2R addresses. For any other game they are never taken over, even if the
+    // build output happens to carry the same number (return 0 = not handled, back to the original path).
+    if (!dm_game_is_d2r()) return 0;
     switch (num) {
     case SVC_HOST_PRIVATE_SKILL_AIM: { void svc_private_skill_aim(uint64_t *); svc_private_skill_aim(regs); return 1; }
     case SVC_HOST_PRIVATE_SKILL_RENDER: {

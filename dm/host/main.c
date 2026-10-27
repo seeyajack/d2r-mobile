@@ -106,7 +106,7 @@ static void guest_main(void) {
     ((fnp)req("_ZN2nn2os11SetHostArgvEPPc"))(g_argv);
     game_seed_maybe(); save_throttle_patch();
     { void dm_guest_spawn_selftest(void); dm_guest_spawn_selftest(); }   // DM_GUEST_SPAWN_TEST 宿主客体线程自检（hle_guestthread.c） | DM_GUEST_SPAWN_TEST self-test of host-created guest threads (hle_guestthread.c)
-    { void dm_padmode_boot(void); dm_padmode_boot(); }   // 触屏覆盖层在：布局前缀改指触屏版（dm_padmode.c），要在游戏建面板之前 | Touch overlay present: repoint the layout prefixes to the touch version (dm_padmode.c); must happen before the game builds its panels
+    if (dm_game_is_d2r()) { void dm_padmode_boot(void); dm_padmode_boot(); }   // 触屏覆盖层在：布局前缀改指触屏版（dm_padmode.c），要在游戏建面板之前；D2R 专属（np382 按身份闸） | Touch overlay present: repoint the layout prefixes to the touch version (dm_padmode.c); must happen before the game builds its panels; D2R-only, gated by game identity (np382)
     // np366：**守卫记录槽所在页改成可写**。np364 的桩要 `stp x0,x30,[槽]`，但洞在 RX 段里
     // （真机实测桩里的 stp 直接 SIGSEGV，addr 正是槽地址 main+0x2405a70）。
     // np365 挂在 dm_pin_and_flush() 上，实测那个函数**根本没被调用**（np316 的日志一条都没有），
@@ -157,6 +157,16 @@ static void guest_main(void) {
     // wrong for fetch" (np315-318), while runtime patching does take effect (np297). This calls the installer
     // that had never been wired up; on a hit, crash.c's null_guard_trap() prints the caller chain.
     { void guest_null_tolerant_ctor(void); guest_null_tolerant_ctor(); }
+    // np386：断言钩子。零售 SDK 的断言文本被裁空、svc Break 不带载荷，只能把 AbortImpl 改跳到宿主，
+    // 才能知道是哪个断言（file/func/line）。装完由下面那次 guest_flush_icache 一起生效。
+    // np386: assertion hook. The retail SDK's assertion text is stripped and svc Break carries no payload, so
+    // AbortImpl is redirected to the host to learn which assertion fired (file/func/line). The guest_flush_icache
+    // call below makes it take effect on this thread.
+    // dm_assert_hook_install();   // np394 A/B：临时摘掉，验证「软断言」是否自己造成了 Break | np394 A/B: temporarily off, to check whether the soft assert itself causes the Break
+    // np393：语言码补丁。`nn::settings::detail::MakeLanguageCode` 要经 set 服务查语言表，宿主只有假句柄 ⇒ 断言。
+    // np393: language-code shim. MakeLanguageCode queries the language table through the `set` service and the
+    // host only has a fake handle, which ends in an assertion.
+    dm_lang_shim_install();
     // np376：**装完补丁立刻在"将要执行客体的这个线程"上清 icache**。
     // 为什么必须有这一步：aarch64 的 `ic ivau` 只影响本核；`guest_flush_icache()` 原来只在
     // worker 线程（thread_main）里被调，**主线程从不经过那里**——而崩溃正发生在主线程（h=0x1001）。

@@ -323,9 +323,18 @@ uint32_t dm_guest_work_qos(unsigned *count) {
 
 // ---------- 同步对象 ----------
 // ---------- Synchronization objects ----------
+// 假服务句柄：`sm::GetServiceHandle` 在宿主里没有服务端，只发一个 0x50xx 的号码（见 hle_svc.c）。
+// 它们**不在句柄表里**，但客体确实会拿它去等（例：np384 真机 `nn::os::TryWaitSystemEvent` 等 fs 会话）。
+// 语义按"空闲对象"处理：**合法但永不触发** —— 等它是超时，不是坏句柄（坏句柄会让 SDK 断言自杀）。
+// Fake service handles: sm::GetServiceHandle has no server side in the host and only hands out a 0x50xx
+// number (see hle_svc.c). They are NOT in the handle table, yet the guest really waits on them (np384 on
+// device: nn::os::TryWaitSystemEvent waiting on the fs session). Treat them as "idle objects": valid but
+// never signaled -- waiting on one is a timeout, not a bad handle (a bad handle makes the SDK assert).
+static int fake_service_handle(uint32_t h) { return h >= 0x5000 && h <= 0x50ff; }
 static int sig_obj(uint32_t h, int *bad) {    // 1=已触发（持 G） | 1 = signaled (holding G)
     unsigned i = h - 0x1000;
     if (h == H_CUR_THREAD) return 0;
+    if (fake_service_handle(h)) return 0;
     if (i == 0 || i >= MAX_H) { *bad = 1; return 0; }
     switch (g_h[i].type) {
     case O_THREAD: return ((thr_t *)g_h[i].obj)->exited;
@@ -730,6 +739,14 @@ int svc_thread(int num, uint64_t *regs) {
     }
     case 0x18: {  // WaitSynchronization(→w1 下标; x1 句柄数组, w2 个数, x3 超时) | WaitSynchronization(→w1 index; x1 handle array, w2 count, x3 timeout)
         thr_t *t = cur(); const uint32_t *hs = (const uint32_t *)regs[1]; int n = (int)regs[2]; int64_t ns = (int64_t)regs[3];
+        { static int nc; if (nc++ < 6) LOG("WaitSynchronization 调用：n=%d 超时=%lld 首句柄=%#x", n, (long long)ns, n > 0 ? hs[0] : 0); }
+        // 只在等假服务句柄时：它们永远不会有服务端来触发，**无限等就是死锁** ⇒ 上限 100 ms，之后回超时。
+        // 有真句柄混在里面时不动（那种等待是靠真事件触发的）。
+        // Only when every handle is a fake service handle: nothing will ever signal them, so an infinite wait
+        // would deadlock -- cap it at 100 ms and then report a timeout. Untouched when a real handle is mixed in.
+        { int all_fake = n > 0; for (int i = 0; i < n; i++) if (!fake_service_handle(hs[i])) { all_fake = 0; break; }
+          if (all_fake) { static int logged; if (!logged++) LOG("WaitSynchronization：等的是假服务句柄 %#x（无服务端）→ 最长 100 ms 后回超时", hs[0]);
+                          if (ns < 0 || ns > 100000000ll) ns = 100000000ll; } }
         int64_t deadline = ns > 0 ? (dm_detclock_enabled() ? (int64_t)guest_ns() : now_mono_ns()) + ns : 0;
         pthread_mutex_lock(&G);
         int64_t r; int idx = -1;
@@ -737,7 +754,10 @@ int svc_thread(int num, uint64_t *regs) {
             if (t->cancel) { t->cancel = 0; r = R_CANCELLED; break; }
             int bad = 0;
             for (int i = 0; i < n && idx < 0; i++) if (sig_obj(hs[i], &bad)) idx = i;
-            if (bad) { r = R_BAD_HANDLE; break; }
+            if (bad) {   // np385：坏句柄是 SDK 断言自杀的常见根（TryWaitSystemEvent 等）；把号码打出来才查得下去
+                         static int nbad; if (nbad++ < 8) { LOG("WaitSynchronization 坏句柄：n=%d 超时=%lld 句柄=", n, (long long)ns);
+                             for (int i = 0; i < n && i < 4; i++) LOG("    [%d] %#x", i, hs[i]); }
+                         r = R_BAD_HANDLE; break; }
             if (idx >= 0) { r = 0; break; }
             int64_t left = ns < 0 ? -1 : ns == 0 ? 0 : deadline - (dm_detclock_enabled() ? (int64_t)guest_ns() : now_mono_ns());
             if (ns > 0 && left <= 0) { r = R_TIMEOUT; break; }

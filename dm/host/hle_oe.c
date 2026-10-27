@@ -85,6 +85,19 @@ HLE_FORCE("_ZN2nn2oe17DisableScreenShotEv", "截图开关；宿主无系统截�
 
 // OperationMode：0 Handheld、1 Console；PerformanceMode：0 Normal、1 Boost（与运行模式一一对应）
 // OperationMode: 0 Handheld, 1 Console; PerformanceMode: 0 Normal, 1 Boost (one-to-one with the operation mode)
+// np391：BotW 启动就调 `nn::oe::Initialize`（已在 hle_sdkinit.c 接管成空转），但它下游还有几条没接的入口 ⇒ 去连
+// `set`（系统设置）服务 ⇒ 假句柄 ⇒ `nn::settings::detail::MakeLanguageCode(&code, value)` 断言自杀。
+// 真机实证：断言钩子读出的格式串就是 `detail::MakeLanguageCode(&code, value)`（np390）。
+// 这一族全部接管成"宿主自己说了算"：初始化空转、音量平衡给 1.0/1.0、其余开关忽略。
+// np391: BotW calls nn::oe::Initialize at startup and the host did NOT take it over, so the SDK's own
+// implementation ran, connected to the `set` (system settings) service, got a fake handle and aborted in
+// nn::settings::detail::MakeLanguageCode(&code, value) -- the format string the assertion hook recovered on
+// device (np390). This whole family is taken over so the host decides: init is a no-op, volume balance is
+// 1.0/1.0, and the remaining switches are ignored.
+HLE_FORCE("_ZN2nn2oe17FinishStartupLogoEv", "启动 logo 已过：宿主空转", void, h_oe_FinishLogo, void) {}
+HLE_FORCE("_ZN2nn2oe24GetExpectedVolumeBalanceEPfS1_", "音量平衡：给 1.0 / 1.0（满），游戏只用来调混音", void, h_oe_GetVolBal, float *a, float *b) { if (a) *a = 1.0f; if (b) *b = 1.0f; }
+HLE_FORCE("_ZN2nn2oe24SetExpectedVolumeBalanceEff", "音量平衡：宿主不落盘，忽略", void, h_oe_SetVolBal, float a, float b) { (void)a; (void)b; }
+HLE_FORCE("_ZN2nn2oe38SetUserInactivityDetectionTimeExtendedEb", "闲置检测延长：宿主不检测闲置，忽略", void, h_oe_SetInactivity, unsigned on) { (void)on; }
 HLE_FORCE("_ZN2nn2oe16GetOperationModeEv", "运行模式查询；按 DM_OPMODE 给固定值", int, h_oe_GetOpMode, void) { int u = g_ui_opmode; if (atomic_exchange(&g_ui_armed, 0)) atomic_fetch_add(&g_ui_reads, 1); return u >= 0 ? u : opmode(); }
 HLE_FORCE("_ZN2nn2oe18GetPerformanceModeEv", "性能模式查询；与运行模式一致", int, h_oe_GetPerfMode, void) { return opmode(); }
 HLE_FORCE("_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", "设 CPU/GPU 频率档；宿主不调频", void, h_oe_SetPerfCfg, int mode, int cfg) {
@@ -313,6 +326,12 @@ static void scale3d_tick(void) {
     if (s3g_on()) { float g = atomic_load(&g_s3g_scale); dyn = g > 0 && g < want_cfg ? g : want_cfg; }   // GPU 时间控制器（DM_3D_SCALE_GPU=1，鸿蒙缺省开）覆盖帧间隔档 | GPU-time controller (DM_3D_SCALE_GPU=1, on by default on HarmonyOS) overrides the frame-interval level
     float want = dm_nvn_ruler_truth() ? 1.0f : dyn;
     if (want == cur || !main || dm_nvn_frame_count() < 30) return;
+    // np382：下面读的 main+0x31e0848（渲染器对象）是 **D2R 的布局**；BotW 的 main 映像只有 0x241ca70，
+    // 这个地址在镜像之外。动态 3D 比例要按"这款游戏的渲染器在哪"来定位，profile 化之前别的游戏一律不动。
+    // np382: main+0x31e0848 (the renderer object) is the D2R layout; BotW's main image is only 0x241ca70, so this
+    // address lies outside it. Dynamic 3D scale needs a per-game renderer locator; until that is profile-driven,
+    // other games are left alone.
+    if (!dm_game_is_d2r()) return;
     uintptr_t renderer = *(uintptr_t *)(main->base + 0x31e0848); if (!renderer) return;
     uint32_t ow = *(uint32_t *)(renderer + 0xee88), oh = *(uint32_t *)(renderer + 0xee8c); if (!ow || !oh) return;
     { extern void mtl_rt_force_full(int) __attribute__((weak)); if (mtl_rt_force_full) mtl_rt_force_full(4); }   // 运行时外推：换比例前后几帧一律全画（主通道换尺寸那帧不能外推） | runtime extrapolation: the few frames before and after a scale change are all drawn in full (the frame where the main pass changes size cannot be extrapolated)
@@ -336,9 +355,9 @@ HLE_FORCE("_ZN2nn2oe25TryPopNotificationMessageEPj", "系统通知队列；前�
     // When they are read: each time the handler is entered, once after the first notification is fetched (0xe10d5c / 0xe10d60), and notifications fetched later in the loop still use the values from that read. So every time one is taken, the value due at this moment is written into the current thread's slot --
     // writing only when 31 is taken is not enough: when 31 is queued behind another notification (e.g. focus 15), the parameter bits have already been read after fetching 15 (iOS app: the front end did not switch to 16:9, in the Mac host run 31 happened to be queued first).
     if (ok) for (int i = 0; i < 2; i++) if (g_keyres[i]) pthread_setspecific(g_keyres[i], (void *)dm_game_res(i));
-    if (ok && *msg == MSG_PERFMODE) dm_uiscreen_res_reread();
+    if (ok && dm_game_is_d2r() && *msg == MSG_PERFMODE) dm_uiscreen_res_reread();   // np382：界面重读是 D2R 自己的页（dm_uiscreen.c） | np382: the UI re-read belongs to D2R's own pages (dm_uiscreen.c)
     if (ok) LOG("oe 通知被游戏取走：%u", *msg);   // 状态变化很少，逐条打不刷屏 | state changes are rare, printing each one does not flood the log
-    if (ok && (*msg == MSG_OPMODE || *msg == MSG_PERFMODE)) dm_ui_gen_bump(*msg == MSG_OPMODE ? DM_UIGEN_OPMODE : DM_UIGEN_PERFMODE);   // 界面代号（dm_cursor.h） | UI generation (dm_cursor.h)
+    if (ok && (*msg == MSG_OPMODE || *msg == MSG_PERFMODE) && dm_game_is_d2r()) dm_ui_gen_bump(*msg == MSG_OPMODE ? DM_UIGEN_OPMODE : DM_UIGEN_PERFMODE);   // 界面代号（dm_cursor.h，D2R 专属；np382 按身份闸） | UI generation (dm_cursor.h, D2R-only; gated by game identity in np382)
     return ok;
 }
 // bool 参数：Switch 调用方不扩展，声明成 unsigned 只看低 8 位

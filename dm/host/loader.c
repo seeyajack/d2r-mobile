@@ -555,6 +555,10 @@ static void guest_redirect(uint8_t *at, void *fn, uint32_t expect0, const char *
     else LOG("改跳 %s → %p", why, fn);
 }
 
+// np386：把上面这个改跳能力开放给宿主其它文件（断言钩子要用）。
+// np386: expose the redirect above to other host files (the assertion hook needs it).
+void dm_guest_redirect(uint8_t *at, void *fn, uint32_t expect0, const char *why) { guest_redirect(at, fn, expect0, why); }
+
 // np296：AArch64 `b` 指令编码（同一个模块内，±128MB 射程）。
 // np379：adrp 编码（rd <- page(addr)，以 insn_at 为基准）
 static uint32_t arm64_adrp_rt(int rd, uint64_t addr, uint64_t insn_at) {

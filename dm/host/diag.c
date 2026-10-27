@@ -448,8 +448,12 @@ static void event_msg_obs(const uint64_t *regs) {
     static int n; if (n++ < 8) LOG("秘境：拦下原版「游戏难度设为 N」提示（事件子类型 0x17）"); pkt[1] = 0xff;
 }
 static void setlang_obs(const uint64_t *regs) {
+    // np382：界面代号 / 触屏布局串表都是 D2R 产物（dm_cursor / dm_padmode），别的游戏不碰
+    // np382: the UI generation and the touch-layout string table belong to D2R (dm_cursor / dm_padmode); skip for other games
+    if (dm_game_is_d2r()) {
     dm_ui_gen_bump(DM_UIGEN_LANG);   // 界面代号（dm_cursor.h）：切语言会重建整套界面 | UI generation (dm_cursor.h): switching language rebuilds the entire UI
     { void dm_padmode_lang_reset(void); dm_padmode_lang_reset(); }   // 串表清空之前：我们换进串表的指针先写回原文、记的节点清空（dm_padmode.c） | Before the string table is cleared: write the original text back over the pointers we swapped into the string table and clear the recorded nodes (dm_padmode.c)
+    }
     module_t *m = NULL; for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) m = &g_mod[i];
     uint32_t idx = 0; const char *nm = NULL; vm_size_t got = 0;   // 安全读（不用 tk_rd：它给拍状态采集计数） | Safe read (not tk_rd: that one counts toward tick state collection)
     if (regs[1] && !vm_read_overwrite(mach_task_self(), regs[1], 4, (vm_address_t)&idx, &got) && got == 4 && idx < 13) {
@@ -460,7 +464,7 @@ static void setlang_obs(const uint64_t *regs) {
 void probe_install(void) {
     if (gate_obs_present(OBS_SETLANG)) gate_obs_set(OBS_SETLANG, setlang_obs);
     if (gate_obs_present(OBS_EVENT_MSG)) gate_obs_set(OBS_EVENT_MSG, event_msg_obs);
-    { void dm_ui_tooltip_obs(const uint64_t *regs); if (gate_obs_present(OBS_TOOLTIP)) gate_obs_set(OBS_TOOLTIP, dm_ui_tooltip_obs); }   // 说明框停靠（dm_cursor.c） | tooltip docking (dm_cursor.c)
+    if (dm_game_is_d2r()) { void dm_ui_tooltip_obs(const uint64_t *regs); if (gate_obs_present(OBS_TOOLTIP)) gate_obs_set(OBS_TOOLTIP, dm_ui_tooltip_obs); }   // 说明框停靠（dm_cursor.c，D2R 专属；np382 按身份挂） | tooltip docking (dm_cursor.c, D2R-only; np382 attaches by game identity)
     const char *ui = getenv("DM_UIMSG");
     if (ui && strcmp(ui, "1") && !(g_uifp = fopen(ui, "w"))) die("DM_UIMSG 打不开 %s", ui);
     g_ui_print = ui != NULL;
@@ -621,6 +625,7 @@ static module_t *main_mod(void) { for (int i = 0; i < g_nmod; i++) if (!strcmp(g
 static void *players_obj(module_t *main) { return ((void *(*)(void))(main->base + 0x3102c0))(); }   // 原版 /players 处理函数里同一调用（无参，返回单例） | The same call as in the original game's /players handler (no arguments, returns a singleton)
 
 static void players_apply(void) {          // 有新请求就照原版 /players：模式值 ∈ {0,5,7} 才允许 → main+0x1199c50(对象, N) | On a new request do as the original game's /players does: only allowed when the mode value ∈ {0,5,7} → main+0x1199c50(object, N)
+    if (!dm_game_is_d2r()) return;         // np382：下面全是 D2R 的硬编码地址（0x3102c0 / 0x2d20b8c / 0x1199c50），别的游戏一次都不能进 | everything below is hard-coded D2R addresses; another game must never get here
     int want = dm_hud_requested_players();
     if (!want || want == g_players_applied) return;
     g_players_applied = want;
@@ -793,17 +798,23 @@ static void cube_diag_tick(uint64_t G, uint64_t player) {   // 合成请求后 2
 // The local player unit id as recorded by the client itself (main+0x2d20e4c local player slot → main+0x2d60380[slot], same reading as the original 0x45f9d0); 0xffffffff if unreadable (not in a game yet).
 // All three "who is the controlled player" sites go by it: the per-tick feature entry hud_tick, the state dump state_dump, the position check poschk. A corpse left in the player table after the character dies is also a player-type unit with "mode ≠ 0 and coordinates",
 // so counting units present reports "living player + own corpse" as non-unique. That is a stale measuring criterion, not two players on the field
-static uint32_t local_player_id(void) { uint32_t slot = 8, lid = 0xffffffffu; module_t *mm = main_mod(); if (mm && tk_rd((uint64_t)mm->base + 0x2d20e4c, &slot, 4) && slot < 8) tk_rd((uint64_t)mm->base + 0x2d60380 + 4 * slot, &lid, 4); return lid; }
+static uint32_t local_player_id(void) {
+    // np382：本地玩家槽号在 main+0x2d20e4c / main+0x2d60380（D2R 布局，超出 BotW 映像）⇒ 别的游戏答「没有」
+    // np382: the local player slot lives at main+0x2d20e4c / main+0x2d60380 (D2R layout, outside the BotW image), so another game answers "none"
+    if (!dm_game_is_d2r()) return 0xffffffffu;
+    uint32_t slot = 8, lid = 0xffffffffu; module_t *mm = main_mod(); if (mm && tk_rd((uint64_t)mm->base + 0x2d20e4c, &slot, 4) && slot < 8) tk_rd((uint64_t)mm->base + 0x2d60380 + 4 * slot, &lid, 4); return lid; }
 static void hud_tick(uint64_t G) {
     // np381：**整段 D2R 按帧自动化在换游戏时必须不跑**。真机实证（np379/np380）：这一串里
     // `dm_actions_pump` 用硬编码 D2R 地址 `b+0x45f9d0` 当函数指针调用，在 BotW 镜像里正好落在
     // 某个构造函数中段 ⇒ 门票① 的全部现场；关掉它之后下一个崩点又来自 `dm_bossrush_tick`。
-    // 这些模块只对 Diablo 2 有意义，默认全关；要跑设 DM_D2R_PUMPS=1。
+    // 这些模块只对 Diablo 2 有意义 ⇒ 按游戏身份闸住（np382 起由 dm_game_is_d2r() 统一裁决，
+    // np381 的 DM_D2R_PUMPS 环境变量已取消：换成 DM_GAME=d2r 手动放行）。
     // np381: the whole per-tick D2R automation must not run for another game. Device evidence (np379/np380):
     // dm_actions_pump calls a hard-coded D2R address (b+0x45f9d0) as a function pointer, which in the BotW image
     // is the middle of a constructor -- that produced every 门票① symptom; after disabling it the next crash came
-    // from dm_bossrush_tick. These modules only make sense for Diablo 2: off by default, DM_D2R_PUMPS=1 enables.
-    { static int d2r = -1; if (d2r < 0) d2r = getenv("DM_D2R_PUMPS") != NULL; if (!d2r) return; }        // 每拍：受控玩家等级 / 本级经验‰ / 腰带四列件数 / 回城次数 + 当前人数档 → g_hud（前端 dm_hud_get） | Every tick: controlled player's level / current-level experience ‰ / item counts of the four belt columns / town portal count + current /players setting → g_hud (front end dm_hud_get)
+    // from dm_bossrush_tick. These modules only make sense for Diablo 2, so np382 gates them by game identity
+    // (dm_game_is_d2r()); the np381 DM_D2R_PUMPS switch is gone -- use DM_GAME=d2r to force them on.
+    if (!dm_game_is_d2r()) return;        // 每拍：受控玩家等级 / 本级经验‰ / 腰带四列件数 / 回城次数 + 当前人数档 → g_hud（前端 dm_hud_get） | Every tick: controlled player's level / current-level experience ‰ / item counts of the four belt columns / town portal count + current /players setting → g_hud (front end dm_hud_get)
     dm_hud_info h = {0};
     uint64_t player = 0, inv = 0, u = 0, next = 0;
     // 受控玩家 = 客户端自己记的本地玩家单位号那个单位（main+0x2d20e4c 本地玩家槽号 → main+0x2d60380[槽号] 单位号，原版 0x45f9d0 同口径），
@@ -1029,6 +1040,7 @@ static void hud_tick(uint64_t G) {
 }
 
 static void state_dump(const uint64_t *regs) {
+    if (!dm_game_is_d2r()) return;   // np382：整张转储表都是 D2R 的布局（单位表 0x2230 / 0x2a30 …），别的游戏读出来是垃圾 | the whole dump is the D2R layout (unit tables 0x2230 / 0x2a30 ...); for another game it is garbage
     static char *prev;
     uint64_t G = regs[0], player = 0, inv = 0, cursor = 0;
     int players = 0; uint32_t lid = local_player_id(); uint64_t mine = 0;
@@ -1185,11 +1197,17 @@ static void c2s_obs(const uint64_t *regs) {
     tk_rd(regs[0] + 0x170, &tick, 4);
     if (regs[1] && tk_rd(regs[1] + 8, &uid, 4)) hu = 1;
     uint8_t b[512]; uint32_t n = len < 512 ? len : 512; if (!tk_rd(regs[2], b, n)) n = 0;
+    // np382：下面这几个都是 D2R 专属的收包改写（合成 / 连战 / 秘境 / 珍宝匣 / 商人刷新），
+    // 别的游戏一条都不能过——它们会按 D2R 的类号、D2R 的硬编码函数去改包。
+    // np382: the block below is D2R-only packet rewriting (transmute / boss rush / rift / trove / vendor refresh);
+    // another game must not run any of it -- it rewrites packets by D2R class ids and hard-coded D2R functions.
+    if (dm_game_is_d2r()) {
     if (n >= 1 && b[0] == 0x20) cube_diag_req(regs[0], regs[1], b, n);   // 合成读数 | Transmute readout
     dm_bossrush_c2s(regs[0], regs[1], b, n);
     { void dm_rift_c2s(uint64_t, const uint8_t *, uint32_t); dm_rift_c2s(regs[0], b, n); }
     { void dm_pouch_c2s(uint64_t *); dm_pouch_c2s((uint64_t *)(uintptr_t)regs); }   // 珍宝匣：符文 / 宝石 / 材料拖进共享页时改道进高级仓库（dm_pouch.c；会换掉 x2 / x3 指向的包） | Trove: runes / gems / materials dragged into the shared tab are rerouted into the advanced stash tabs (dm_pouch.c; replaces the packet x2 / x3 point to)
     { void dm_shoprefresh_c2s(uint64_t, uint64_t, const uint8_t *, uint32_t); dm_shoprefresh_c2s(regs[0], regs[1], b, n); }   // 商人交易页「刷新货架」（dm_shoprefresh.c）   // 首领连战：玩家点了连战的门（门只是外观，换关由 dm_bossrush.c 做） | Vendor trade page 「刷新货架」(Refresh Stock) (dm_shoprefresh.c)   // Boss rush: the player tapped the boss rush door (the door is appearance only; the level change is done by dm_bossrush.c)
+    }
     if (!g_c2sfp) return;                       // 门在产品里常挂（首领连战要看），没开 DM_C2S_LOG 时不记 | The gate is usually installed in the product (boss rush needs it); nothing is logged when DM_C2S_LOG is not on
     // 诊断开关 DM_TEST_WARP_DIAG=1（只读）：收到「与出口砖交互」包（0x40 [砖 id]）这一刻，把服务端处理函数 main+0x6dbea0 的判定逐项读出来记一行——点了出口不进时看是哪一项拒的（全部拒绝都不回包）。
     // 判定顺序：当前动作能否被打断 main+0x6c5730(游戏, 玩家, 2, 0, 0)（0 = 放行）→ 砖对应的出口可用 main+0x5592f0(砖)（非 0 = 放行）→ 距离 main+0x5c7050(玩家, 砖)（查表距离，≤4 才当场换，>4 什么都不做）。
@@ -1210,6 +1228,7 @@ static void c2s_obs(const uint64_t *regs) {
 // Whether we are in a run: the server run loop 0x5d5120 walks 1024 run-number slots starting at main+0x2d665d8 (0 / -1 = empty), looks up the run object by run number, and calls the tick entry 0x5d3bc0 with object+0x10 as G.
 // No live run number ⇒ the run has ended (save-and-exit, kicked by a fatal error, or any other path) and G is no longer readable: clear g_lastG. After leaving a run the tick number is a fixed garbage value
 static int game_live(void) {
+    if (!dm_game_is_d2r()) return 1;   // np382：局号槽表在 main+0x2d665d8（D2R 布局，超出 BotW 映像）；别的游戏一律按「局还在」答，不清 g_lastG | the run-number slot table is at main+0x2d665d8 (D2R layout, outside the BotW image); for another game always answer "still live" and never clear g_lastG
     static const uint64_t *slots;
     if (!slots) { for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) slots = (const uint64_t *)(g_mod[i].base + 0x2d665d8); if (!slots) return 1; }
     for (int i = 0; i < 0x400; i++) if (slots[i] + 1 >= 2) return 1;
@@ -1230,7 +1249,9 @@ int dm_request_save(void) {
 }
 // 游戏是不是停着（暂停菜单 / 大秘境选层页这类开着：同上两个界面状态字节）。不在局内返回 0
 // Whether the game is stopped (pause menu / Greater Rift level-selection page and the like open: the same two UI state bytes as above). Returns 0 when not in a game
-int dm_game_paused(void) { uint8_t *b = NULL; for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) b = (uint8_t *)g_mod[i].base; return b && in_game() && (*(volatile uint8_t *)(b + 0x2d5ff51) | *(volatile uint8_t *)(b + 0x2d5ff67)); }
+int dm_game_paused(void) {   // np382：下面两个标志位是 main+0x2d5ff51 / 0x2d5ff67（D2R 布局，超出 BotW 映像）⇒ 别的游戏答「没暂停」 | the two flags are main+0x2d5ff51 / 0x2d5ff67 (D2R layout, outside the BotW image), so another game answers "not paused"
+    if (!dm_game_is_d2r()) return 0;
+    uint8_t *b = NULL; for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) b = (uint8_t *)g_mod[i].base; return b && in_game() && (*(volatile uint8_t *)(b + 0x2d5ff51) | *(volatile uint8_t *)(b + 0x2d5ff67)); }
 // 测试用：按 id 取服务端物品单位（物品表 G+0x2e30，128 桶、next=+0x158）；不在局内 / 没找到返回 0
 // For tests: get a server item unit by id (item table G+0x2e30, 128 buckets, next=+0x158); returns 0 when not in a run / not found
 uint64_t dm_diag_srv_item(uint32_t id) { if (!in_game()) return 0; uint64_t u = 0; tk_rd(g_lastG + 0x2e30 + 8 * (id & 0x7f), &u, 8); for (int k = 0; u && k < 4096; k++) { uint32_t ty = 0, uid = 0; if (!tk_rd(u, &ty, 4) || !tk_rd(u + 8, &uid, 4)) return 0; if (ty == 4 && uid == id) return u; if (!tk_rd(u + 0x158, &u, 8)) return 0; } return 0; }
@@ -1298,6 +1319,7 @@ void c2s_deliver_sys(uint64_t *regs) {   // svc #0x82：收包泵 → 0x6310b0(b
 // 0x16: [16][u32 item id][u32 x][u32 y][u32 flag]; 0x5f: [5f][u32 item id][u32 cube id][u32 x][u32 y][u32 cube position in inventory x|y<<16][u32 target inside cube x|y<<16]
 typedef struct { uint64_t a; uint32_t b, c; uint8_t ok; uint8_t pad[47]; } autoplace_res;   // 0x646840 的结果（经 x8 返回），+0x10 = 是否找到位置 | Result of 0x646840 (returned via x8), +0x10 = whether a position was found
 static int cube_pickup_rewrite(const uint64_t *regs, uint8_t out[4 + 25]) {
+    if (!dm_game_is_d2r()) return 0;   // np382：整段按 D2R 的物件类号 / 硬编码函数改包，别的游戏一律不改 | the whole thing rewrites packets by D2R class ids and hard-coded functions: never for another game
     static int on = -1; if (on < 0) { const char *e = getenv("DM_CUBE_PICKUP"); on = !(e && !strcmp(e, "0")); }
     uint8_t in[4 + 17]; uint32_t id, flag;
     if (!on || regs[1] != 17 || !tk_rd(regs[0], in, sizeof in) || in[4] != 0x16) return 0;
@@ -1329,6 +1351,7 @@ static int cube_pickup_rewrite(const uint64_t *regs, uint8_t out[4 + 25]) {
 // Server-side pass of potion auto-pickup (see the dm_potpick.c file header): at the moment a 0x16 sent by auto-pickup is handled, check server state once more with the original game's belt slot search main+0x561de0(inventory object, item, &slot, 1);
 // if it does not fit in the belt, drop the packet (return 1) and the potion stays on the ground -- not into the inventory, not into the cube. A 0x16 the player tapped themselves is not in the auto-pickup table and does not pass through here.
 static int potpick_gate(const uint64_t *regs) {
+    if (!dm_game_is_d2r()) return 0;   // np382：药水自动拾取是 D2R 腰带概念（main+0x561de0），别的游戏不拦包 | potion auto-pickup is a D2R belt concept (main+0x561de0); do not drop packets for other games
     int dm_potpick_auto(uint32_t); uint8_t in[4 + 17]; uint32_t id;
     if (regs[1] != 17 || !tk_rd(regs[0], in, sizeof in) || in[4] != 0x16) return 0;
     memcpy(&id, in + 5, 4); if (!dm_potpick_auto(id)) return 0;
@@ -1474,7 +1497,9 @@ static void c2s_load(const char *path) {
 static uint32_t g_hold_tick; static char g_hold_ui[96] = "PausePanelMessage:ExitGame"; static _Atomic int g_holding; static uint64_t g_hold_t0;
 static volatile uint32_t *g_hold_dl; static uint32_t g_hold_dl0; static int32_t g_hold_org; static int g_hold_org_ok; static uint32_t g_hold_dl1;
 static uint32_t guest_ms(void) { return (uint32_t)(guest_ns() / 1000000); }
+static uint32_t g_hold_dl_dummy;   // np382：非 D2R 时 hold_dl 给的替身（冻结/停着存盘这套机制在别的游戏上不生效，但调用方不必改）
 static volatile uint32_t *hold_dl(void) {
+    if (!dm_game_is_d2r()) return &g_hold_dl_dummy;   // np382：拍时限槽在 main+0x2d685d8（D2R 布局，超出 BotW 映像）⇒ 给本地替身，读写都不碰客体 | the tick deadline slot is at main+0x2d685d8 (D2R layout, outside the BotW image), so hand out a local stand-in and never touch the guest
     if (!g_hold_dl) for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) g_hold_dl = (volatile uint32_t *)(g_mod[i].base + 0x2d685d8);
     return g_hold_dl;
 }
@@ -1652,7 +1677,7 @@ static uint32_t frz_snapshot(uint64_t G, int *nmon, int *php) {   // 冻没冻�
 static void freeze_world_obs(const uint64_t *rc) { uint64_t *r = (uint64_t *)rc; static uint64_t fq[0x1500 / 8], fg[0x200 / 8]; if (atomic_load(&g_dm_frozen)) { fg[0x170 / 8] = 0; fg[0x188 / 8] = (uint64_t)(uintptr_t)fq; r[0] = (uint64_t)(uintptr_t)fg; } }
 static void freeze_client_obs(const uint64_t *rc) { uint64_t *r = (uint64_t *)rc; static uint32_t fu[0x200 / 4]; if (atomic_load(&g_dm_frozen) && r[0]) { fu[0x124 / 4] = 1u << 23; r[0] = (uint64_t)(uintptr_t)fu; } }
 static void freeze_anim_obs(const uint64_t *rc) { uint64_t *r = (uint64_t *)rc; static uint32_t fu[0x200 / 4]; if (atomic_load(&g_dm_frozen) && r[0]) { fu[0] = 9; r[0] = (uint64_t)(uintptr_t)fu; } }
-static void freeze_render_obs(const uint64_t *rc) { (void)rc; static uint64_t t0; static int was; module_t *m = main_mod(); if (!m) return; uint32_t *dt = (uint32_t *)((uintptr_t)m->base + 0x20cebb8); uint64_t *wt = (uint64_t *)((uintptr_t)m->base + 0x3114208);
+static void freeze_render_obs(const uint64_t *rc) { (void)rc; static uint64_t t0; static int was; if (!dm_game_is_d2r()) return; module_t *m = main_mod(); if (!m) return; uint32_t *dt = (uint32_t *)((uintptr_t)m->base + 0x20cebb8); uint64_t *wt = (uint64_t *)((uintptr_t)m->base + 0x3114208);   // np382：两个字段都是 D2R 布局（帧计时 0x20cebb8 / 等待目标 0x3114208） | both fields are the D2R layout (frame timer 0x20cebb8 / wait target 0x3114208)
     if (atomic_load(&g_dm_frozen)) { if (!was) { was = 1; t0 = *wt; } *dt = 0; *wt = t0; } else was = 0; }
 static _Atomic int g_frz_by_panel;   // 当前这次冻结是面板引起的（不是测试时间窗） | The current freeze was caused by a panel (not a test time window)
 // 每个出图帧调（dm_cursor.c 面板状态泵）：解冻本来在拍入口做，但拍入口不走的时候轮不到——面板冻着时切到暂停菜单（原版暂停，拍停）、点「保存并退出」、换角色，
@@ -1677,7 +1702,8 @@ static int freeze_attach(void) {   // 挂冻结用的四个入口门（产物里
 // progress between the last autosave and opening the pause menu is lost if the system reclaims the app in the background. Method: first freeze the world (same as panel freezing: the world / client / animation / render entry points become no-ops and the tick number does not advance, so monsters do not move and time does not pass),
 // then temporarily release the two UI state bytes of the original pause so ticks run and perform the save; after the commit (front end background_wait_save) write the two bytes back and unfreeze. Called by the front end on the main thread
 static _Atomic int g_bgsave; static uint8_t g_bg_pause[2];
-static int save_unpause_begin(void) {   // 1 = 冻住世界并放开了暂停；0 = 游戏没停着（不用做）；-1 = 产物没有冻结门，做不了 | 1 = froze the world and released the pause; 0 = the game is not stopped (nothing to do); -1 = the product has no freeze gates, cannot do it
+static int save_unpause_begin(void) {
+    if (!dm_game_is_d2r()) return 0;   // np382：读的是 D2R 的暂停标志位（main+0x2d5ff51 / 0x2d5ff67），别的游戏没有这套 | reads D2R's pause flags (main+0x2d5ff51 / 0x2d5ff67); another game has no such thing   // 1 = 冻住世界并放开了暂停；0 = 游戏没停着（不用做）；-1 = 产物没有冻结门，做不了 | 1 = froze the world and released the pause; 0 = the game is not stopped (nothing to do); -1 = the product has no freeze gates, cannot do it
     uint8_t *b = NULL; for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) b = (uint8_t *)g_mod[i].base;
     if (!b || !in_game()) return 0; volatile uint8_t *f = b + 0x2d5ff51, *g = b + 0x2d5ff67; if (!*f && !*g) return 0;
     if (!freeze_attach()) { LOG("【红】停着存盘：游戏停着，但产物里没有冻结门 10–13，不放开暂停（这次存不了）"); return -1; }
@@ -1688,6 +1714,7 @@ static int save_unpause_begin(void) {   // 1 = 冻住世界并放开了暂停；
     return 1;
 }
 static void save_unpause_end(void) {
+    if (!dm_game_is_d2r()) return;   // np382：同上，写回 D2R 的暂停标志位 | same as above: writes D2R's pause flags back
     if (!atomic_load(&g_bgsave)) return;
     uint8_t *b = NULL; for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) b = (uint8_t *)g_mod[i].base;
     if (b) { *(volatile uint8_t *)(b + 0x2d5ff51) = g_bg_pause[0]; *(volatile uint8_t *)(b + 0x2d5ff67) = g_bg_pause[1]; }   // 先恢复暂停、后解冻：解冻后的拍不再走 | Restore the pause first, then unfreeze: ticks after unfreezing no longer advance
@@ -1772,7 +1799,7 @@ static void tick_gate(const uint64_t *regs) {         // 拍入口：先注入�
     if (g_rp) c2s_inject(regs[0]);
     if (g_spfp) state_dump(regs);
     if (g_tkfp) ticks_hash(regs);
-    { void dm_bright_server_tick(uint64_t G); dm_bright_server_tick(regs[0]); }   // 3D 画面加亮的测试开关 DM_TEST_DAYTIME（dm_bright.c） | The test switch DM_TEST_DAYTIME for 3D picture brightening (dm_bright.c)
+    if (dm_game_is_d2r()) { void dm_bright_server_tick(uint64_t G); dm_bright_server_tick(regs[0]); }   // 3D 画面加亮的测试开关 DM_TEST_DAYTIME（dm_bright.c）；D2R 专属（np382 按身份闸） | The test switch DM_TEST_DAYTIME for 3D picture brightening (dm_bright.c); D2R-only, gated by game identity (np382)
     freeze_tick(regs[0]);   // 面板冻结：放在最后，前面各段读到的还是没减过的拍号 | Panel freeze: placed last, so the sections before it still read the tick number before the decrement
 }
 // ---------- DM_SOAK=<路径>[,间隔秒（缺省 60）]：浸泡读数，宿主线程定时写一行 TSV ----------
@@ -1838,6 +1865,14 @@ static void loadscreen_on_uimsg(const char *cat, const char *act, const char *ar
     // 我们的底栏直接开任务面板、不经原版的任务提示按钮，提示字节没人清：任务面板一打开就清（= 已读）。本回调在客户端主线程，与游戏自己读写这个字节同线程
     // Whether the character creation naming panel is open (hle_swkbd.c / the front-end input box use it to block characters according to the game's character name rules: the game itself accepts only 2–15 English letters, see the header comment of hle_swkbd.c)
     // Our bottom bar opens the quest panel directly, without going through the original game's quest hint button, so nobody clears the hint byte: it is cleared as soon as the quest panel opens (= read). This callback is on the client main thread, the same thread on which the game itself reads and writes this byte
+    // np382：下面这一串是 D2R 的界面消息分发（任务提示字节在 main+0x2d5ff58，超出 BotW 映像；
+    // 十几个模块各按 D2R 的面板名 / 类号认自己的消息）。换游戏时一条都不该跑：BotW 有自己的面板名，
+    // 让它们去认只会白比对，认错了就按 D2R 的布局动客体。
+    // np382: the block below is D2R's UI-message dispatch (the quest hint byte is at main+0x2d5ff58, outside the
+    // BotW image; a dozen modules each recognise their own message by D2R panel name / class id). None of it should
+    // run for another game: BotW has its own panel names, so they would only compare for nothing -- and a wrong
+    // match would touch the guest through the D2R layout.
+    if (dm_game_is_d2r()) {
     if (!strcmp(cat, "PanelManager") && !strcmp(arg, "QuestLogPanelExpansion") && (!strcmp(act, "OpenPanel") || !strcmp(act, "OpenExclusivePanel"))) { module_t *qm = main_mod(); if (qm) *(volatile uint8_t *)(qm->base + 0x2d5ff58) = 0; }
     { void dm_textinput_on_uimsg(const char *, const char *, const char *); dm_textinput_on_uimsg(cat, act, arg); }
     { void dm_update_on_uimsg(const char *, const char *, const char *); dm_update_on_uimsg(cat, act, arg); }
@@ -1848,6 +1883,7 @@ static void loadscreen_on_uimsg(const char *cat, const char *act, const char *ar
     { void dm_shoprefresh_on_uimsg(const char *, const char *, const char *, uint8_t *); module_t *sm = main_mod(); dm_shoprefresh_on_uimsg(cat, act, arg, sm ? (uint8_t *)sm->base : NULL); }   // 商人交易页「刷新货架」按钮（dm_shoprefresh.c） | The 「刷新货架」(Refresh Stock) button on the vendor trade page (dm_shoprefresh.c)
     { void dm_runeword_on_uimsg(const char *, const char *, const char *); dm_runeword_on_uimsg(cat, act, arg); }   // 符文之语助手（dm_runeword.c） | Runeword helper (dm_runeword.c)
     { void dm_beltauto_on_uimsg(const char *, const char *, const char *); dm_beltauto_on_uimsg(cat, act, arg); }   // 开背包自动补腰带（dm_beltauto.c） | Auto-refill the belt when the inventory opens (dm_beltauto.c)
+    }   // np382：D2R 界面消息分发到此结束（dm_game_is_d2r() 为真才跑） | the D2R UI-message dispatch ends here (runs only when dm_game_is_d2r())
     { extern void (*g_dm_charsel_hook)(void); if (g_dm_charsel_hook && !strcmp(cat, "FrontEndNavigation") && !strcmp(act, "ToFrontEnd")) g_dm_charsel_hook(); }   // 退出这一局、回到前端（主菜单 / 选角页）：iOS 把这一局攒下的存档传 iCloud（cloud_ios.m）   // 构建号 + 新版本提示（dm_update.c） | Exiting this run and returning to the front end (main menu / character select page): iOS uploads the saves accumulated during this run to iCloud (cloud_ios.m)   // build number + new version notice (dm_update.c)
     if (!strcmp(cat, "PanelManager") && !strcmp(act, "ClosePanel") && !strcmp(arg, "TouchShareLog")) {   // 暂停菜单「分享诊断日志」（按钮发这条空操作，布局见 touch_layout.py _pause_no_help） | Pause menu 「分享诊断日志」(Share Diagnostics) (the button sends this no-op; for the layout see touch_layout.py _pause_no_help)
         LOG("诊断日志：点了「分享诊断日志」%s", g_sharelog_cb ? "" : "（外壳没登记，不弹）"); if (g_sharelog_cb) g_sharelog_cb(); }
@@ -1859,7 +1895,7 @@ static void loadscreen_on_uimsg(const char *cat, const char *act, const char *ar
             else if (off && strstr(m, off)) { LOG("DM_TEST_FRZ：「%s」命中 → 世界冻结状态位 关", m); mtl_world_frozen(0); } }
     }
     if (!strcmp(cat, "PanelManager") && !strcmp(arg, "CharacterCreateNamePanel")) { extern int g_swkbd_name_panel; g_swkbd_name_panel = !strcmp(act, "OpenPanel") || !strcmp(act, "OpenExclusivePanel"); }
-    { void dm_ui_on_uimsg(const char *, const char *, const char *); dm_ui_on_uimsg(cat, act, arg); }   // 前端路径理顺（dm_cursor.c）：借这个恒订阅的回调 | Front-end path straightening (dm_cursor.c): borrows this always-subscribed callback
+    if (dm_game_is_d2r()) { void dm_ui_on_uimsg(const char *, const char *, const char *); dm_ui_on_uimsg(cat, act, arg); }   // 前端路径理顺（dm_cursor.c）：借这个恒订阅的回调；D2R 专属（np382 按身份闸） | Front-end path straightening (dm_cursor.c): borrows this always-subscribed callback; D2R-only, gated by game identity (np382)
     if (strcmp(arg, "LoadScreenPanel")) return;
     pthread_mutex_lock(&g_shotgate_mu);
     if (!strcmp(act, "OpenPanel") || !strcmp(act, "OpenExclusivePanel")) {
@@ -1890,6 +1926,7 @@ static int shotui_wait_needed(const char *trigger) {
 }
 struct shotui_wait_arg { int index; char label[96]; };
 static void *shotui_wait_loadscreen(void *arg) {
+    if (!dm_game_is_d2r()) return NULL;   // np382：等读取画面的判据是 D2R 的界面状态（main+0x2d128f8 / 0x2d128fc） | the loadscreen wait is judged by D2R's UI state (main+0x2d128f8 / 0x2d128fc)
     struct shotui_wait_arg *a = arg; uint64_t start = now_ns();
     uint64_t not_before = start + (uint64_t)g_loadscreen_delay_ms * 1000000ull;
     for (;;) {
@@ -1944,7 +1981,7 @@ static void res_on_uimsg(const char *cat, const char *act, const char *arg) { (v
 void ticks_install(void) {
     const char *e = getenv("DM_TICKS"), *rp = getenv("DM_C2S_REPLAY"), *lg = getenv("DM_C2S_LOG"), *sp = getenv("DM_STATE");
     const char *pn = getenv("DM_PLAYERS");
-    if (pn && *pn) { dm_hud_request_players(atoi(pn)); LOG("DM_PLAYERS：起局请求档位 %d", dm_hud_requested_players()); }
+    if (pn && *pn && dm_game_is_d2r()) { dm_hud_request_players(atoi(pn)); LOG("DM_PLAYERS：起局请求档位 %d", dm_hud_requested_players()); }   // np382：/players 是 D2R 的难度档，别的游戏不认这个请求 | /players is D2R's difficulty setting; another game does not take this request
     if ((e || rp || lg) && gate_obs_present(OBS_UIMSG)) { void uimsg_subscribe(void (*)(const char *, const char *, const char *)); uimsg_subscribe(res_on_uimsg); }
     soak_install();
     shotui_install();
@@ -1980,8 +2017,8 @@ void ticks_install(void) {
     else LOG("【红】产物没有命令分派观测门 OBS_C2S：首领连战的门点了不换关");
     if (gate_obs_present(OBS_TICK)) gate_obs_set(OBS_TICK, tick_gate_product);
     else LOG("【红】产物没有拍入口观测门 OBS_TICK：底栏数字 / 难度条 / 动态 3D 比例（dm_ingame_now）都不工作");
-    { module_t *tm = main_mod(); void dm_textbox_install(uint8_t *); if (tm) dm_textbox_install((uint8_t *)tm->base); }   // 普通文字框里的注释颜色码（dm_textbox.c，观测门 14） | Annotation color codes in ordinary text boxes (dm_textbox.c, observation gate 14)
-    { module_t *tm = main_mod(); void dm_turnsmooth_install(uint8_t *); if (tm) dm_turnsmooth_install((uint8_t *)tm->base); }   // 转向回跳平滑 / 模型转身参数读取（dm_turnsmooth.c，观测门 19 / 20） | turn snap-back smoothing / reading the model turning parameters (dm_turnsmooth.c, observation gates 19 / 20)
+    if (dm_game_is_d2r()) { module_t *tm = main_mod(); void dm_textbox_install(uint8_t *); if (tm) dm_textbox_install((uint8_t *)tm->base); }   // np382：文字框注释色码的安装是 D2R 的观测门 14 | np382: installing the annotation colour codes is D2R's observation gate 14   // 普通文字框里的注释颜色码（dm_textbox.c，观测门 14） | Annotation color codes in ordinary text boxes (dm_textbox.c, observation gate 14)
+    if (dm_game_is_d2r()) { module_t *tm = main_mod(); void dm_turnsmooth_install(uint8_t *); if (tm) dm_turnsmooth_install((uint8_t *)tm->base); }   // np382：转向平滑的安装是 D2R 的观测门 19 / 20 | np382: installing the turn smoothing is D2R's observation gates 19 / 20   // 转向回跳平滑 / 模型转身参数读取（dm_turnsmooth.c，观测门 19 / 20） | turn snap-back smoothing / reading the model turning parameters (dm_turnsmooth.c, observation gates 19 / 20)
     if (e || rp || lg || sp) {                              // DM_C2S_LOG 也挂拍入口：系统类消息的拍号要从 G 读 | DM_C2S_LOG also hooks the tick entry: the tick number of system-class messages has to be read from G
         if (!gate_obs_present(OBS_TICK)) die("DM_TICKS / DM_STATE / DM_C2S_REPLAY / DM_C2S_LOG：产物没有拍入口观测门 OBS_TICK（需 r8 起的产物）");
         gate_obs_set(OBS_TICK, tick_gate);
