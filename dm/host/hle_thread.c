@@ -747,19 +747,30 @@ int svc_thread(int num, uint64_t *regs) {
         // np411: when waiting on a thread handle, print the target's identity (entry / arg / exited?) --
         // np410 on device: the main thread waits forever on 0x1003/0x1007 (two workers); distinguish
         // "waiting for it to exit" from "waiting for something that already went wrong".
-        { static int nt; if (nt++ < 6) {
+        // np419：把上限提到 64（卡住后的等待也要看），且**所有句柄类型都打**——
+        // np413 之后怀疑主线程等的可能不是线程而是事件/传输对象；只打 O_THREAD 会漏。
+        // np419: raise the cap to 64 (stall-phase waits matter too) and print EVERY handle's type --
+        // the main thread may be waiting on an event / transfer object, not a thread; O_THREAD-only
+        // logging would miss that.
+        { static unsigned nt; if (nt++ % 50 == 0) {   // np419b：改成采样式（每 500 次 1 条）——「前 N 次」制度会被 hilog 回绕吃光 | sampled, not capped: log wrap ate the capped ones
             for (int i = 0; i < n && i < 4; i++) {
                 unsigned i_ = hs[i] - 0x1000;
-                if (i_ < MAX_H && g_h[i_].type == O_THREAD) {
+                if (i_ >= MAX_H) { LOG("WaitSync 句柄越界 h=%#x（非 0x10xx 段？）超时=%lld", hs[i], (long long)ns); continue; }   // np419c：越界也打——句柄可能根本不在 0x10xx 客体段 | log even out-of-range handles
+                if (g_h[i_].type == O_THREAD) {
                     thr_t *w = (thr_t *)g_h[i_].obj;
                     module_t *me_ = module_of((void *)w->entry);
-                    LOG("WaitSynchronization 等线程 h=%#x entry=%s+%#llx arg=%#llx started=%d exited=%d 超时=%lld",
+                    LOG("WaitSync 等线程 h=%#x entry=%s+%#llx arg=%#llx started=%d exited=%d 超时=%lld",
                         hs[i], me_ ? me_->name : "?", me_ ? (uint64_t)w->entry - (uint64_t)me_->base : 0,
                         (unsigned long long)w->arg, w->started, w->exited, (long long)ns);
+                } else if (g_h[i_].type == O_EVENT_R || g_h[i_].type == O_EVENT_W) {
+                    event_t *e = (event_t *)g_h[i_].obj;
+                    LOG("WaitSync 等事件 h=%#x signaled=%d 超时=%lld", hs[i], e->signaled, (long long)ns);
+                } else {
+                    LOG("WaitSync 等其他 h=%#x 类型=%d 超时=%lld", hs[i], g_h[i_].type, (long long)ns);
                 }
             }
         } }
-        { static int nc; if (nc++ < 6) LOG("WaitSynchronization 调用：n=%d 超时=%lld 首句柄=%#x", n, (long long)ns, n > 0 ? hs[0] : 0); }
+        { static unsigned nc; if (nc++ % 50 == 0) LOG("WaitSynchronization 调用：n=%d 超时=%lld 首句柄=%#x", n, (long long)ns, n > 0 ? hs[0] : 0); }
         // 只在等假服务句柄时：它们永远不会有服务端来触发，**无限等就是死锁** ⇒ 上限 100 ms，之后回超时。
         // 有真句柄混在里面时不动（那种等待是靠真事件触发的）。
         // Only when every handle is a fake service handle: nothing will ever signal them, so an infinite wait
