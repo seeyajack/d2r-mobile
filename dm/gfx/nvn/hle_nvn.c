@@ -935,6 +935,14 @@ NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
     o->used -= 8;
 }
 NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
+    // np410：**通用进展打点**。看门狗的"进展"原来只从 D2R 的 UI 消息钩子记（diag.c），
+    // BotW 不走那条路 ⇒ 看门狗永远不推进、卡死也判不出来（np408/409 两轮"卡住"都是这么漏掉的）。
+    // EndRecording 是最普适的"游戏活着"信号：游戏在录命令缓冲就说明主循环在转。
+    // np410: a universal progress signal. The watchdog's progress used to be recorded only from D2R's UI-message
+    // hook (diag.c); BotW never walks that path, so the watchdog never advanced and hangs went unnoticed
+    // (np408/409 both stalled like this). EndRecording is the most universal "the game is alive" signal.
+    { static _Atomic unsigned n; if (atomic_fetch_add(&n, 1) % 256 == 0) {
+        void crash_watch_progress(uint32_t, const char *); crash_watch_progress(0, "nvn:EndRecording"); } }
     cmd_t *o = CB(c);
     // np349：进/出各一行 —— 崩点在"EndRecording 返回之后"还是"我们内部"，看有没有"返回"这行即定谳
     // np349: one line in, one line out -- whether the crash is after our return or inside us is settled by the presence of the "out" line
@@ -1466,6 +1474,9 @@ static uint64_t x_present_ticket(uint64_t job) {   // 出图任务执行完后�
     return tk;
 }
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
+    // np410：同上，提交命令也是"活着"信号 | same: submitting commands is also an "alive" signal
+    { static _Atomic unsigned sn; if (sn++ % 64 == 0) {
+        void crash_watch_progress(uint32_t, const char *); crash_watch_progress(0, "nvn:QueueSubmit"); } }
     gfx_enter();
     ((queue_t *)q)->submits++;
     xjob j = {XJ_SUBMIT, n, n > 0 ? malloc((size_t)n * sizeof *h) : NULL};   // 句柄数组是游戏的，入队时拷一份 | The handle array belongs to the game; copy it when enqueuing
