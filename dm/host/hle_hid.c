@@ -480,6 +480,38 @@ HLE_FORCE("_ZN2nn3hid15GetNpadStyleSetERKj", "手柄样式查询；跟 DM_OPMODE
 HLE_FORCE("_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj", "全键手柄状态；取 dm_input", void, h_hid_GetFullKey, NpadState *s, const uint32_t *id) { fill(s, *id, STYLE_FULLKEY); }
 HLE_FORCE("_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj", "掌机手柄状态；取 dm_input", void, h_hid_GetHandheld, NpadState *s, const uint32_t *id) { fill(s, *id, STYLE_HANDHELD); }
 
+// np448：**复数版** GetNpadStates —— 直接接管，绕开 SDK 的 detail 路径。
+// 为什么必须接管：SDK 的 `detail::GetNpadStates` 从一张"每种风格一个处理器"的表里取函数，
+// 而表项是在 `nl::hid::InitializeNpad`（真身）里注册的；那条路要走 hid 的 CMIF IPC
+// （我们没有这一层，注释见下方 InitializeDebugPad），所以历史做法是把 InitializeNpad 整个空转
+// ⇒ 表里只剩"永远返回 0"的默认桩 ⇒ 1.6.0 一启动就断言。
+// 现场证据（sdk.patched.bin）：
+//   sdk+0x44446c  ldr  x8,[x8,#0x8c8]   ; 取表项（RELATIVE addend = 0x444fc = 默认桩）
+//   sdk+0x444474  blr  x8
+//   sdk+0x444478  cmp  w0,#1 / b.ne     ; 期望 ==1
+//   sdk+0x444490  cbnz w0 → 抛断言
+//   sdk+0x444fc   mov  w0,wzr; ret      ; ← 默认桩
+// 接管后按 count 填我们自己的状态，SDK 的 detail 根本没机会跑。
+// 步长用 0x28（= sizeof(NpadState)，下面有静态断言）；真机上各风格的 state 结构 ≥0x28，
+// 所以"按 0x28 步长填 N 个"不会越过调用方按真实尺寸分配的数组。
+// np448: the **plural** GetNpadStates -- taken over directly, bypassing the SDK detail path.
+// The SDK's detail::GetNpadStates looks up a per-style handler in a table that nl::hid::InitializeNpad
+// (the real one) fills in, and that path needs hid's CMIF IPC (we have no such layer), which is why the
+// real InitializeNpad was historically stubbed out entirely -- leaving only a "always return 0" default
+// handler in the table, so 1.6.0 asserts on boot. After this takeover the SDK detail path never runs.
+// Stride is 0x28 (= sizeof(NpadState), statically asserted below); real per-style states are >= 0x28,
+// so filling N entries at that stride never overruns the caller's allocation.
+#define HID_STATES(fnname, mangled, label, style) \
+    HLE_FORCE(mangled, label, int, fnname, NpadState *arr, int count, const uint32_t *id) { \
+        int n = count < 0 ? 0 : (count > 16 ? 16 : count); \
+        for (int i = 0; i < n; i++) fill(arr + i, *id, style); \
+        return n; }
+HID_STATES(h_hid_StatesFullKey, "_ZN2nn3hid13GetNpadStatesEPNS0_16NpadFullKeyStateEiRKj", "复数版：全键（接管，np448）", STYLE_FULLKEY)
+HID_STATES(h_hid_StatesHandheld, "_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj", "复数版：掌机（接管，np448）", STYLE_HANDHELD)
+HID_STATES(h_hid_StatesJoyDual, "_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyDualStateEiRKj", "复数版：双持（接管，np448）", STYLE_FULLKEY)
+HID_STATES(h_hid_StatesJoyLeft, "_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyLeftStateEiRKj", "复数版：左半（接管，np448）", STYLE_FULLKEY)
+HID_STATES(h_hid_StatesJoyRight, "_ZN2nn3hid13GetNpadStatesEPNS0_17NpadJoyRightStateEiRKj", "复数版：右半（接管，np448）", STYLE_FULLKEY)
+
 // 震动：设备数 0，游戏不会再初始化 / 发送
 // Vibration: device count 0, the game will not initialize / send any further
 HLE_FORCE("_ZN2nn3hid20IsVibrationPermittedEv", "震动许可；宿主不支持（返回 bool）", unsigned, h_hid_VibPermit, void) { return 0; }
