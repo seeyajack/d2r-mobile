@@ -592,7 +592,9 @@ void guest_null_tolerant_ctor(void) {   // np374：改为运行期安装（np297
     // On the real device these 6 entries are only reached from "allocate then construct" factories and
     // this can never be null; it is null here, so something upstream differs -- keep the guest alive
     // first and then see where it actually uses the null object.
-    static const struct { uint64_t off; uint32_t first; int mode; const char *name; } kEnt[] = {
+    // np433：表里加 target —— mode 4（跳到指定偏移）要用它。
+    // np433: the table gets a target column, used by mode 4 (branch to a given offset).
+    static const struct { uint64_t off; uint32_t first; int mode; const char *name; uint64_t target; } kEnt[] = {
         // np406：**资源管理器 getter**（`ldr x8,[x0,#0x10]; ldr x0,[x8,#0x38]; ret`）。
         // np405 真机：游戏连续跑帧后第一个裸崩点就在它（this=NULL，addr=0x38）。
         // mode 0 的桩形正好合适：cbz x0 → NULL 时直接 ret（x0 已是 0 ⇒ 返回 NULL），
@@ -614,7 +616,26 @@ void guest_null_tolerant_ctor(void) {   // np374：改为运行期安装（np297
         // x0+0x68 read as 0 into x19, so the next ldr x8,[x19] faulted at addr=0 (FAULT pc=0xa660ac). The game checks
         // cbz x20 after the blr anyway (0xa660c4), so skipping the virtual call with a zero result is a path the
         // caller already expects. Mode 1 (plain ret): x0 is `this` on entry and the result register is 0.
-        { 0xa660a8, 0xF9403660u, 1, "0xa660a8 场景管理器成员（np407 裸崩点，跳过虚调用返回 0）" },
+        // np433：⭐ **这条原来是 mode 1（无条件 ret），是一个致命错误，本轮已修**。
+        // 0xa660a8 不是函数入口，也不是函数末尾 —— 此刻 x30 仍然装着 `bl 0xa661e8`（0xa66088）的返回地址
+        // 0xa6608c，所以 `ret` 等于**跳回本函数中间**：0xa6608c → … → 0xa660a8 → ret → 0xa6608c …
+        // 真机 500Hz 采样直方图把这个环画出来了（0xa66094 占 80~90%，其余散在 0xa6608c/90/9c/a4/a8；
+        // lr 恒为 0xa6608c；CPU 100% 用户态、缺页 0、无系统调用；入口只被进过 1 次、0xa660c0 一次没到）。
+        // 后果：`arrow.raw` 这条装载路径永远走不完 ⇒ ShaderHolder 拿不到着色器集 ⇒ Shader=0、
+        // `fs open` 断流 ⇒ ksys::InitializeApp 的 Step 4 死等。**前几轮追的"启动卡点"就是这条补丁。**
+        // 修法：改成 mode 4 —— 直接跳到本函数尾声 0xa661d0（`sub sp,x29,#0x30` / ldp / ret），
+        // 语义仍是"跳过这次虚调用、结果当 0"，但走的是**正常返回**，不再自环。
+        // np433: this used to be mode 1 (plain ret) and that was a fatal mistake. 0xa660a8 is neither a function
+        // entry nor the end of the function: x30 still holds the return address of `bl 0xa661e8` at 0xa66088, which
+        // is 0xa6608c, so `ret` jumped back **into the middle of the same function** -- 0xa6608c ... 0xa660a8 ret
+        // 0xa6608c ... The 500 Hz on-device histogram drew that loop (0xa66094 at 80-90%, the rest spread over
+        // 0xa6608c/90/9c/a4/a8; lr always 0xa6608c; 100% of the CPU in user mode, zero faults, no syscalls; the
+        // entry was entered once and 0xa660c0 never). Consequence: the `arrow.raw` load path can never finish, so
+        // ShaderHolder gets no shader set, so Shader=0 and `fs open` stops, so ksys::InitializeApp Step 4 waits
+        // forever -- **the "startup stall" of the last few rounds was this patch.** The fix is mode 4: branch to the
+        // function's own epilogue at 0xa661d0, which keeps the meaning (skip the virtual call, result 0) but returns
+        // normally instead of looping.
+        { 0xa660a8, 0xF9403660u, 4, "0xa660a8 场景管理器成员（np433：改跳尾声，原 mode 1 会自环）", 0xa661d0u },
         { 0x105f9e4, 0xF81E0FF3u, 0, "0x105f9e4 就地构造（np374：改回真守卫，不再无条件 ret）" },
         { 0x45f9c8,  0xF81E0FF3u, 0, "0x45f9c8 类构造器" },
         { 0x3326b8,  0xF81E0FF3u, 0, "0x3326b8 构造包装 A" },
@@ -684,7 +705,32 @@ void guest_null_tolerant_ctor(void) {   // np374：改为运行期安装（np297
             guest_patch32((uint32_t *)fn, kEnt[i].first, arm64_b((uint64_t)fn, (uint64_t)stub), kEnt[i].name);
             continue;
         }
+        if (kEnt[i].mode == 4) {   // np433：跳到指定偏移（函数尾声），走**正常返回**
+            // 为什么不复用 mode 1：mode 1 是"就地 ret"，它依赖 x30 仍是调用者的返回地址；
+            // 装在函数中段（本次就是）会跳回本函数内部形成死循环。这里显式给出目标，语义不依赖 x30。
+            // Why not reuse mode 1: mode 1 is a bare `ret`, which relies on x30 still holding the caller's return
+            // address; placed mid-function (as here) it jumps back into the same function and loops. Here the
+            // destination is explicit, so the semantics do not depend on x30.
+            guest_patch32((uint32_t *)fn, kEnt[i].first,
+                          arm64_b((uint64_t)fn, (uint64_t)((uint8_t *)mm->base + kEnt[i].target)), kEnt[i].name);
+            continue;
+        }
         if (kEnt[i].mode == 1) {   // np297 对照实验：无条件 ret（不占空穴）
+            // np433：**入口专用**。`ret` 只有在 x30 还是"调用者的返回地址"时才等价于"跳过本函数"，
+            // 而这只有函数入口才成立；装在函数中段就会跳回本函数内部（np407 的 0xa660a8 正是这样自环了五轮）。
+            // 判据：紧挨着的前一条必须是 `ret` 或无条件 `b`（即函数边界），否则拒绝安装并报红——宁可不打，也不能打个死循环。
+            // np433: entry-only. A bare `ret` means "skip this function" only when x30 is still the caller's return
+            // address, which holds only at a function entry; mid-function it jumps back into the same function (np407's
+            // 0xa660a8 looped for five rounds exactly that way). Criterion: the preceding word must be `ret` or an
+            // unconditional `b` (a function boundary); otherwise refuse to install and report red -- better no patch
+            // than a silent infinite loop.
+            uint32_t prev = ((const uint32_t *)fn)[-1];
+            if (prev != 0xD65F03C0u && ((prev >> 26) & 0x3Fu) != 0x05u) {
+                LOG("【红】拒绝 mode 1 补丁 %s：%#x 不是函数入口（前一条 %08x 既不是 ret 也不是 b），"
+                    "无条件 ret 装在函数中段会跳回本函数、形成死循环；要跳过一段请改用 mode 4 指定目标",
+                    kEnt[i].name, kEnt[i].off, prev);
+                continue;
+            }
             guest_patch32((uint32_t *)fn, kEnt[i].first, 0xD65F03C0u, kEnt[i].name);
             continue;
         }
