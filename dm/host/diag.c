@@ -186,7 +186,7 @@ static int probe_hit(ucontext_t *uc) {   // 由 probe_install 注册给 crash.c 
         uint64_t t = now_ns();
         // 计数模式：头 3 次给全量，之后 1 秒最多一行（只有 x0/x1 两个数，不取字符串）
         // Count mode: full detail for the first 3 hits, then at most one line per second (just x0/x1, no string reads)
-        if (g_probe[i].count) {
+        if (g_probe[i].count == 1) {
             uint64_t n = ++g_probe[i].cnt;
             if (n > 3) {
                 if (t - g_probe[i].last_print < 1000000000ull) { UC_PC(uc) = (uint64_t)g_probe[i].slot; return 1; }
@@ -223,6 +223,24 @@ static int probe_hit(ucontext_t *uc) {   // 由 probe_install 注册给 crash.c 
                 for (int k = 0; k < 16; k++) fputc(b[k] >= 0x20 && b[k] < 0x7f ? b[k] : '.', stderr);
             }
         }
+        // np434b：`@s<偏移>` —— 把 [x0+偏移] 当指针，打它后面 64 字节的原文（ASCII 视图）。
+        // 为什么不直接按 C 串打：这类"安全字符串"对象的缓冲区前面还有指针/容量字段，
+        // 文本不在第 0 字节，probe_str 的"从头可打印"判据必然失败。
+        // np434b: `@s<offset>` -- treat [x0+offset] as a pointer and print the next 64 bytes as text.
+        // Not a plain C-string dump: these "safe string" objects have pointer/capacity fields before the
+        // characters, so probe_str's "printable from byte 0" test always fails on them.
+        if (g_probe[i].count == 2) {
+            uint64_t p = 0; vm_size_t g = 0;
+            if (!vm_read_overwrite(mach_task_self(), UC_X(uc, 0) + (uint64_t)g_probe[i].dump, 8, (vm_address_t)&p, &g) && g == 8) {
+                uint8_t nb[64]; vm_size_t g2 = 0;
+                fprintf(stderr, " [*x0+%#lx]=%#llx", g_probe[i].dump, (unsigned long long)p);
+                if (!vm_read_overwrite(mach_task_self(), p, sizeof nb, (vm_address_t)nb, &g2) && g2 == sizeof nb) {
+                    fprintf(stderr, " |");
+                    for (int k = 0; k < (int)sizeof nb; k++) fputc(nb[k] >= 0x20 && nb[k] < 0x7f ? nb[k] : '.', stderr);
+                    fprintf(stderr, "|");
+                }
+            }
+        }
         fputc('\n', stderr);
         dm_backtrace(UC_FP(uc));
         UC_PC(uc) = (uint64_t)g_probe[i].slot;
@@ -248,7 +266,7 @@ static void probe_add(module_t *m, uint64_t off, long dump, probe_fn fn, int cou
     g_probe[g_nprobe].at = at; g_probe[g_nprobe].slot = sl; g_probe[g_nprobe].dump = dump; g_probe[g_nprobe].fn = fn;
     g_probe[g_nprobe].count = count;
     snprintf(g_probe[g_nprobe].name, sizeof g_probe[0].name, "%s+%#llx", m->name, off);
-    LOG("探针 %s（原指令 %08x）%s", g_probe[g_nprobe].name, sl[0], g_probe[g_nprobe].count ? "［计数模式］" : "");
+    LOG("探针 %s（原指令 %08x）%s", g_probe[g_nprobe].name, sl[0], g_probe[g_nprobe].count == 1 ? "［计数模式］" : g_probe[g_nprobe].count == 2 ? "［取串］" : "");
     g_nprobe++;
 }
 
@@ -260,10 +278,10 @@ static void probe_add(module_t *m, uint64_t off, long dump, probe_fn fn, int cou
 // entry rising while the return point stands still = stuck inside that one call; both rising = calls return normally and the
 // problem is further up (redone every frame).
 void dm_probe_dump_counts(void) {
-    int any = 0; for (int i = 0; i < g_nprobe; i++) if (g_probe[i].count) any = 1;
+    int any = 0; for (int i = 0; i < g_nprobe; i++) if (g_probe[i].count == 1) any = 1;
     if (!any) return;
     fprintf(stderr, "[dm] 探针计数：");
-    for (int i = 0; i < g_nprobe; i++) if (g_probe[i].count)
+    for (int i = 0; i < g_nprobe; i++) if (g_probe[i].count == 1)
         fprintf(stderr, " %s=%llu", g_probe[i].name, (unsigned long long)g_probe[i].cnt);
     fputc('\n', stderr);
 }
@@ -577,6 +595,7 @@ void probe_install(void) {
             long dump = -1; int count = 0;
             if (at_) {
                 if (at_[1] == 'c') count = 1;                                    // @c：只计数（高频点专用） | @c: count only (for high-frequency points)
+                else if (at_[1] == 's') { count = 2; dump = (long)strtol(at_ + 2, 0, 16); }   // @s<偏移>：把 [x0+偏移] 当 char* 再打出来（np434b） | @s<offset>: treat [x0+offset] as a char* and print it
                 else dump = at_[1] == '*' ? (0x1000000 | strtol(at_ + 2, 0, 16)) : strtol(at_ + 1, 0, 16);   // @偏移 / @*偏移 | @offset / @*offset
             }
             probe_add(m, strtoull(c + 1, 0, 16), dump, NULL, count);
@@ -585,7 +604,7 @@ void probe_install(void) {
     {   // 起汇总线程：有计数探针，或显式要了周期读数（DM_DIAG_TICK=1，拿进程 CPU 与缺页计数）
         // Start the summary thread: any counting probe, or an explicit periodic reading (DM_DIAG_TICK=1: process CPU + fault count)
         int any = getenv("DM_DIAG_TICK") != NULL;
-        for (int i = 0; i < g_nprobe; i++) if (g_probe[i].count) any = 1;
+        for (int i = 0; i < g_nprobe; i++) if (g_probe[i].count == 1) any = 1;
         if (any) { pthread_t t; if (!pthread_create(&t, NULL, probe_ticker, NULL)) pthread_detach(t); }
     }
     if (g_slots && !g_slots_sealed) { mprotect(g_slots, 0x4000, PROT_READ | PROT_EXEC); sys_icache_invalidate(g_slots, 0x4000); g_slots_sealed = 1; }
