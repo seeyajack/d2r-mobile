@@ -291,6 +291,7 @@ static void *probe_ticker(void *p) {
     for (;;) {
         struct timespec ts = {5, 0}; nanosleep(&ts, NULL);
         dm_probe_dump_counts();
+        { void dm_fs_dump_reads(void); dm_fs_dump_reads(); }   // np435：每个文件读了几次、多少字节（DM_FSRD=1） | per-file read accounting
         // 进程 CPU 拆成用户态 / 内核态，外加缺页计数——这三项合起来回答"主线程到底在干什么"：
         //   · 用户态每 5 秒涨满 5 秒 ⇒ 客体代码自己满速转（真的循环/忙等）；
         //   · 内核态涨满 ⇒ 一直卡在同一条指令的内核处理里（缺页、writeback、异常重试）；

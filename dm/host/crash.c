@@ -432,6 +432,11 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
                 (unsigned long long)(uintptr_t)si->si_addr,
                 (unsigned long long)UC_X(uc, 0), (unsigned long long)UC_SP(uc),
                 (unsigned long long)UC_FP(uc));
+    // np435：崩溃现场顺带把"每个文件读了几次/多少字节"打出来。启动期的崩溃常常早于 5 秒的滴答，
+    // 不在这里打就永远看不到（np435 就是 0.7 秒崩的）。
+    // np435: also dump the per-file read accounting at the crash site. Early-boot crashes usually beat the 5 s
+    // tick, so without this it is never printed (np435 crashed 0.7 s in).
+    if (sig == SIGSEGV || sig == SIGBUS) { void dm_fs_dump_reads(void); dm_fs_dump_reads(); }
     // np369：**fp 链逐帧打印**。np330 读 [sp+0x18] 只能看最近一帧，而这次要回答的是
     // "谁调用了 0x45f9c8"。帧指针链是 `x29` 指向本帧保存的 x29/x30 对（[fp]=旧 x29、[fp+8]=返回地址），
     // 顺链走 8 帧就能把真实调用者列出来（每帧都用 process_vm_readv，不会二次崩）。

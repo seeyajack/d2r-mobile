@@ -76,6 +76,31 @@ __attribute__((weak)) void front_save_failed(int err) { LOG("front_save_failed(e
 // DM_FSLOG=<文件>：每次 ReadFile 记一行 TSV「启动后秒\t客体路径\t偏移\t长度\t客体缓冲地址」（启动读了哪些字节，离线对清单反查用）
 // DM_FSLOG=<file>: each ReadFile logs one TSV line "seconds since boot\tguest path\toffset\tlength\tguest buffer address" (which bytes boot read, for offline reverse lookup against the manifest)
 static FILE *g_fslog; static char *g_fdpath[4096]; static pthread_mutex_t g_fslog_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// ---------- DM_FSRD=1：按文件记账"读了几次、多少字节"（np435）----------
+// 为什么需要：`DM_FS=1` 的汇总要累计 64 MiB 或 1000 次才打一行，判"某个包到底被真读了没有"根本不够细。
+// 真机上"包被 open 了"和"包被解析了"是两件事——这一轮就是靠它把两者分开的。
+// Why: the DM_FS=1 summary only prints every 64 MiB or 1000 reads, far too coarse to tell whether a given pack was
+// actually read. On device, "the pack was opened" and "the pack was parsed" are two different things.
+#define FSRD_MAX 16
+static struct { char path[96]; uint64_t io, bytes; } g_fsrd[FSRD_MAX];
+static int g_nfsrd;
+static pthread_mutex_t g_fsrd_mu = PTHREAD_MUTEX_INITIALIZER;
+static void fsrd_add(const char *p, size_t n) {
+    if (!getenv("DM_FSRD") || !p) return;
+    pthread_mutex_lock(&g_fsrd_mu);
+    int i = 0; for (; i < g_nfsrd; i++) if (!strcmp(g_fsrd[i].path, p)) break;
+    if (i == g_nfsrd && g_nfsrd < FSRD_MAX) { snprintf(g_fsrd[g_nfsrd].path, sizeof g_fsrd[0].path, "%s", p); g_nfsrd++; }
+    if (i < g_nfsrd) { g_fsrd[i].io++; g_fsrd[i].bytes += n; }
+    pthread_mutex_unlock(&g_fsrd_mu);
+}
+void dm_fs_dump_reads(void) {   // 由诊断滴答（diag.c）每 5 秒调一次 | called every 5 s by the diag ticker (diag.c)
+    if (!g_nfsrd) return;
+    pthread_mutex_lock(&g_fsrd_mu);
+    for (int i = 0; i < g_nfsrd; i++) LOG("fs 读账 %-56s %6llu 次 %9.2f MiB", g_fsrd[i].path,
+                                         (unsigned long long)g_fsrd[i].io, g_fsrd[i].bytes / 1048576.0);
+    pthread_mutex_unlock(&g_fsrd_mu);
+}
 static void fslog_init(void) { static int done; if (done) return; done = 1; const char *e = getenv("DM_FSLOG"); if (e && !(g_fslog = fopen(e, "w"))) die("DM_FSLOG 打不开 %s", e); }
 
 static const char *envdir(const char *var, const char *rel, char *buf, size_t n) {
@@ -611,7 +636,10 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
     { const char *c = strchr(path, ':'); size_t ln = c ? (size_t)(c - path) : 0; g_fsave[fd] = 0;
       for (int i = 0; c && i < g_nmnt; i++) if (strlen(g_mnt[i].name) == ln && !strncmp(g_mnt[i].name, path, ln)) g_fsave[fd] = g_mnt[i].commit[0] != 0; }
     fslog_init();
-    if (g_fslog && fd < 4096) { pthread_mutex_lock(&g_fslog_lock); free(g_fdpath[fd]); g_fdpath[fd] = strdup(path); pthread_mutex_unlock(&g_fslog_lock); }
+    // np435：fd→路径无条件记（原先只在 DM_FSLOG 打开时记，导致"按文件记账读量"没有路径可用；每次 open 一次 strdup，可忽略）
+    // np435: always record fd->path (it used to be recorded only with DM_FSLOG, which left per-file read accounting
+    // without a path; one strdup per open is negligible)
+    if (fd < 4096) { pthread_mutex_lock(&g_fslog_lock); free(g_fdpath[fd]); g_fdpath[fd] = strdup(path); pthread_mutex_unlock(&g_fslog_lock); }
     if (g_flag.fs) LOG("fs open [%.2fs] %s mode=%d → fd %d", (now_ns() - g_t0_ns) / 1e9, path, mode, fd);
     return RES_OK;
 }
@@ -639,6 +667,7 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
         got += r;
     }
     *out = got;
+    fsrd_add((int)h < 4096 && g_fdpath[(int)h] ? g_fdpath[(int)h] : "?", got);   // np435：按文件记账（DM_FSRD=1） | per-file read accounting
     if (g_flag.bootprof) dm_prof_add(PROF_FS_READ, now_ns() - t0, got);
     if (g_fslog) { pthread_mutex_lock(&g_fslog_lock);
         static int hash_on = -1; if (hash_on < 0) hash_on = getenv("DM_FSLOG_HASH") != NULL;   // DM_FSLOG_HASH=1：末尾加一列读到内容的 FNV-1a 64（对比两份资源包读到的字节是否一致） | DM_FSLOG_HASH=1: append a column with the FNV-1a 64 of the content read (to compare whether the bytes read from two resource packs match)
