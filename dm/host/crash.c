@@ -344,8 +344,24 @@ static void dump_guest_stack_chain(uint64_t sp) {
     }
     if (!shown) fprintf(stderr, "   （栈上没找到指向客体代码的返回地址）\n");
 }
+// np432：**缺页计数**。目的只有一个：把"主线程停在一条写指令上不动"的两种解释分开——
+// ① 反复缺页重试（计数暴涨，且 addr/pc 恒定）；② 根本没缺页，就是停着（计数 0）。
+// 之前只能靠"日志里没出现 CRASH"来推断"没缺页"，那是不成立的：钩子接住的缺页本来就不打日志。
+// np432: fault counter. One purpose: separate the two readings of "the main thread sits on a store instruction" --
+// (1) repeated fault-and-retry (count explodes, addr/pc constant); (2) no fault at all, it is simply parked (count 0).
+// Until now "no CRASH line in the log" was the only evidence for "no fault", and that does not hold: a fault taken
+// by a hook never prints anything.
+static _Atomic uint64_t g_nfault, g_fault_pc, g_fault_addr;
+void dm_fault_stats(unsigned long long *n, unsigned long long *pc, unsigned long long *addr) {
+    *n = atomic_load(&g_nfault); *pc = atomic_load(&g_fault_pc); *addr = atomic_load(&g_fault_addr);
+}
 static void on_crash(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = uc_;
+    if (sig == SIGSEGV || sig == SIGBUS) {   // 先记一笔再做任何判断（钩子接住的分支也要算进去） | count first, before any decision (hook-handled paths included)
+        atomic_fetch_add(&g_nfault, 1);
+        atomic_store(&g_fault_pc, (uint64_t)UC_PC(uc));
+        atomic_store(&g_fault_addr, (uint64_t)(uintptr_t)(si ? si->si_addr : 0));
+    }
     if (sig == SIGTRAP) {
         if (null_guard_trap(uc)) return;
         if (g_trap_hook && g_trap_hook(uc)) return;

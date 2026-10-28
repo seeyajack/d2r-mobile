@@ -533,6 +533,14 @@ void svc_thread_dump(void) {
         }
         vm_deallocate(mach_task_self(), (vm_address_t)ths, nth * sizeof *ths);
     }
+    // 消息队列现场（hle_msgq.c）：哪个队列有人发、有人收、此刻几个线程阻塞在它上面。
+    // "worker 在 ReceiveMessageQueue 上等" 与 "队列里有没有货" 是两件事，这里一次看全。
+    // Message-queue state (hle_msgq.c): which queues are sent to, received from, and how many threads are blocked on each right now.
+    // "a worker waits in ReceiveMessageQueue" and "is there anything in the queue" are two different things; this shows both at once.
+    { void dm_msgq_dump(void); dm_msgq_dump(); }
+    // 探针计数（diag.c）：卡住时把"入口被调了几次、返回点被调了几次"一次打全——差值就是阻塞所在的那一段。
+    // Probe counts (diag.c): on a stall print how many times each entry and each return point was reached — the gap is the blocked segment.
+    { void dm_probe_dump_counts(void); dm_probe_dump_counts(); }
 }
 
 // np343 对齐 nxnative：占进程线程资源上限名额的游戏线程数——已创建（无论是否 started）且未退出（hle_svc.c GetInfo FreeThreadCount 用）。

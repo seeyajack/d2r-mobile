@@ -136,7 +136,17 @@ static void l3mem_request(uint32_t tick) {
 // The trampoline borrows x16: place probes only at function entries or at points where x16 is dead; the original instruction must not be PC-relative (adr/adrp/b/bl/ldr literal/cbz...).
 #define MAX_PROBE 16
 typedef void (*probe_fn)(ucontext_t *uc);
-static struct { uint64_t at; uint32_t *slot; unsigned hits; char name[40]; long dump; probe_fn fn; } g_probe[MAX_PROBE];   // dump：命中时打印 [x0+dump] 16 字节（-1 = 不打）；fn：专用处理（替代缺省打印） | dump: on hit print 16 bytes at [x0+dump] (-1 = do not print); fn: dedicated handler (replaces the default print)
+// count：计数模式（`@c`）——命中只做一次原子自增，不打印、不取字符串、不做反符号化；
+// 头 3 次仍给全量（拿参数），之后每 1 秒最多一行，另有 5 秒一次的汇总行与卡住时的全表（dm_probe_dump_counts）。
+// 为什么要有：每次命中都打印 x0..x3 + 字符串 + 回溯 + dladdr 的做法，在每秒上千次的点上会把这个客体线程楔死
+// （正是「大 I/O 楔死」那条铁律），于是高频点只能靠"零命中 / 命中 4 次"这种极脆的判据——2026-10-28 连错三轮就是这个原因。
+// count: count-only mode (`@c`) — a hit does one atomic increment and no printing, no string reads, no symbolization;
+// the first 3 hits still print everything (to get the arguments), then at most one line per second, plus a 5 s summary and
+// a full table on stall (dm_probe_dump_counts). Why: printing x0..x3 + strings + backtrace + dladdr on every hit wedges that
+// guest thread at any point hit thousands of times per second (the "large I/O wedges the guest" rule), leaving high-frequency
+// points measurable only by fragile "zero hits / 4 hits" readings — the reason three rounds in a row went wrong on 2026-10-28.
+static struct { uint64_t at; uint32_t *slot; unsigned hits; char name[40]; long dump; probe_fn fn;
+                int count; _Atomic uint64_t cnt, last_print; } g_probe[MAX_PROBE];   // dump：命中时打印 [x0+dump] 16 字节（-1 = 不打）；fn：专用处理（替代缺省打印） | dump: on hit print 16 bytes at [x0+dump] (-1 = do not print); fn: dedicated handler (replaces the default print)
 static int g_nprobe;
 static void probe_str(uint64_t p) {
     char buf[80]; vm_size_t got = 0;
@@ -172,7 +182,23 @@ static int probe_hit(ucontext_t *uc) {   // 由 probe_install 注册给 crash.c 
     for (int i = 0; i < g_nprobe; i++) if (g_probe[i].at == pc) {
         probe_dump_once();
         if (g_probe[i].fn) { g_probe[i].hits++; g_probe[i].fn(uc); UC_PC(uc) = (uint64_t)g_probe[i].slot; return 1; }
-        { extern uint64_t g_t0_ns; uint64_t now_ns(void); fprintf(stderr, "[dm] PROBE %s #%u [%.4fs]", g_probe[i].name, ++g_probe[i].hits, (now_ns() - g_t0_ns) / 1e9); }
+        extern uint64_t g_t0_ns; uint64_t now_ns(void);
+        uint64_t t = now_ns();
+        // 计数模式：头 3 次给全量，之后 1 秒最多一行（只有 x0/x1 两个数，不取字符串）
+        // Count mode: full detail for the first 3 hits, then at most one line per second (just x0/x1, no string reads)
+        if (g_probe[i].count) {
+            uint64_t n = ++g_probe[i].cnt;
+            if (n > 3) {
+                if (t - g_probe[i].last_print < 1000000000ull) { UC_PC(uc) = (uint64_t)g_probe[i].slot; return 1; }
+                g_probe[i].last_print = t;
+                fprintf(stderr, "[dm] CNT %s = %llu [%.4fs] x0=%#llx x1=%#llx\n", g_probe[i].name, (unsigned long long)n,
+                        (t - g_t0_ns) / 1e9, (unsigned long long)UC_X(uc, 0), (unsigned long long)UC_X(uc, 1));
+                UC_PC(uc) = (uint64_t)g_probe[i].slot;
+                return 1;
+            }
+            g_probe[i].last_print = t;
+        }
+        { fprintf(stderr, "[dm] PROBE %s #%u [%.4fs]", g_probe[i].name, ++g_probe[i].hits, (t - g_t0_ns) / 1e9); }
         for (int r = 0; r < 4; r++) { uint64_t v = UC_X(uc, r); fprintf(stderr, " x%d=%#llx", r, v); probe_str(v); }
         for (int r = 19; r < 24; r++) fprintf(stderr, " x%d=%#llx", r, UC_X(uc, r));
         { uint64_t x8 = UC_X(uc, 8); Dl_info di; fprintf(stderr, " x8=%#llx", x8);   // x8：间接调用目标常在这里（blr x8 前下探针） | x8: indirect call targets are often here (probe placed before blr x8)
@@ -192,7 +218,7 @@ static int probe_hit(ucontext_t *uc) {   // 由 probe_install 注册给 crash.c 
     return 0;
 }
 static uint32_t *g_slots; static int g_slots_sealed;
-static void probe_add(module_t *m, uint64_t off, long dump, probe_fn fn) {
+static void probe_add(module_t *m, uint64_t off, long dump, probe_fn fn, int count) {
     if (g_nprobe >= MAX_PROBE) die("探针过多");
     if (!g_slots) g_slots = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     uint64_t at = (uint64_t)m->base + off;
@@ -207,9 +233,61 @@ static void probe_add(module_t *m, uint64_t off, long dump, probe_fn fn) {
     mprotect((void *)pg, 0x4000, PROT_READ | PROT_EXEC);
     sys_icache_invalidate(w, 4);
     g_probe[g_nprobe].at = at; g_probe[g_nprobe].slot = sl; g_probe[g_nprobe].dump = dump; g_probe[g_nprobe].fn = fn;
+    g_probe[g_nprobe].count = count;
     snprintf(g_probe[g_nprobe].name, sizeof g_probe[0].name, "%s+%#llx", m->name, off);
-    LOG("探针 %s（原指令 %08x）", g_probe[g_nprobe].name, sl[0]);
+    LOG("探针 %s（原指令 %08x）%s", g_probe[g_nprobe].name, sl[0], g_probe[g_nprobe].count ? "［计数模式］" : "");
     g_nprobe++;
+}
+
+// ---------- 计数模式的汇总：5 秒一行（短、低频，不会被 hilog 回绕吃掉）+ 卡住时全表 ----------
+// 判读法：**入口计数** 与 **返回点计数** 的差值直接指出阻塞落在哪一段——
+// 入口涨而返回点不动 = 卡在两者之间那次调用里；两者同涨 = 调用在正常返回、问题在更上层（每帧重做）。
+// ---------- Count-mode summary: one line every 5 s (short and infrequent, never eaten by the hilog ring) + full table on stall ----------
+// How to read it: the gap between the **entry count** and the **return-point count** says exactly where the block is —
+// entry rising while the return point stands still = stuck inside that one call; both rising = calls return normally and the
+// problem is further up (redone every frame).
+void dm_probe_dump_counts(void) {
+    int any = 0; for (int i = 0; i < g_nprobe; i++) if (g_probe[i].count) any = 1;
+    if (!any) return;
+    fprintf(stderr, "[dm] 探针计数：");
+    for (int i = 0; i < g_nprobe; i++) if (g_probe[i].count)
+        fprintf(stderr, " %s=%llu", g_probe[i].name, (unsigned long long)g_probe[i].cnt);
+    fputc('\n', stderr);
+}
+static void *probe_ticker(void *p) {
+    (void)p;
+    double prev_u = -1, prev_s = -1;
+    for (;;) {
+        struct timespec ts = {5, 0}; nanosleep(&ts, NULL);
+        dm_probe_dump_counts();
+        // 进程 CPU 拆成用户态 / 内核态，外加缺页计数——这三项合起来回答"主线程到底在干什么"：
+        //   · 用户态每 5 秒涨满 5 秒 ⇒ 客体代码自己满速转（真的循环/忙等）；
+        //   · 内核态涨满 ⇒ 一直卡在同一条指令的内核处理里（缺页、writeback、异常重试）；
+        //   · 两个都不涨 ⇒ 其实在等（那时 pc 只是"最后停下的地方"）。
+        // 缺页计数单独给：钩子接住的缺页不会打日志，只有它能证明"有没有在反复缺页"。
+        // Process CPU split into user / system, plus the fault counter — together they answer "what is the main thread doing":
+        //   user time +5 s per 5 s  => guest code itself spins at full speed (a real loop / busy wait);
+        //   system time +5 s       => stuck in the kernel's handling of one instruction (fault, writeback, exception retry);
+        //   neither grows          => it is actually waiting (the pc then is just where it stopped).
+        // The fault counter is separate: faults taken by a hook print nothing, so it is the only proof of a fault storm.
+        double cpu = -1, usu = -1, sys = -1;
+        FILE *sf = fopen("/proc/self/stat", "r");
+        if (sf) {
+            char buf[1024]; size_t n = fread(buf, 1, sizeof buf - 1, sf); fclose(sf); buf[n] = 0;
+            char *q = strrchr(buf, ')');
+            if (q) { long long v[20]; int k = 0;
+                for (char *t = strtok(q + 1, " "); t && k < 20; t = strtok(NULL, " ")) v[k++] = atoll(t);   // q+1 起：字段 3 起 | from q+1 = field 3 onwards
+                if (k >= 13) { usu = (double)v[11] / 100.0; sys = (double)v[12] / 100.0; cpu = usu + sys; } }
+        }
+        if (cpu >= 0) {
+            unsigned long long fn = 0, fpc = 0, fad = 0;
+            { void dm_fault_stats(unsigned long long *, unsigned long long *, unsigned long long *); dm_fault_stats(&fn, &fpc, &fad); }
+            fprintf(stderr, "[dm] 进程 CPU %.2fs | 用户 %.2fs 内核 %.2fs | 缺页 %llu 最后 pc=%#llx addr=%#llx\n",
+                    cpu, usu, sys, fn, (unsigned long long)fpc, (unsigned long long)fad);
+            if (prev_u >= 0) fprintf(stderr, "[dm]    +/5s：用户 %+.2fs  内核 %+.2fs\n", usu - prev_u, sys - prev_s);
+            prev_u = usu; prev_s = sys;
+        }
+    }
 }
 
 #endif   // !TARGET_OS_IPHONE（DM_PROBE）
@@ -483,10 +561,19 @@ void probe_install(void) {
             for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, t)) m = &g_mod[i];
             if (!m) die("DM_PROBE 无此模块 %s", t);
             char *at_ = strchr(c + 1, '@');
-            long dump = -1;
-            if (at_) dump = at_[1] == '*' ? (0x1000000 | strtol(at_ + 2, 0, 16)) : strtol(at_ + 1, 0, 16);   // @偏移 / @*偏移 | @offset / @*offset
-            probe_add(m, strtoull(c + 1, 0, 16), dump, NULL);
+            long dump = -1; int count = 0;
+            if (at_) {
+                if (at_[1] == 'c') count = 1;                                    // @c：只计数（高频点专用） | @c: count only (for high-frequency points)
+                else dump = at_[1] == '*' ? (0x1000000 | strtol(at_ + 2, 0, 16)) : strtol(at_ + 1, 0, 16);   // @偏移 / @*偏移 | @offset / @*offset
+            }
+            probe_add(m, strtoull(c + 1, 0, 16), dump, NULL, count);
         }
+    }
+    {   // 起汇总线程：有计数探针，或显式要了周期读数（DM_DIAG_TICK=1，拿进程 CPU 与缺页计数）
+        // Start the summary thread: any counting probe, or an explicit periodic reading (DM_DIAG_TICK=1: process CPU + fault count)
+        int any = getenv("DM_DIAG_TICK") != NULL;
+        for (int i = 0; i < g_nprobe; i++) if (g_probe[i].count) any = 1;
+        if (any) { pthread_t t; if (!pthread_create(&t, NULL, probe_ticker, NULL)) pthread_detach(t); }
     }
     if (g_slots && !g_slots_sealed) { mprotect(g_slots, 0x4000, PROT_READ | PROT_EXEC); sys_icache_invalidate(g_slots, 0x4000); g_slots_sealed = 1; }
 #endif
@@ -500,7 +587,7 @@ static pthread_t g_sample_pt;
 // Do only async-signal-safe things in the signal handler: copy pc / lr / the frame pointer chain into a lock-free ring buffer; symbolization and printing are done by the sampling thread
 // (it once called fprintf directly in the handler: if the interrupted thread happened to hold the stderr lock, the handler deadlocked on itself and the guest main thread hung)
 #define SRING 1024
-static struct { uint64_t t, pc, lr, bt[16]; int n; uint32_t h; } g_sring[SRING];
+static struct { uint64_t t, pc, lr, bt[16]; uint64_t x19, x20; int n; uint32_t h; } g_sring[SRING];   // x19/x20：停住时能看出"在操作哪个对象" | x19/x20: tells which object is being operated on when it stops
 static _Atomic unsigned g_shead;
 static void on_sample(int sig, siginfo_t *si, void *uc_) {
     (void)sig; (void)si; ucontext_t *uc = uc_;
@@ -508,6 +595,7 @@ static void on_sample(int sig, siginfo_t *si, void *uc_) {
     extern uint64_t now_ns(void);
     uint32_t thr_cur_handle(void);
     g_sring[i].h = thr_cur_handle(); g_sring[i].t = now_ns(); g_sring[i].pc = UC_PC(uc); g_sring[i].lr = UC_LR(uc);
+    g_sring[i].x19 = UC_X(uc, 19); g_sring[i].x20 = UC_X(uc, 20);
     uint64_t fp = UC_FP(uc); int n = 0;
     // 帧链用安全读：被打断的函数可能把 x29 当普通寄存器用（直接解引用曾段错误）
     // The frame chain uses safe reads: the interrupted function may be using x29 as an ordinary register (a direct dereference once segfaulted)
@@ -523,8 +611,44 @@ static void on_sample(int sig, siginfo_t *si, void *uc_) {
 }
 int thr_find_by_name(const char *name, pthread_t *out);
 static const char *g_sample_name;
+// ---------- DM_HIST=1：机内 pc 直方图（高频采样 + 就地聚合，每 5 秒只打前 8 名）----------
+// 为什么需要：100 Hz 采样一条 5 条指令的循环，只能拿到"其中一个"——这正是"主线程为什么永远停在
+// 0xa66094"卡了两轮的原因（样本量不足以分辨"一条指令被打转"和"一小段被打转"）。
+// 而每条采样都打一行日志又会让日志爆量、把客体线程拖慢。折中：采样提到 2 ms，聚合在宿主做。
+// ---------- DM_HIST=1: in-process pc histogram (high-rate sampling, aggregated in place, only the top 8 every 5 s) ----------
+// Why: sampling a 5-instruction loop at 100 Hz mostly returns "one of them" -- exactly why "why is the main thread always at
+// 0xa66094" has survived two rounds; the sample count cannot tell "one instruction spinning" from "a short span spinning".
+// Printing a line per sample floods the log and slows the guest, so: sample at 2 ms and aggregate on the host.
+#define HIST_SLOT 1024
+static struct { uint64_t pc; uint32_t n; } g_hist[HIST_SLOT];
+static unsigned g_hist_total;
+static void hist_add(uint64_t pc) {
+    unsigned h = (unsigned)((pc * 0x9e3779b97f4a7c15ull) >> 54) & (HIST_SLOT - 1);
+    for (unsigned k = 0; k < HIST_SLOT; k++) {
+        unsigned s = (h + k) & (HIST_SLOT - 1);
+        if (g_hist[s].n && g_hist[s].pc != pc) continue;
+        if (!g_hist[s].n) g_hist[s].pc = pc;
+        g_hist[s].n++; g_hist_total++;
+        return;
+    }
+}
+static void hist_print(void) {
+    if (!g_hist_total) return;
+    fprintf(stderr, "[dm] PC 直方图：%u 条采样，前 8：", g_hist_total);
+    for (int rank = 0; rank < 8; rank++) {
+        int best = -1; uint32_t bn = 0;
+        for (int s = 0; s < HIST_SLOT; s++) if (g_hist[s].n > bn) { bn = g_hist[s].n; best = s; }
+        if (best < 0) break;
+        fprintf(stderr, " ["); off("", g_hist[best].pc); fprintf(stderr, " x%u %.0f%%]", bn, 100.0 * bn / g_hist_total);
+        g_hist[best].n = 0;   // 取走即清零：每个窗口只统计自己的样本 | take-and-clear: each window counts only its own samples
+    }
+    fputc('\n', stderr);
+    g_hist_total = 0;
+}
 static void *sampler(void *p) {
     useconds_t us = (useconds_t)(uintptr_t)p; unsigned printed = 0;
+    int hist = getenv("DM_HIST") != NULL;
+    uint64_t hist_next = 0;
     for (;;) {
         usleep(us);
         if (g_sample_name && !strcmp(g_sample_name, "*")) {        // 全部客体线程轮一遍 | Cycle through all guest threads
@@ -537,8 +661,22 @@ static void *sampler(void *p) {
         for (unsigned h = atomic_load(&g_shead); printed < h; printed++) {
             unsigned i = printed % SRING;
             extern uint64_t g_t0_ns;
+            if (hist) {   // 直方图模式：只累加，不打每行 | histogram mode: accumulate only, no per-sample line
+                hist_add(g_sring[i].pc);
+                if (!hist_next) { extern uint64_t now_ns(void); hist_next = now_ns() + 5000000000ull; }
+                else { extern uint64_t now_ns(void); if (now_ns() >= hist_next) { hist_print(); hist_next = now_ns() + 5000000000ull; } }
+                continue;
+            }
             fprintf(stderr, "[dm] SAMPLE #%u [%.3fs] thr=%#x", printed + 1, (g_sring[i].t - g_t0_ns) / 1e9, g_sring[i].h); off("pc", g_sring[i].pc); off("lr", g_sring[i].lr);
-            fprintf(stderr, "\n[dm] bt:"); for (int k = 0; k < g_sring[i].n; k++) off("", g_sring[i].bt[k]); fputc('\n', stderr);
+            fprintf(stderr, " x19=%#llx x20=%#llx", (unsigned long long)g_sring[i].x19, (unsigned long long)g_sring[i].x20);
+            // 回溯只在头 3 条与每 20 条打一次：高频采样时每条都带回溯会把日志与客体线程一起拖死，
+            // 而"主线程到底停在哪"靠 pc 分布（按 pc 聚合出直方图）就够判。
+            // Backtrace only for the first 3 and every 20th: a backtrace on every sample drags both the log and the guest
+            // thread down, while the pc distribution (aggregated into a histogram) already answers "where does the main thread live".
+            if (printed < 3 || printed % 20 == 19) {
+                fprintf(stderr, "\n[dm] bt:"); for (int k = 0; k < g_sring[i].n; k++) off("", g_sring[i].bt[k]);
+            }
+            fputc('\n', stderr);
         }
     }
 }
