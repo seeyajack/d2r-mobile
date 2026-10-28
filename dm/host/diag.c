@@ -241,6 +241,19 @@ static int probe_hit(ucontext_t *uc) {   // 由 probe_install 注册给 crash.c 
                 }
             }
         }
+        // np445：`@p<偏移>` —— 转储 [sp+偏移] 的 16 字节原始内容。
+        // 用途：判据经常放在栈上（例如 `cmp w8,#0x35` 里的 w8 来自 `ldr w8,[sp,#0x18]`），
+        // 而探针默认只打寄存器，看不到这些值，导致"条件失败但不知道差多少"。
+        // np445: `@p<offset>` -- dump the raw 16 bytes at sp+offset. Criteria are often spilled to the stack
+        // (the w8 of `cmp w8,#0x35` comes from `ldr w8,[sp,#0x18]`), and the probe only prints registers.
+        if (g_probe[i].count == 3) {
+            uint8_t nb[16]; vm_size_t g = 0;
+            uint64_t at2 = UC_SP(uc) + (uint64_t)g_probe[i].dump;
+            fprintf(stderr, " [sp+%#lx]=", g_probe[i].dump);
+            if (!vm_read_overwrite(mach_task_self(), at2, sizeof nb, (vm_address_t)nb, &g) && g == sizeof nb) {
+                for (int k = 0; k < (int)sizeof nb; k++) fprintf(stderr, "%02x", nb[k]);
+            } else fprintf(stderr, "?");
+        }
         fputc('\n', stderr);
         dm_backtrace(UC_FP(uc));
         UC_PC(uc) = (uint64_t)g_probe[i].slot;
@@ -266,7 +279,7 @@ static void probe_add(module_t *m, uint64_t off, long dump, probe_fn fn, int cou
     g_probe[g_nprobe].at = at; g_probe[g_nprobe].slot = sl; g_probe[g_nprobe].dump = dump; g_probe[g_nprobe].fn = fn;
     g_probe[g_nprobe].count = count;
     snprintf(g_probe[g_nprobe].name, sizeof g_probe[0].name, "%s+%#llx", m->name, off);
-    LOG("探针 %s（原指令 %08x）%s", g_probe[g_nprobe].name, sl[0], g_probe[g_nprobe].count == 1 ? "［计数模式］" : g_probe[g_nprobe].count == 2 ? "［取串］" : "");
+    LOG("探针 %s（原指令 %08x）%s", g_probe[g_nprobe].name, sl[0], g_probe[g_nprobe].count == 1 ? "［计数模式］" : g_probe[g_nprobe].count == 2 ? "［取串］" : g_probe[g_nprobe].count == 3 ? "［栈转储］" : "");
     g_nprobe++;
 }
 
@@ -597,6 +610,7 @@ void probe_install(void) {
             if (at_) {
                 if (at_[1] == 'c') count = 1;                                    // @c：只计数（高频点专用） | @c: count only (for high-frequency points)
                 else if (at_[1] == 's') { count = 2; dump = (long)strtol(at_ + 2, 0, 16); }   // @s<偏移>：把 [x0+偏移] 当 char* 再打出来（np434b） | @s<offset>: treat [x0+offset] as a char* and print it
+                else if (at_[1] == 'p') { count = 3; dump = (long)strtol(at_ + 2, 0, 16); }   // @p<偏移>：转储 [sp+偏移] 16 字节（判据常放在栈上） | @p<offset>: dump 16 bytes at sp+offset
                 else dump = at_[1] == '*' ? (0x1000000 | strtol(at_ + 2, 0, 16)) : strtol(at_ + 1, 0, 16);   // @偏移 / @*偏移 | @offset / @*offset
             }
             probe_add(m, strtoull(c + 1, 0, 16), dump, NULL, count);
