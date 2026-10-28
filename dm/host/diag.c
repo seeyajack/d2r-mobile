@@ -210,6 +210,19 @@ static int probe_hit(ucontext_t *uc) {   // 由 probe_install 注册给 crash.c 
             if (at && !vm_read_overwrite(mach_task_self(), at, 16, (vm_address_t)b, &got) && got == 16) {
                 fprintf(stderr, " [%s%#lx]=", (g_probe[i].dump & 0x1000000) ? "*x0+" : "x0+", g_probe[i].dump & 0xffffff); for (int k = 0; k < 16; k++) fprintf(stderr, "%02x", b[k]); }
         }
+        // np434：**x1 处的原始 16 字节**。有些"名字"不是普通 C 串，而是 {指针, 长度} 或 UTF-16，
+        // probe_str 读不出来时只有字节能说话（np434 就是这样：查询返回 0，而名字串一个字都没打出来）。
+        // np434: raw 16 bytes at x1. Some "names" are not plain C strings but {ptr, len} or UTF-16; when probe_str
+        // prints nothing, only the bytes can speak (np434: the lookup returned 0 and the name printed as nothing).
+        {
+            uint8_t b[16]; vm_size_t got = 0; uint64_t a1 = UC_X(uc, 1);
+            if (a1 && !vm_read_overwrite(mach_task_self(), a1, 16, (vm_address_t)b, &got) && got == 16) {
+                fprintf(stderr, " [x1 16B]=");
+                for (int k = 0; k < 16; k++) fprintf(stderr, "%02x", b[k]);
+                fprintf(stderr, " |");
+                for (int k = 0; k < 16; k++) fputc(b[k] >= 0x20 && b[k] < 0x7f ? b[k] : '.', stderr);
+            }
+        }
         fputc('\n', stderr);
         dm_backtrace(UC_FP(uc));
         UC_PC(uc) = (uint64_t)g_probe[i].slot;
