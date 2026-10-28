@@ -255,6 +255,7 @@ static void host_preload(int argc, char **argv) {
     load_modules(argv[1], names, n);
     uint64_t ta = now_ns();
     probe_install();   // DM_PROBE 探针（诊断用） | DM_PROBE probes (for diagnostics)
+    { void dm_msgq_install(void); dm_msgq_install(); }   // DM_MQ / DM_MQ_POLL：消息队列记账与可选轮询收（hle_msgq.c） | Message-queue accounting and the optional polling receive (hle_msgq.c)
     ticks_install();   // DM_TICKS 逐拍状态哈希（拍入口观测门） | DM_TICKS per-tick state hash (tick-entry observation gate)
     { void target_rank_install(void); target_rank_install(); }   // 触屏版自动选怪 Boss > 精英 > 普通（hle_target.c） | Touch version auto-targeting Boss > elite > normal (hle_target.c)
     hid_keys_init();   // DM_KEYS 脚本输入（按 UI 消息驱动的步骤要在消息出现前订阅） | DM_KEYS scripted input (steps driven by UI messages must subscribe before the message appears)
