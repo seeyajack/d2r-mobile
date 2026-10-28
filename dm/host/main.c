@@ -94,7 +94,22 @@ static void guest_main(void) {
     // install_botw_fakelock();
     LOG(">>> nnosInitialize"); ((fn2)req("nnosInitialize"))(hmain, 0);
     ((fn0)req("_init_libc1"))();
-    LOG(">>> nninitInitializeSdkModule"); ((fn0)req("nninitInitializeSdkModule"))();
+    // np438 通用性修正：`nninitInitializeSdkModule` 不是每个构建都导出。
+    // 1.0.0 的 main 导出它（一个很小的函数：oe::Initialize → aoc::Initialize → fs::SetLocalAccessLog
+    // → pctl::Initialize → fs::SetResultHandledByApplication → diag::InitializeApplicationAbortObserver）；
+    // 1.6.0 的 main 只剩 21 个导出、没有它 —— 因为这一段被**内联进 nnMain** 了
+    // （main+0xe53864 起：oe::Initialize → SetPerformanceConfiguration → SetCpuBoostMode → GetHostArgc…）。
+    // 所以没导出就跳过，不要 die：这是"换版本/换游戏只换输入"该有的行为。
+    // np438 genericity: `nninitInitializeSdkModule` is not exported by every build. 1.0.0's main exports it (a tiny
+    // function: oe::Initialize -> aoc::Initialize -> fs::SetLocalAccessLog -> pctl::Initialize ->
+    // fs::SetResultHandledByApplication -> tail-call diag::InitializeApplicationAbortObserver). 1.6.0's main has only
+    // 21 exports and not that one, because the block was **inlined into nnMain** (from main+0xe53864: oe::Initialize ->
+    // SetPerformanceConfiguration -> SetCpuBoostMode -> GetHostArgc ...). So skip it when absent instead of dying.
+    {
+        void *p = guest_sym("nninitInitializeSdkModule");
+        if (p) { LOG(">>> nninitInitializeSdkModule"); ((fn0)p)(); }
+        else LOG("【黄】本构建未导出 nninitInitializeSdkModule（1.6.0 起内联进 nnMain）：跳过这一步");
+    }
     LOG(">>> nninitStartup"); ((fn0)req("nninitStartup"))();
     ((fn0)req("_init_libc2"))();
     dm_prof_mark("② SDK 初始化（nnosInitialize → nninitStartup）");
