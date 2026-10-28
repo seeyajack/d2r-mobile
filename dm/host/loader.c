@@ -538,8 +538,7 @@ unsigned long dm_guest_malloc_stat(unsigned long *fail) {
 // The host .so is far beyond `b`'s +-128MB reach from the guest image, so the first 16 bytes become
 //   ldr x16, [pc,#8] ; br x16 ; <8-byte target address>
 // which covers exactly 4 instructions (all prologue, dead once we tail-jump away).
-static void guest_redirect(uint8_t *at, void *fn, uint32_t expect0, const char *why) {
-    uintptr_t pg = (uintptr_t)at & ~(uintptr_t)0xfff;
+static void guest_redirect(uint8_t *at, void *fn, uint32_t expect0, const char *why) {    uintptr_t pg = (uintptr_t)at & ~(uintptr_t)0xfff;
     size_t len = ((uintptr_t)at & 0xfff) + 16;
     if (*(volatile uint32_t *)at != expect0) {
         LOG("【红】改跳 %s：原值 %#x ≠ 期望 %#x，不改（构建号不符？）", why, *(volatile uint32_t *)at, expect0);
@@ -558,6 +557,26 @@ static void guest_redirect(uint8_t *at, void *fn, uint32_t expect0, const char *
 // np386：把上面这个改跳能力开放给宿主其它文件（断言钩子要用）。
 // np386: expose the redirect above to other host files (the assertion hook needs it).
 void dm_guest_redirect(uint8_t *at, void *fn, uint32_t expect0, const char *why) { guest_redirect(at, fn, expect0, why); }
+
+// np439：**按符号名**改跳，不写死地址、不写死指令字。
+// 为什么：客体 libc 分配器（malloc/calloc/realloc）原来写成 main+0x9b27a0 / 0x9b2810 / 0x9b2888，
+// 换 1.6.0 后这三条一律红字失败（"原值 ≠ 期望（构建号不符？）"）。但 1.0.0 的 .dynsym 里
+// `malloc` 的地址**正好就是 0x9b27a0**（calloc/realloc 同理）——本来就能按名字取，不该写死。
+// 这里只要求首指令"像一个函数序言"（非 0、非 b/bl/cbz 一类），不再断言具体指令字。
+// np439: redirect **by symbol name** -- no hardcoded address, no hardcoded instruction word.
+// Why: the guest libc allocators used to be hardcoded as main+0x9b27a0 / 0x9b2810 / 0x9b2888, and on 1.6.0 all
+// three fail their byte assertion. But in 1.0.0's .dynsym `malloc` *is* 0x9b27a0 (ditto calloc/realloc), so they
+// can be resolved by name. Only require the first word to look like a prologue (non-zero, not b/bl/cbz).
+static void guest_redirect_sym(module_t *m, const char *sym, void *fn, const char *why) {
+    void *p = guest_sym(sym);
+    if (!p) { LOG("【红】改跳 %s 跳过：%s 里没有符号 %s（该构建可能没导出它）", why, m->name, sym); return; }
+    uint32_t first = *(volatile uint32_t *)p;
+    if (!first || (first >> 26) == 0x05u || (first >> 26) == 0x25u || (first & 0xFF000010u) == 0x54000000u) {
+        LOG("【红】改跳 %s 跳过：%s（%p）首指令 %08x 不像函数序言", why, sym, p, first);
+        return;
+    }
+    guest_redirect((uint8_t *)p, fn, first, why);
+}
 
 // np296：AArch64 `b` 指令编码（同一个模块内，±128MB 射程）。
 // np379：adrp 编码（rd <- page(addr)，以 insn_at 为基准）
@@ -821,9 +840,13 @@ static void guest_libc_hook(void) {
     // replica is incomplete, so rather than chase it, jump straight to the host malloc and make
     // allocation always succeed. The free side 0x9f36a0 looks the owning allocator up by pointer
     // (0xa0dfcc) and skips when not found, so the worst case is a leak, never a cross-allocator free.
-    guest_redirect(mm->base + 0x9b27a0, (void *)(uintptr_t)&guest_malloc, 0xA9BF7BFDu, "客体 malloc");
-    guest_redirect(mm->base + 0x9b2810, (void *)(uintptr_t)&calloc, 0xA9BE4FF4u, "客体 calloc");
-    guest_redirect(mm->base + 0x9b2888, (void *)(uintptr_t)&realloc, 0xA9BF7BFDu, "客体 realloc");
+    // np439：改成按符号名解析（1.0.0 的 .dynsym 里 malloc/calloc/realloc 正好是 0x9b27a0/0x9b2810/0x9b2888，
+    // 与原来写死的地址一致；1.6.0 里它们在 0x1d421e0/0x1d42260/0x1d422e0，同一段代码不用改就能用）。
+    // np439: resolve by symbol name (in 1.0.0 .dynsym malloc/calloc/realloc are exactly the old hardcoded
+    // 0x9b27a0/0x9b2810/0x9b2888; in 1.6.0 they are 0x1d421e0/0x1d42260/0x1d422e0 -- same code, no per-build constant).
+    guest_redirect_sym(mm, "malloc", (void *)(uintptr_t)&guest_malloc, "客体 malloc");
+    guest_redirect_sym(mm, "calloc", (void *)(uintptr_t)&calloc, "客体 calloc");
+    guest_redirect_sym(mm, "realloc", (void *)(uintptr_t)&realloc, "客体 realloc");
 }
 
 // np301：装载后**主动清 icache**。
