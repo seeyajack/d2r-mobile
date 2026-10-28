@@ -145,7 +145,7 @@ typedef void (*probe_fn)(ucontext_t *uc);
 // a full table on stall (dm_probe_dump_counts). Why: printing x0..x3 + strings + backtrace + dladdr on every hit wedges that
 // guest thread at any point hit thousands of times per second (the "large I/O wedges the guest" rule), leaving high-frequency
 // points measurable only by fragile "zero hits / 4 hits" readings — the reason three rounds in a row went wrong on 2026-10-28.
-static struct { uint64_t at; uint32_t *slot; unsigned hits; char name[40]; long dump; probe_fn fn;
+static struct { uint64_t at, modbase; uint32_t *slot; unsigned hits; char name[40]; long dump; probe_fn fn;
                 int count; _Atomic uint64_t cnt, last_print; } g_probe[MAX_PROBE];   // dump：命中时打印 [x0+dump] 16 字节（-1 = 不打）；fn：专用处理（替代缺省打印） | dump: on hit print 16 bytes at [x0+dump] (-1 = do not print); fn: dedicated handler (replaces the default print)
 static int g_nprobe;
 static void probe_str(uint64_t p) {
@@ -246,6 +246,18 @@ static int probe_hit(ucontext_t *uc) {   // 由 probe_install 注册给 crash.c 
         // 而探针默认只打寄存器，看不到这些值，导致"条件失败但不知道差多少"。
         // np445: `@p<offset>` -- dump the raw 16 bytes at sp+offset. Criteria are often spilled to the stack
         // (the w8 of `cmp w8,#0x35` comes from `ldr w8,[sp,#0x18]`), and the probe only prints registers.
+        // np451：`@m<偏移>` —— 转储 [模块基址+偏移] 的 16 字节。
+        // 用途：查"加载期才填"的东西（导入蹦床、GOT 槽）。这些位置在文件里是 0，只有运行时才有值。
+        // np451: `@m<offset>` -- dump 16 bytes at module_base+offset. For things filled only at load time
+        // (import trampolines, GOT slots), whose file content is zero.
+        if (g_probe[i].count == 4) {
+            uint8_t nb[16]; vm_size_t g = 0;
+            uint64_t at3 = g_probe[i].modbase + (uint64_t)g_probe[i].dump;
+            fprintf(stderr, " [mod+%#lx]=%#llx:", g_probe[i].dump, (unsigned long long)at3);
+            if (!vm_read_overwrite(mach_task_self(), at3, sizeof nb, (vm_address_t)nb, &g) && g == sizeof nb) {
+                for (int k = 0; k < (int)sizeof nb; k++) fprintf(stderr, "%02x", nb[k]);
+            } else fprintf(stderr, "?");
+        }
         if (g_probe[i].count == 3) {
             uint8_t nb[16]; vm_size_t g = 0;
             uint64_t at2 = UC_SP(uc) + (uint64_t)g_probe[i].dump;
@@ -276,10 +288,11 @@ static void probe_add(module_t *m, uint64_t off, long dump, probe_fn fn, int cou
     *w = 0xD43E0000;                             // brk #0xf000
     mprotect((void *)pg, 0x4000, PROT_READ | PROT_EXEC);
     sys_icache_invalidate(w, 4);
-    g_probe[g_nprobe].at = at; g_probe[g_nprobe].slot = sl; g_probe[g_nprobe].dump = dump; g_probe[g_nprobe].fn = fn;
+    g_probe[g_nprobe].at = at; g_probe[g_nprobe].modbase = (uint64_t)m->base;   // np451：@m<偏移> 用
+    g_probe[g_nprobe].slot = sl; g_probe[g_nprobe].dump = dump; g_probe[g_nprobe].fn = fn;
     g_probe[g_nprobe].count = count;
     snprintf(g_probe[g_nprobe].name, sizeof g_probe[0].name, "%s+%#llx", m->name, off);
-    LOG("探针 %s（原指令 %08x）%s", g_probe[g_nprobe].name, sl[0], g_probe[g_nprobe].count == 1 ? "［计数模式］" : g_probe[g_nprobe].count == 2 ? "［取串］" : g_probe[g_nprobe].count == 3 ? "［栈转储］" : "");
+    LOG("探针 %s（原指令 %08x）%s", g_probe[g_nprobe].name, sl[0], g_probe[g_nprobe].count == 1 ? "［计数模式］" : g_probe[g_nprobe].count == 2 ? "［取串］" : g_probe[g_nprobe].count == 3 ? "［栈转储］" : g_probe[g_nprobe].count == 4 ? "［模块内存转储］" : "");
     g_nprobe++;
 }
 
@@ -611,6 +624,7 @@ void probe_install(void) {
                 if (at_[1] == 'c') count = 1;                                    // @c：只计数（高频点专用） | @c: count only (for high-frequency points)
                 else if (at_[1] == 's') { count = 2; dump = (long)strtol(at_ + 2, 0, 16); }   // @s<偏移>：把 [x0+偏移] 当 char* 再打出来（np434b） | @s<offset>: treat [x0+offset] as a char* and print it
                 else if (at_[1] == 'p') { count = 3; dump = (long)strtol(at_ + 2, 0, 16); }   // @p<偏移>：转储 [sp+偏移] 16 字节（判据常放在栈上） | @p<offset>: dump 16 bytes at sp+offset
+                else if (at_[1] == 'm') { count = 4; dump = (long)strtoull(at_ + 2, 0, 16); }   // @m<偏移>：转储 [模块基址+偏移] 16 字节（np451：查加载期填的表/蹦床） | @m<offset>: dump 16 bytes at module_base+offset
                 else dump = at_[1] == '*' ? (0x1000000 | strtol(at_ + 2, 0, 16)) : strtol(at_ + 1, 0, 16);   // @偏移 / @*偏移 | @offset / @*offset
             }
             probe_add(m, strtoull(c + 1, 0, 16), dump, NULL, count);
