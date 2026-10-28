@@ -588,6 +588,23 @@ NVN(nvnTextureViewSetLevels, void, NVNtextureView *v, int base, int n) { VW(v)->
 NVN(nvnTextureViewSetLayers, void, NVNtextureView *v, int min, int n) { VW(v)->set_layers = 1; VW(v)->min_layer = min; VW(v)->nlayers = n; }
 NVN(nvnTextureViewSetFormat, void, NVNtextureView *v, NVNformat f) { VW(v)->set_format = 1; VW(v)->format = f; }
 NVN(nvnTextureViewSetTarget, void, NVNtextureView *v, NVNtextureTarget t) { VW(v)->set_target = 1; VW(v)->target = t; }
+
+// np449：1.6.0 会调这三个"视图/设备属性"接口，1.0.0 时代没见过。
+// 它们都只影响"取图时的寻址/清屏色"，翻译侧目前按格式与层数取值，所以这里**记录 + 放行**即可；
+// 一旦后面发现取色不对，再回来把它们接进翻译路径。
+// np449: 1.6.0 calls these three view/device property setters (1.0.0 never did). They only affect
+// sampling address mode / clear colour; the translation side currently derives everything from format
+// and layer counts, so recording and letting them through is enough for now.
+NVN(nvnTextureViewSetSwizzle, void, NVNtextureView *v, int r, int g, int b, int a) {
+    (void)v; static int once; if (!once++) OLOG("TextureViewSetSwizzle %d,%d,%d,%d（只记录）", r, g, b, a);
+}
+NVN(nvnTextureViewSetDepthStencilMode, void, NVNtextureView *v, int m) {
+    (void)v; static int once; if (!once++) OLOG("TextureViewSetDepthStencilMode %d（只记录）", m);
+}
+NVN(nvnDeviceRegisterFastClearColor, void, NVNdevice *d, const float *c, int fmt) {
+    (void)d; static int once;
+    if (!once++) OLOG("DeviceRegisterFastClearColor %.3f %.3f %.3f %.3f fmt=%d（只记录）", c[0], c[1], c[2], c[3], fmt);
+}
 NVN(nvnTextureViewGetLayers, NVNboolean, const NVNtextureView *v, int *min, int *n) {
     const view_t *o = (const view_t *)v; *min = o->min_layer; *n = o->nlayers; return o->set_layers;
 }
@@ -676,6 +693,23 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
     if (n < 0 || n > 6) { LOG("【红】ProgramSetShaders 阶段数 %d", n); return 0; }
     snap_drop(&o->snap, o->serial, offsetof(prog_t, serial)); mtl_prog_release(o); o->nstage = n; memcpy(o->sd, sd, n * sizeof *sd); o->serial = nvn_new_serial();
     OLOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)p, n, n ? (unsigned long long)sd[0].data : 0ull);
+    return 1;
+}
+
+// np449：`nvnProgramSetShadersExt` —— 新版接口，头文件里没有（NVN 后加的）。
+// 先按 SetShaders 的布局（每项 0x10：{data, control}）拷贝并**首次转储首项**，
+// 用日志判断真实步长是不是 0x10；若不是（例如多了 stage 字段变成 0x18），再改这里。
+// np449: `nvnProgramSetShadersExt` is a later NVN addition missing from our header. Copy with the
+// SetShaders layout ({data, control} = 0x10 per entry) and dump the first entry once so the log tells
+// us whether the real stride is 0x10 or something else (e.g. 0x18 with an explicit stage field).
+NVN_NOPROTO(nvnProgramSetShadersExt, NVNboolean, NVNprogram *p, int n, const void *sd) {
+    prog_t *o = (prog_t *)p;
+    static int once;
+    if (!once++) { const uint64_t *w = (const uint64_t *)sd;
+        OLOG("ProgramSetShadersExt 首次 n=%d 首项 %#llx %#llx %#llx %#llx", n, w[0], w[1], w[2], w[3]); }
+    if (n < 0 || n > 6) { LOG("【红】ProgramSetShadersExt 阶段数 %d", n); return 0; }
+    snap_drop(&o->snap, o->serial, offsetof(prog_t, serial)); mtl_prog_release(o);
+    o->nstage = n; memcpy(o->sd, sd, (size_t)n * sizeof(NVNshaderData)); o->serial = nvn_new_serial();
     return 1;
 }
 
