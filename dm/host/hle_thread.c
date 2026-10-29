@@ -933,7 +933,40 @@ void hle_bind_system_event(void *ev, int autoclear) {      // 必须在客体线
     if (g_nse >= (int)(sizeof g_se / sizeof g_se[0])) die("SystemEvent 绑定表满");
     g_se[g_nse].ev = ev; g_se[g_nse++].wh = wh;
     pthread_mutex_unlock(&g_se_lock);
+    { void se_tick_start(void); se_tick_start(); }   // np467：第一个事件绑定后就把假音频时钟起起来
 }
+// np467：**假音频时钟**。我们的 AudioRenderer 是空实现，没有任何回调去"放行已播缓冲"，
+// 于是游戏卡在 `WaitSync 等事件 h=0x1003/0x1012 signaled=0 超时=-1`（那两个句柄正是
+// hle_bind_system_event 建出来的读端）。这里起一个宿主线程，按 ~60 Hz 把**所有已绑定的**
+// SystemEvent signal 一遍，模拟"缓冲被消费"的节奏；事件是 auto-clear 的，多 signal 无害。
+// 关掉用 DM_SE_TICK=0。
+// np467: fake audio clock. Our AudioRenderer is a stub, so nothing ever releases played buffers and the
+// guest blocks in WaitSync on the read ends (0x1003 / 0x1012) forever. A host thread signals every bound
+// SystemEvent at ~60 Hz to emulate buffer consumption; the events are auto-clear so extra signals are
+// harmless. DM_SE_TICK=0 disables it.
+static void *se_tick(void *a) {
+    (void)a;
+    for (;;) {
+        usleep(16000);
+        void *evs[64]; int n = 0;
+        pthread_mutex_lock(&g_se_lock);
+        for (int i = 0; i < g_nse && n < 64; i++) evs[n++] = g_se[i].ev;
+        pthread_mutex_unlock(&g_se_lock);
+        for (int i = 0; i < n; i++) hle_signal_system_event(evs[i]);
+    }
+    return NULL;
+}
+void se_tick_start(void) {
+    static int started;
+    if (started) return;
+    const char *e = getenv("DM_SE_TICK");
+    if (e && *e == '0') { LOG("【黄】假音频时钟已关（DM_SE_TICK=0）"); return; }
+    started = 1;
+    pthread_t t; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, 256 << 10);
+    if (!pthread_create(&t, &at, se_tick, NULL)) LOG("假音频时钟已起：每 16ms signal 一遍已绑定的 SystemEvent（DM_SE_TICK=0 可关）");
+    else LOG("【红】假音频时钟起线程失败");
+}
+
 void hle_signal_system_event(void *ev) {   // 未绑定的按手动清除即时绑定（只能在客体线程上发生） | An unbound one is bound on the spot as manual-clear (can only happen on a guest thread)
     pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock);
     if (!wh) { hle_bind_system_event(ev, 0); pthread_mutex_lock(&g_se_lock); wh = se_find(ev); pthread_mutex_unlock(&g_se_lock); }

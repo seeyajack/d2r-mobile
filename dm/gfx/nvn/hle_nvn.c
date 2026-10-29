@@ -2099,7 +2099,13 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
 // 为什么用**宿主侧边表**而不是写进游戏给的 NVNbuffer：那是游戏分配的不透明结构，
 // 我们不知道它多大，写进去会越界。边表按对象指针查即可。
 typedef struct { void *dev, *pool; ptrdiff_t off; size_t size; } buf_builder_t;
-#define BUF_MAX 512
+// np468：边表原来是 512 条，而 BotW 建的缓冲区远不止这个数（实测 BufferMap 反复返回同一块
+// 暂存区 = `buf_find` 查不到 = 表满后新缓冲区根本没登记）⇒ 数据写不到该去的地方，游戏循环重试。
+// 放大到 8192，并在满时打一次红字（以后再满就看得见）。
+// np468: the side table was 512 entries, but BotW creates far more buffers; once full, new buffers were
+// never registered, BufferMap kept returning the scratch area and the game looped. Raised to 8192 with a
+// one-shot red log when it fills up.
+#define BUF_MAX 8192
 static struct { const void *obj; void *mem; ptrdiff_t off; size_t size; } g_buf[BUF_MAX];
 static int g_nbuf, g_buf_warned;
 static uint8_t g_buf_scratch[2u << 20];          // 兜底：游戏传空对象时给它一块能用的内存
@@ -2118,6 +2124,7 @@ NVN_NOPROTO(nvnBufferInitialize, int, void *b, const void *bd) {
     void *mem = bb->pool ? (void *)((const pool_t *)bb->pool)->mem : NULL;
     int i = buf_find(b);
     if (i < 0 && g_nbuf < BUF_MAX) { i = g_nbuf++; g_buf[i].obj = b; }
+    else if (i < 0) { static int warned; if (!warned) { warned = 1; LOG("【红】缓冲区边表已满（%d），后续 nvnBufferMap 只能给暂存区", BUF_MAX); } }
     if (i >= 0) { g_buf[i].mem = mem; g_buf[i].off = bb->off; g_buf[i].size = bb->size; }
     return 1;                                    // NVN_TRUE
 }

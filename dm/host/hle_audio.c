@@ -487,9 +487,18 @@ HLE_FORCE("_ZN2nn5audio25GetReleasedAudioOutBufferEPNS0_8AudioOutE", "取已播�
 HLE_FORCE("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11SystemEventERKNS0_22AudioRendererParameterEPvm",
           "打开音频渲染器：宿主无 audren 服务，给假句柄并返回成功", uint32_t, h_audio_open,
           uint32_t *handle, void *event, const void *param, void *workbuf, size_t worksize) {
-    (void)event; (void)param; (void)workbuf; (void)worksize;
+    (void)param; (void)workbuf; (void)worksize;
     if (handle) *handle = 0x41520001u;
-    static int once; if (!once++) LOG("audio：OpenAudioRenderer 假实现（返回成功，句柄 %#x）", 0x41520001u);
+    // np466 ★ 调用方传进来的那个 SystemEvent **必须真的建出来**。
+    // 证据：游戏的对象头是 `[+0]=1(状态) [+8]=0x41520001(我们给的句柄) [+0x98]=全零`，
+    // 而 +0x98 就是它内嵌的 SystemEvent；随后 `nn::os::SignalSystemEvent` 读 [+0x28] 的类型字节，
+    // 既不是 1 也不是 2 ⇒ 断言（且断言消息为 NULL，格式化时又空解引用，把现场盖掉）。
+    // 走我们已有的 hle_bind_system_event（内部用 SDK 的 CreateSystemEvent → SVC 0x45 真句柄）。
+    // np466: the SystemEvent the caller passes in MUST really be created. Evidence: the game's object is
+    // `[+0]=1 (state) [+8]=0x41520001 (our handle) [+0x98]=all zero`, and +0x98 is its embedded SystemEvent;
+    // SignalSystemEvent then reads the type byte at +0x28, finds neither 1 nor 2 and asserts.
+    if (event) { void hle_bind_system_event(void *, int); hle_bind_system_event(event, 0); }
+    static int once; if (!once++) LOG("audio：OpenAudioRenderer 假实现（返回成功，句柄 %#x，event=%p）", 0x41520001u, event);
     return 0;
 }
 HLE_FORCE("_ZN2nn5audio18StartAudioRendererENS0_19AudioRendererHandleE", "启动渲染器：空实现", uint32_t, h_audio_start, uint32_t h) {
