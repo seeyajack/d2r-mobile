@@ -134,15 +134,24 @@ HLE("setlocale", char *, h_setlocale, int category, const char *locale) {
     return r;
 }
 // newlocale / uselocale / freelocale：同一族，一并接上（掩码同样换算）
+// np512：假 locale 句柄（musl 对部分组合返回 0 时的兜底；freelocale 对它空操作）
+static int g_oe_locale_dummy[4] = {0x1C, 0};
 HLE("newlocale", void *, h_newlocale, int mask, const char *name, void *base) {
     if ((unsigned)mask == 0x7fffffff) mask = LC_ALL_MASK;
     void *r = newlocale(mask, name, base);
     // np302：locale 句柄为 0 时客体不一定判空（np240 曾在同族上栽过：把 -1 当 locale 指针 memset）
-    if (!r) LOG("【红】newlocale(%#x, %s)：宿主 libc 返回 NULL（客体若不判空必崩）", mask, name ? name : "(null)");
+    if (!r) {
+        // np512：主循环放出后 libdms2 的 locale 初始化走到这里（newlocale 返回 0 → 调用方 abort）。
+        r = (void *)g_oe_locale_dummy;
+        LOG("【黄】newlocale(%#x, %s) 返回 NULL → 假句柄 %p 兜底", mask, name ? name : "(null)", r);
+    }
     return r;
 }
 HLE("uselocale", void *, h_uselocale, void *l) { return uselocale(l); }
-HLE("freelocale", void, h_freelocale, void *l) { freelocale(l); }
+HLE("freelocale", void, h_freelocale, void *l) {
+    if (l == (void *)g_oe_locale_dummy) return;   // np512：假句柄不释放
+    freelocale(l);
+}
 
 // ── C++ 静态构造守卫（np242）──
 // 客体 sdk 自带一份 __cxa_guard_acquire（sdk+0x2ee860），它内部先调 **导入** nn::os::LockMutex
