@@ -479,22 +479,42 @@ uint64_t dm_tlsval(unsigned slot) { return slot < TLS_MAX ? g_tlsval[slot] : 0; 
 // "事件参数块处理"（12f30d0 → 1cf2fb0，找 tag 0x2001 的消息节点）会因参数块全 0 而崩
 // —— 脉冲需要配套的参数块布局（nn::oe 消息），见 np502。在全零（安全）与完整实现之间，
 // 先回 0 保主循环健康；np504 再做参数块。
-static uint8_t g_oe_event_obj[0x40];   // 全零：无事件，主循环健康空转
+// np521 ★ 默认**不再 pin**（原来的 pin 语义已被证伪，见下）。
+//   np520 纠错：0x2d23e58 / 0x2d23e5a 不是"事件对象指针"，是同一个 .bss 对象里的**字节标志**
+//   （所在的指针槽 0x2c7fb38 / 0x2c7fb40 由 RELA 指向它们，代码 `ldr x8,[x8,#0xb38]; ldrb w8,[x8]`）。
+//   旧实现把 8 字节宿主指针**写进对象本体**（第二笔还与第一笔重叠 6 字节）⇒ 游戏读到的"标志"是
+//   堆地址低字节，随 ASLR 漂移；其真实效果是"把 Atk(音频库) 的 initialized 标志弄成非 0 ⇒ 跳过 Atk 初始化"。
+//   np521 真机证据：跳过初始化后，snd(声音系统) 对象 +0x560 处的节点从没被填过类型半字，
+//   到 0x1cf2fb0 找 0x2001 找不到 ⇒ x8=0 ⇒ `ldr w0,[x8,#8]` 崩在 addr=0x8。
+//   所以默认**什么都别做**：让游戏用自己的 .bss 对象（首字节本来就是 0）把 Atk 初始化真跑一遍。
+//   DM_OE_PIN=1 恢复旧行为，仅用于对照（会把 Atk 初始化再跳过）。
+// np521: no pin by default -- the old pin's semantics were disproved (see np520 above).
+//   0x2d23e58 / 0x2d23e5a are *byte flags* inside one .bss object (the pointer slots 0x2c7fb38 /
+//   0x2c7fb40 are relocated to point at them; the code does `ldr x8,[x8,#0xb38]; ldrb w8,[x8]`).
+//   The old code wrote an 8-byte host pointer into the object body (and the second write overlapped the
+//   first by 6 bytes), so the flag the game read was the low byte of a heap address, drifting with ASLR.
+//   Its real effect was "make Atk's (audio library) initialized flag non-zero => skip Atk init".
+//   np521 device evidence: with init skipped, the node at snd (sound system) +0x560 never got its type
+//   halfword, so 0x1cf2fb0 found no 0x2001, x8 became 0 and `ldr w0,[x8,#8]` faulted at addr=0x8.
+//   Hence: do nothing by default -- let the game use its own .bss object (first byte is 0 anyway) and
+//   actually run Atk init. DM_OE_PIN=1 restores the old behaviour for comparison only.
+static uint8_t g_oe_event_obj[0x40];   // 旧 pin 用的宿主缓冲（仅 DM_OE_PIN=1 时用到）
 void dm_pin_oe_event(void) {
+    const char *e = getenv("DM_OE_PIN");
+    if (!e || !*e || *e == '0') {
+        LOG("oe 事件槽不 pin（np521）：让 Atk 初始化真跑；要恢复旧行为用 DM_OE_PIN=1");
+        return;
+    }
     module_t *mm = NULL;
     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mm = &g_mod[i]; break; }
     if (!mm) { LOG("【红】oe 事件：main 模块未装载"); return; }
     uint8_t *b = mm->base;
-    // np501：两个槽都要 pin——0x2d23e58（1cf5580 读）与 0x2d23e5a（1cf5a10 读）。
-    // np498 首字节=1 那次崩的 LockMutex(NULL) 其实是 1cf5a10 读第二个野指针，不是消费路径。
-    // 但"有事件"还要让 1cf5580 的成功分支后续调用（1cfcba0/1cff940）不踩别的野数据，
-    // 稳妥起见仍先给全零（无事件）跑通主循环，两个指针都合法即可。
     uint64_t slots[2] = { 0x2d23e58, 0x2d23e5a };
     for (int i = 0; i < 2; i++) {
         uint64_t slot = (uint64_t)(uintptr_t)b + slots[i];
         void *cur = *(void **)(uintptr_t)slot;
         *(volatile void **)(uintptr_t)slot = (void *)g_oe_event_obj;
-        LOG("oe 事件队列已接管：main+%#llx %p → %p（全零=无事件）", (unsigned long long)slots[i], cur, (void *)g_oe_event_obj);
+        LOG("【对照】oe 事件槽已 pin：main+%#llx %p → %p（会让 Atk 初始化被跳过）", (unsigned long long)slots[i], cur, (void *)g_oe_event_obj);
     }
 }
 
@@ -514,6 +534,22 @@ static void *oe_msg_thread(void *a) {
         module_t *mm = NULL;
         for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mm = &g_mod[i]; break; }
         if (!mm) continue;
+        // np520 ★ 先确认映像装得下那两个硬编码偏移，再解引用。
+        //   `main+0x2cbe0018` / `+0x9f8` 是 **D2R 的布局**；BotW 1.6.0 的 main 映像只有约 48 MB，
+        //   0x2cbe0018 落在映像外约 715 MB 处 ⇒ `ldr x9,[x8,x25]` 当场 SIGSEGV。
+        //   真机实测：pc = 宿主 .so+0x15a414（= oe_msg_thread+0x90），addr = base+0x2cbe0018。
+        //   映像基址随 ASLR 变 ⇒ 这一刀有时落进别的映射（读到垃圾、被后面守卫滤掉），有时落进空洞（当场死）
+        //   ⇒ **间歇性崩**，正是过去几轮"这轮说无崩、下轮莫名死"的来源。np509 的范围守卫在解引用**之后**，防不住第一刀。
+        //   D2R 的映像装得下 ⇒ 这一行对它是空操作（行为零变化）。
+        // np520: verify the image can hold those two hard-coded offsets before dereferencing them.
+        //   `main+0x2cbe0018` / `+0x9f8` is the *D2R* layout; BotW's 1.6.0 main image is only ~48 MB, so
+        //   0x2cbe0018 sits ~715 MB outside it and `ldr x9,[x8,x25]` faults at once. On device: pc =
+        //   host .so+0x15a414 (= oe_msg_thread+0x90), addr = base+0x2cbe0018. The base moves with ASLR, so the
+        //   read lands in another mapping sometimes (garbage, filtered by the guard below) and in a hole other
+        //   times (instant death) -- an intermittent crash, the source of past rounds' "no crash / died anyway".
+        //   np509's range guard runs *after* the dereference, so it cannot stop this first one.
+        //   D2R's image holds them, so this line is a no-op there (zero behaviour change).
+        if (mm->size < 0x2cbe0018ull + 8) continue;
         uint8_t *b = mm->base;
         uint64_t sing = *(volatile uint64_t *)(b + 0x2cbe0018);
         if (!sing) continue;
