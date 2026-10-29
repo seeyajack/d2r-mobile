@@ -55,7 +55,20 @@ extern void *nvn_thunk[NVN_NFUNC];
 extern const char *nvn_names[NVN_NFUNC];
 extern void nvn_unimpl_entry(void);
 extern void nvn_prof_entry(void);
-__attribute__((visibility("hidden"))) void *nvn_real[NVN_NFUNC];               // 同上（隐藏可见性）
+__attribute__((visibility("hidden"))) void *nvn_real[NVN_NFUNC];
+
+// np452：宿主地址 → NVN 名字。NVN 的 523 个入口都是"计数跳板"（每个 0x3C 字节），
+// 所以崩溃/探针里出现的 .so 地址落在某个跳板范围内时，能直接说是哪个 nvnXxx。
+// np452: host address -> NVN name. All 523 NVN entries are counting thunks (0x3C bytes each), so an address
+// inside one of them can be named directly.
+const char *dm_nvn_whos(const void *p) {
+    const uint8_t *q = (const uint8_t *)p;
+    for (unsigned i = 0; i < NVN_NFUNC; i++) {
+        const uint8_t *b = (const uint8_t *)nvn_thunk[i];
+        if (q >= b && q < b + 0x3C) return nvn_names[i];
+    }
+    return NULL;
+}               // 同上（隐藏可见性）
 __attribute__((visibility("hidden"))) _Atomic uint64_t nvn_prof_ticks[NVN_NFUNC]; // 同上（隐藏可见性）
 static uint8_t g_unimpl_seen[NVN_NFUNC];
 
@@ -2122,7 +2135,26 @@ NVN_NOPROTO(nvnBufferGetAddress, uint64_t, const void *b, ptrdiff_t off) {
 NVN_NOPROTO(nvnBufferGetSize, size_t, const void *b) { int i = buf_find(b); return i >= 0 ? g_buf[i].size : 0; }
 NVN_NOPROTO(nvnBufferGetMemoryPool, void *, const void *b) { (void)b; return NULL; }
 NVN_NOPROTO(nvnBufferGetMemoryOffset, ptrdiff_t, const void *b) { int i = buf_find(b); return i >= 0 ? g_buf[i].off : 0; }
-NVN_NOPROTO(nvnBufferMap, void *, void *b) { (void)b; return NULL; }
+// np453 ★ 这是 1.6.0 启动崩溃的直接原因：`nvnBufferMap` 原来是"返回 NULL"的空桩，
+// 而游戏拿到返回值**不判空**直接 memcpy 往里写 ⇒ addr=0 崩（pc=sdk+0x33b0d8）。
+// 语义按 NVN：返回该缓冲区可被 CPU 访问的首地址 = 池内存 + builder 偏移。
+// 与 `nvnBufferGetAddress` 同策略：边表查不到（空缓冲区/没走 builder）时给暂存区兜底，
+// **绝不返回 0** —— 0 在调用方眼里就是合法地址。
+// np453: this was the direct cause of the 1.6.0 boot crash: nvnBufferMap used to be a "return NULL"
+// stub, and the game memcpy's into the result without a null check (addr=0 crash). Per NVN it returns the
+// CPU-accessible start of the buffer = pool memory + builder offset. Same policy as nvnBufferGetAddress:
+// fall back to the scratch area when the side table has no entry, and **never return 0**.
+NVN_NOPROTO(nvnBufferMap, void *, void *b) {
+    int i = buf_find(b);
+    uint8_t *m = (i >= 0) ? (uint8_t *)g_buf[i].mem : NULL;
+    ptrdiff_t base = (i >= 0) ? g_buf[i].off : 0;
+    if (!m) {
+        if (!g_buf_warned) { g_buf_warned = 1; LOG("【黄】nvnBufferMap 拿到空缓冲区（b=%p）⇒ 暂存区兜底", b); }
+        m = g_buf_scratch;
+    }
+    OLOG("BufferMap %p → %p", b, (void *)(m + base));
+    return m + base;
+}
 NVN_NOPROTO(nvnBufferFlushMappedRange, void, const void *b, ptrdiff_t o, size_t n) { (void)b; (void)o; (void)n; }
 NVN_NOPROTO(nvnBufferInvalidateMappedRange, void, const void *b, ptrdiff_t o, size_t n) { (void)b; (void)o; (void)n; }
 NVN_NOPROTO(nvnBufferGetDebugID, int, const void *b) { (void)b; return 0; }
