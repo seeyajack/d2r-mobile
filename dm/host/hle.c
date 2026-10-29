@@ -34,7 +34,8 @@ uint64_t resolve_import(module_t *m, const char *name, int weak) {
     if (!sec) DM_SECT_GET(swhle, const hle_ent, sec, secsz);
     for (unsigned i = 0; i < secsz / sizeof(hle_ent); i++)
         if (!strcmp(sec[i].name, name)) {
-            if (g_flag.imports) { Dl_info di; dladdr(sec[i].fn, &di); LOG("import %s -> %s", name, di.dli_sname); }
+            // np452：把绑定到的宿主地址也打出来 —— 崩溃回溯里出现的宿主地址才能对上"是哪个导入"
+            if (g_flag.imports) { Dl_info di; dladdr(sec[i].fn, &di); LOG("import %s -> %p %s", name, (void *)sec[i].fn, di.dli_sname); }
             void *hlecount_wrap(const char *, const char *, void *); return (uint64_t)hlecount_wrap("HLE", name, sec[i].fn);   // DM_HLECOUNT 时为计数桩（含 libc 直通表） | With DM_HLECOUNT it is a counting stub (including the libc passthrough table)
         }
     // 未解析的弱导入保持零，让客体能检测可选函数缺失。
@@ -102,4 +103,26 @@ uint64_t gate_dispatch(uint64_t ret_addr, uint64_t *regs) {
         }
         if (!g->ret) die("unknown gate at %#llx", ret_addr);
     }
+}
+
+// np452：宿主地址 → 导入名。崩溃/探针里出现宿主地址时，直接说"这是哪个导入"，
+// 不用再去 .so 的符号表里翻（我们的 HLE 实现是 static，符号表里本来就没名字）。
+// 两张表都要查：HLE 导入（swhle）与 NVN 入口（swnvn）。
+// np452: host address -> import name. When a crash or a probe shows a host address, say which import it is
+// instead of digging through the .so symbol table (our HLE implementations are static and unnamed there).
+// Both tables must be searched: HLE imports (swhle) and NVN entries (swnvn).
+typedef struct { const char *name; void *fn; } nvn_impl_lite;
+const char *dm_whos(const void *p) {
+    static const hle_ent *sec; static unsigned long secsz;
+    if (!sec) DM_SECT_GET(swhle, const hle_ent, sec, secsz);
+    for (unsigned long i = 0; i < secsz / sizeof(hle_ent); i++)
+        if (sec[i].fn && (const uint8_t *)p >= (const uint8_t *)sec[i].fn &&
+            (const uint8_t *)p < (const uint8_t *)sec[i].fn + 0x400) return sec[i].name;
+    static const nvn_impl_lite *im; static unsigned long isz;
+    { DM_SECT_GET(swnvn, const nvn_impl_lite, im, isz); }
+    for (unsigned long i = 0; i < isz / sizeof(nvn_impl_lite); i++)
+        if (im[i].fn && (const uint8_t *)p >= (const uint8_t *)im[i].fn &&
+            (const uint8_t *)p < (const uint8_t *)im[i].fn + 0x400) return im[i].name;
+    { const char *dm_nvn_whos(const void *); const char *n = dm_nvn_whos(p); if (n) return n; }
+    return NULL;
 }

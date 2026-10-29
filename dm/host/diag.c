@@ -256,6 +256,12 @@ static int probe_hit(ucontext_t *uc) {   // 由 probe_install 注册给 crash.c 
             fprintf(stderr, " [mod+%#lx]=%#llx:", g_probe[i].dump, (unsigned long long)at3);
             if (!vm_read_overwrite(mach_task_self(), at3, sizeof nb, (vm_address_t)nb, &g) && g == sizeof nb) {
                 for (int k = 0; k < (int)sizeof nb; k++) fprintf(stderr, "%02x", nb[k]);
+                {   // np452：内容若是指向宿主实现的指针，直接说它是哪个导入
+                    uint64_t v0; memcpy(&v0, nb, 8);
+                    const char *dm_whos(const void *);
+                    const char *w = dm_whos((const void *)(uintptr_t)v0);
+                    if (w) fprintf(stderr, " ⇒ %s", w);
+                }
             } else fprintf(stderr, "?");
         }
         if (g_probe[i].count == 3) {
