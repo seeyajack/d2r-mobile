@@ -627,7 +627,8 @@ int svc_thread(int num, uint64_t *regs) {
         // "the main thread sleeps and nobody wakes it", and the thread table only shows the SDK wrapper.
         { thr_t *me0 = pthread_getspecific(g_keythr);
           if (me0 && me0->handle == 0x1001) {
-              static int once0; if (!once0) { once0 = 1;
+              static unsigned n0;   // np495：改为每 200 次打一条——栈上的 fp 链值可能是**陈旧残留**
+              if (++n0 % 200 == 1) {
                   module_t *mc = module_of((void *)regs[30]);
                   LOG("主线程 SleepThread(ns=%lld) 调用者=%s+%#llx", (long long)ns,
                       mc ? mc->name : "?", mc ? (uint64_t)regs[30] - (uint64_t)mc->base : (uint64_t)regs[30]);
