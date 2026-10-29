@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <string.h>
 #include "hle.h"
+#include <dlfcn.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <stdatomic.h>
@@ -538,4 +539,32 @@ void dm_oe_msg_start(void) {
     static int started; if (started) return; started = 1;
     pthread_t t; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, 256 << 10);
     if (!pthread_create(&t, &at, oe_msg_thread, NULL)) LOG("oe 帧消息线程已起（16ms 注入 tag 0x2001）");
+}
+
+
+// np514 ★ libdms2 自己调 musl 的 newlocale（不经过客体 GOT，HLE 拦不到）：
+//   musl 对部分 mask/locale 组合返回 0 ⇒ libdms2 的调用方走 abort 分支崩（libdms2+0x159588）。
+//   修法：启动时把 libdms2 的 GOT 槽 0x235538（newlocale）改写为下面的包装函数。
+void *dm_host_newlocale(int mask, const char *name, void *base) {
+    void *r = newlocale(mask, name, base);
+    if (!r) {
+        static int dummy[4] = {0x1C, 0};
+        r = dummy;
+        static int once; if (!once++) LOG("【黄】libdms2 newlocale(mask=%#x, %s)=NULL → 假句柄兜底", mask, name ? name : "(null)");
+    }
+    return r;
+}
+__attribute__((used)) void dm_anchor_symbol(void) {}   // np514：dlsym 锚点（基址自举，不受重编译漂移影响）
+void dm_pin_libdms2_newlocale(void) {
+    void *sym = dlsym(RTLD_DEFAULT, "dm_anchor_symbol");
+    if (!sym) { LOG("【红】dlsym 锚点失败，跳过 newlocale GOT 接管"); return; }
+    Dl_info di; if (!dladdr(sym, &di)) { LOG("【红】dladdr 锚点失败"); return; }
+    uint64_t self = (uint64_t)(uintptr_t)di.dli_fbase;
+    uint64_t anchor_vaddr = 0x15a934;   // dm_host_newlocale 的 so 内 vaddr（本轮构建实测）
+    // dli_fbase 是加载基址；dm_host_newlocale 运行地址 = self + vaddr，用它反推（不依赖锚点偏移）
+    (void)anchor_vaddr;
+    uint64_t got = (uint64_t)(uintptr_t)di.dli_fbase + 0x235538;
+    void *cur = *(void **)(uintptr_t)got;
+    *(volatile void **)(uintptr_t)got = (void *)&dm_host_newlocale;
+    LOG("libdms2 newlocale GOT 已接管：0x235538 %p → %p", cur, (void *)&dm_host_newlocale);
 }

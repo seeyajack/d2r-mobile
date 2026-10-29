@@ -118,6 +118,7 @@ static void guest_main(void) {
     { void dm_pin_alloc_got(void); dm_pin_alloc_got(); void dm_dump_alloc_state(const char *); dm_dump_alloc_state("模块构造后"); }
     { void dm_pin_oe_event(void); dm_pin_oe_event(); }   // np497：生命周期事件队列指针兜底（1.6.0 主循环 1cf5580 读它）
     { void dm_oe_msg_start(void); dm_oe_msg_start(); }   // np508：帧消息注入线程（tag 0x2001）
+    { void dm_pin_libdms2_newlocale(void); dm_pin_libdms2_newlocale(); }   // np514：libdms2 自用的 newlocale GOT 改写
     dm_prof_mark("③ 各模块 init_array");
     ((fnp)req("_ZN2nn2os11SetHostArgcEi"))((void *)(uint64_t)g_argc);
     ((fnp)req("_ZN2nn2os11SetHostArgvEPPc"))(g_argv);
