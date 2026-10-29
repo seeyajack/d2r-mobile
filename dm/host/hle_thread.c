@@ -36,7 +36,7 @@
 #define WAITERS_BIT   0x40000000u
 #define H_CUR_THREAD  0xFFFF8000u
 
-enum { O_FREE, O_THREAD, O_EVENT_R, O_EVENT_W };
+enum { O_FREE, O_THREAD, O_EVENT_R, O_EVENT_W, O_TRANSFER };   // np458：O_TRANSFER = CreateTransferMemory 的句柄
 typedef struct event { int signaled; int refs; } event_t;
 typedef struct thr {
     uint32_t handle; uint64_t id;
@@ -763,7 +763,30 @@ int svc_thread(int num, uint64_t *regs) {
         // np419: raise the cap to 64 (stall-phase waits matter too) and print EVERY handle's type --
         // the main thread may be waiting on an event / transfer object, not a thread; O_THREAD-only
         // logging would miss that.
-        { static unsigned nt; if (nt++ % 50 == 0) {   // np419b：改成采样式（每 500 次 1 条）——「前 N 次」制度会被 hilog 回绕吃光 | sampled, not capped: log wrap ate the capped ones
+        // np457：**默认关闭**。空转（等一个永远不来的对象）时这条每秒能刷上万行，
+        // 12 秒就能把 hilog 冲到 29 万行、把真正有用的早期记录（未知 SVC 首现、断言文本）全冲掉。
+        // 要排查等待就开 DM_WAITLOG=1。
+        // np457: off by default. In a spin (waiting for something that never arrives) this logs tens of
+        // thousands of lines per second -- 290k lines in 12 s, wiping the early records (first-seen unknown
+        // SVCs, assertion text). Set DM_WAITLOG=1 when investigating waits.
+        static int waitlog = -1;
+        if (waitlog < 0) { const char *e = getenv("DM_WAITLOG"); waitlog = (e && *e && *e != '0') ? 1 : 0; }
+        // np460：**越界句柄单独记一次**（不受 DM_WAITLOG 控制），并且带上调用者。
+        // 为什么要单列：空转的根源就是它——我们的等待对非法句柄立刻返回错误，游戏立刻重试，100% CPU，
+        // 看门狗 15 秒后报"无进展"。只看句柄值不知道是谁传的，所以必须带 lr。
+        // np460: report an out-of-range handle once (independent of DM_WAITLOG) together with the caller.
+        // This is the spin's root: we return an error immediately for an invalid handle, the guest retries
+        // at once, CPU goes to 100% and the watchdog reports "no progress" after 15 s.
+        for (int i = 0; i < n && i < 4; i++)
+            if ((unsigned)(hs[i] - 0x1000) >= MAX_H) {
+                static int once; if (!once++) {
+                    module_t *mc = module_of((void *)regs[30]);
+                    LOG("WaitSync 越界句柄 h=%#x 调用者=%s+%#llx 超时=%lld n=%d",
+                        hs[i], mc ? mc->name : "?", mc ? (uint64_t)regs[30] - (uint64_t)mc->base : (uint64_t)regs[30],
+                        (long long)ns, n);
+                }
+            }
+        { static unsigned nt; if (waitlog && nt++ % 50 == 0) {   // np419b：采样式 | sampled
             for (int i = 0; i < n && i < 4; i++) {
                 unsigned i_ = hs[i] - 0x1000;
                 if (i_ >= MAX_H) { LOG("WaitSync 句柄越界 h=%#x（非 0x10xx 段？）超时=%lld", hs[i], (long long)ns); continue; }   // np419c：越界也打——句柄可能根本不在 0x10xx 客体段 | log even out-of-range handles
@@ -781,7 +804,11 @@ int svc_thread(int num, uint64_t *regs) {
                 }
             }
         } }
-        { static unsigned nc; if (nc++ % 50 == 0) LOG("WaitSynchronization 调用：n=%d 超时=%lld 首句柄=%#x", n, (long long)ns, n > 0 ? hs[0] : 0); }
+        // np457：默认关闭（空转时它才是真正的刷屏源：12 秒 12 万行，把早期记录全冲掉）。要开用 DM_WAITLOG=1。
+        // np457: off by default -- in a spin this is the real flood source (120k lines in 12 s). DM_WAITLOG=1 enables it.
+        { static unsigned nc; static int wl = -1;
+          if (wl < 0) { const char *e = getenv("DM_WAITLOG"); wl = (e && *e && *e != '0') ? 1 : 0; }
+          if (wl && nc++ % 50 == 0) LOG("WaitSynchronization 调用：n=%d 超时=%lld 首句柄=%#x", n, (long long)ns, n > 0 ? hs[0] : 0); }
         // np425：CreateThread 的 arg 结构首 8 字节 = 真实线程函数指针（0x8b2d8 是统一包装）。
         // 打一次每个线程的真实入口，分辨哪个是 SystemTask 的派发线程。
         // np425: the first 8 bytes of CreateThread's arg struct hold the REAL thread function
@@ -820,12 +847,29 @@ int svc_thread(int num, uint64_t *regs) {
         pthread_mutex_unlock(&G);
         regs[0] = t ? 0 : R_BAD_HANDLE; return 1;
     }
+    case 0x15: {   // CreateTransferMemory(→x1 句柄; x1 地址, x2 大小, x3 权限)
+        // np458 ★ 1.6.0 启动卡死的直接原因：这个 SVC 原来落到默认分支——"返回成功但**不写句柄**"，
+        // 游戏拿到的是栈上的垃圾（实测 0x4），随后一直 WaitSynchronization(0x4) 空转，
+        // 看门狗报「第 15 秒起无进展，卡在 拍 0 / 阶段 nvn:EndRecording」。
+        // np458: the direct cause of the 1.6.0 boot stall. This SVC used to hit the default branch --
+        // "success but no handle written" -- so the guest got stack garbage (0x4 observed) and spun in
+        // WaitSynchronization(0x4); the watchdog reported no progress from second 15, stuck in nvn:EndRecording.
+        uint32_t *out = (uint32_t *)regs[0];
+        pthread_mutex_lock(&G);
+        uint32_t h = h_new(O_TRANSFER, (void *)(uintptr_t)regs[1]);
+        pthread_mutex_unlock(&G);
+        if (out) *out = h;
+        LOG("CreateTransferMemory(addr=%#llx size=%#llx perm=%#llx) → 句柄 %#x", regs[1], regs[2], regs[3], h);
+        regs[0] = 0; regs[1] = h; return 1;
+    }
     case 0x16: {  // CloseHandle(w0)：事件两端都关才释放；线程句柄关闭后槽位回收，对象在线程也退出后释放 | CloseHandle(w0): an event is freed only when both ends are closed; after a thread handle is closed the slot is recycled, and the object is freed once the thread has also exited
         pthread_mutex_lock(&G);
         unsigned i = (uint32_t)regs[0] - 0x1000;
         if (i > 0 && i < MAX_H && (g_h[i].type == O_EVENT_R || g_h[i].type == O_EVENT_W)) {
             event_t *e = g_h[i].obj; if (--e->refs == 0) free(e);
             g_h[i].type = O_FREE; g_h[i].obj = NULL;
+        } else if (i > 0 && i < MAX_H && g_h[i].type == O_TRANSFER) {
+            g_h[i].type = O_FREE; g_h[i].obj = NULL;      // np458：转移内存句柄只占槽位，关掉即回收
         } else if (i > 0 && i < MAX_H && g_h[i].type == O_THREAD) {
             thr_t *t = g_h[i].obj;
             g_h[i].type = O_FREE; g_h[i].obj = NULL;
@@ -862,6 +906,11 @@ void hle_bind_system_event(void *ev, int autoclear) {      // 必须在客体线
     uint32_t r = create(ev, autoclear, 1);
     if (r) die("CreateSystemEvent 失败 %#x", r);
     wh = getw(ev);
+    // np459：把 SDK 建出来的写端句柄打出来。若是垃圾值（例如 0x4），说明 SDK 的 CreateSystemEvent
+    // 内部那条"建内核事件"的路径没真正生效 —— 后面的 WaitSynchronization 就会空转在那个值上。
+    // np459: log the write-end handle the SDK produced. A garbage value (e.g. 0x4) means the SDK's
+    // CreateSystemEvent never really created the kernel event, and later waits spin on that value.
+    LOG("SystemEvent 绑定：ev=%p 写端句柄=%#x", ev, wh);
     pthread_mutex_lock(&g_se_lock);
     if (g_nse >= (int)(sizeof g_se / sizeof g_se[0])) die("SystemEvent 绑定表满");
     g_se[g_nse].ev = ev; g_se[g_nse++].wh = wh;

@@ -469,11 +469,18 @@ HLE_FORCE("_ZN2nn5audio25GetReleasedAudioOutBufferEPNS0_8AudioOutE", "取已播�
 // np454: 1.6.0 calls this and the real sdk body has no null check -- it dereferences the
 // AudioRendererConfig* argument immediately (addr=0x48 crash). We have no audio service, so the caller's
 // config stays 0. Our audio path is AudioOut (handled above), so this Renderer API is a no-op here.
+// np456 ★ 返回类型必须是 Result（uint32_t）：调用点 `bl` 之后紧跟 `mov x19,x0; cbz w19`
+// 是拿返回值当结果用的。原来按 `void` 接管 ⇒ x0 留的是垃圾 ⇒ 游戏判"失败" ⇒ 音频初始化里
+// 走断言分支（`main+0x1cfa0bc` 的 `udf #0`）。现在返回 0（成功）。
+// np456: the return type must be Result (uint32_t): right after the `bl`, the caller does
+// `mov x19,x0; cbz w19`, i.e. it uses the return value. Declaring it `void` left garbage in x0,
+// so the game treated it as a failure and took the assert branch (`udf #0` at main+0x1cfa0bc).
 HLE_FORCE("_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPKNS0_19AudioRendererConfigE",
-          "AudioRenderer 更新：宿主无 audio 服务，空实现（config 可能为 NULL，sdk 真身不判空）", void, h_audio_ReqUpdate,
+          "AudioRenderer 更新：宿主无 audio 服务，空实现并返回成功", uint32_t, h_audio_ReqUpdate,
           uint32_t handle, const void *cfg) {
     (void)handle; (void)cfg;
-    static int once; if (!once++) LOG("audio：RequestUpdateAudioRenderer 空实现（handle=%u cfg=%p）", handle, cfg);
+    static int once; if (!once++) LOG("audio：RequestUpdateAudioRenderer 空实现（handle=%u cfg=%p）→ 返回成功", handle, cfg);
+    return 0;
 }
 
 
