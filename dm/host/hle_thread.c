@@ -629,7 +629,9 @@ int svc_thread(int num, uint64_t *regs) {
                   module_t *mc = module_of((void *)regs[30]);
                   LOG("主线程 SleepThread(ns=%lld) 调用者=%s+%#llx", (long long)ns,
                       mc ? mc->name : "?", mc ? (uint64_t)regs[30] - (uint64_t)mc->base : (uint64_t)regs[30]);
-                  { void dm_backtrace_scan(uint64_t); dm_backtrace_scan(regs[29]); }
+                  // np472：用 **fp 链**（不是扫栈）——门保存区里 x29 是客体自己的 fp，链上是干净的调用序列；
+                  // np472: use the fp chain (not a stack scan) -- x29 in the gate save area is the guest's own fp.
+                  { void dm_backtrace(uint64_t); dm_backtrace(regs[29]); }
               }
           } }
         uint64_t t0 = g_flag.bootprof ? now_ns() : 0;
