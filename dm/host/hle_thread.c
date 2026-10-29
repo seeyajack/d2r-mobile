@@ -37,7 +37,7 @@
 #define H_CUR_THREAD  0xFFFF8000u
 
 enum { O_FREE, O_THREAD, O_EVENT_R, O_EVENT_W, O_TRANSFER };   // np458：O_TRANSFER = CreateTransferMemory 的句柄
-typedef struct event { int signaled; int refs; } event_t;
+typedef struct event { int signaled; int refs; int auto_clear; } event_t;   // auto_clear：被"假音频时钟"触发的事件，等待消费后自动清除（np469）
 typedef struct thr {
     uint32_t handle; uint64_t id;
     uint64_t entry, arg, stack_top; int prio, core; uint64_t mask;
@@ -850,7 +850,14 @@ int svc_thread(int num, uint64_t *regs) {
                          static int nbad; if (nbad++ < 8) { LOG("WaitSynchronization 坏句柄：n=%d 超时=%lld 句柄=", n, (long long)ns);
                              for (int i = 0; i < n && i < 4; i++) LOG("    [%d] %#x", i, hs[i]); }
                          r = R_BAD_HANDLE; break; }
-            if (idx >= 0) { r = 0; break; }
+            if (idx >= 0) {
+                // np469：消费语义——被假时钟触发过的事件，等待成功即清除（真机 auto-clear 事件的行为）
+                // np469: consume semantics -- an event signalled by the fake clock is cleared once a wait succeeds.
+                event_t *ce = h_peek(hs[idx], O_EVENT_R);
+                if (!ce) ce = h_peek(hs[idx], O_EVENT_W);
+                if (ce && ce->auto_clear) ce->signaled = 0;
+                r = 0; break;
+            }
             int64_t left = ns < 0 ? -1 : ns == 0 ? 0 : deadline - (dm_detclock_enabled() ? (int64_t)guest_ns() : now_mono_ns());
             if (ns > 0 && left <= 0) { r = R_TIMEOUT; break; }
             if (block(t, 4, left) == R_TIMEOUT) { r = R_TIMEOUT; break; }
@@ -952,7 +959,17 @@ static void *se_tick(void *a) {
         pthread_mutex_lock(&g_se_lock);
         for (int i = 0; i < g_nse && n < 64; i++) evs[n++] = g_se[i].ev;
         pthread_mutex_unlock(&g_se_lock);
-        for (int i = 0; i < n; i++) hle_signal_system_event(evs[i]);
+        for (int i = 0; i < n; i++) {
+            // np469：先打"自动清除"标记再 signal —— 否则事件一直是 signaled，
+            // 那个音频线程 20 秒发了 1601 万次 svc 0x18（每次立即返回）把 CPU 烧满。
+            // np469: mark auto-clear before signalling; otherwise the event stays signalled forever and the
+            // audio thread spun 16M svc 0x18 calls in 20 s.
+            pthread_mutex_lock(&G);
+            event_t *e = h_peek(se_find(evs[i]), O_EVENT_W);
+            if (e) e->auto_clear = 1;
+            pthread_mutex_unlock(&G);
+            hle_signal_system_event(evs[i]);
+        }
     }
     return NULL;
 }
