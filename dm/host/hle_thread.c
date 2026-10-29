@@ -618,6 +618,20 @@ int svc_thread(int num, uint64_t *regs) {
         thread_exit(cur()); return 1; }
     case 0x0B: {  // SleepThread(x0 ns)；0/-1/-2 = 各类让出 | SleepThread(x0 ns); 0/-1/-2 = the various kinds of yield
         int64_t ns = (int64_t)regs[0];
+        // np471：主线程第一次 SleepThread 时打**调用者 + 栈扫描**。现在卡点就是"主线程在睡、没人叫醒它"，
+        // 而线程表只给到 sdk+0x7b0f8c 这层 SDK 包装 —— 必须再往上一层看是谁调的。
+        // dm_backtrace_scan 已加固（vm_read_overwrite），在 SVC 现场调用也不会再崩。
+        // np471: on the main thread's first SleepThread, log the caller plus a stack scan. The blocker is now
+        // "the main thread sleeps and nobody wakes it", and the thread table only shows the SDK wrapper.
+        { thr_t *me0 = pthread_getspecific(g_keythr);
+          if (me0 && me0->handle == 0x1001) {
+              static int once0; if (!once0) { once0 = 1;
+                  module_t *mc = module_of((void *)regs[30]);
+                  LOG("主线程 SleepThread(ns=%lld) 调用者=%s+%#llx", (long long)ns,
+                      mc ? mc->name : "?", mc ? (uint64_t)regs[30] - (uint64_t)mc->base : (uint64_t)regs[30]);
+                  { void dm_backtrace_scan(uint64_t); dm_backtrace_scan(regs[29]); }
+              }
+          } }
         uint64_t t0 = g_flag.bootprof ? now_ns() : 0;
         if (ns > 0 && dm_detclock_enabled()) {
             uint64_t deadline = guest_ns() + (uint64_t)ns;
