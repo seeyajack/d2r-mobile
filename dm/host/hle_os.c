@@ -461,9 +461,16 @@ void dm_pin_oe_event(void) {
     module_t *mm = NULL;
     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mm = &g_mod[i]; break; }
     if (!mm) { LOG("【红】oe 事件：main 模块未装载"); return; }
-    uint64_t slot = (uint64_t)(uintptr_t)mm->base + 0x2d23e58;
-    void *want = (void *)g_oe_event_obj;
-    void *cur = *(void **)(uintptr_t)slot;
-    *(volatile void **)(uintptr_t)slot = want;
-    LOG("oe 事件队列已接管：main+0x2d23e58 %p → %p（首字节=1，主循环 1cf5580 将读到事件）", cur, want);
+    uint8_t *b = mm->base;
+    // np501：两个槽都要 pin——0x2d23e58（1cf5580 读）与 0x2d23e5a（1cf5a10 读）。
+    // np498 首字节=1 那次崩的 LockMutex(NULL) 其实是 1cf5a10 读第二个野指针，不是消费路径。
+    // 但"有事件"还要让 1cf5580 的成功分支后续调用（1cfcba0/1cff940）不踩别的野数据，
+    // 稳妥起见仍先给全零（无事件）跑通主循环，两个指针都合法即可。
+    uint64_t slots[2] = { 0x2d23e58, 0x2d23e5a };
+    for (int i = 0; i < 2; i++) {
+        uint64_t slot = (uint64_t)(uintptr_t)b + slots[i];
+        void *cur = *(void **)(uintptr_t)slot;
+        *(volatile void **)(uintptr_t)slot = (void *)g_oe_event_obj;
+        LOG("oe 事件队列已接管：main+%#llx %p → %p（全零=无事件）", (unsigned long long)slots[i], cur, (void *)g_oe_event_obj);
+    }
 }
