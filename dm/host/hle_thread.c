@@ -733,6 +733,23 @@ int svc_thread(int num, uint64_t *regs) {
     case 0x45: {  // CreateEvent(→w1 写端, w2 读端) | CreateEvent(→w1 write end, w2 read end)
         event_t *e = calloc(1, sizeof *e); e->refs = 2;
         pthread_mutex_lock(&G); uint32_t hw = h_new(O_EVENT_W, e), hr = h_new(O_EVENT_R, e); pthread_mutex_unlock(&G);
+        // np461：把**进来的 x0–x3** 打出来。如果 x0/x1 是客体堆里的指针（例如 0x5e…），
+        // 说明 Horizon 的约定是"出参用指针"（*x0=写端, *x1=读端），我们现在按寄存器返回就错了；
+        // 如果 x0/x1 是 0 或小整数，才是"返回值约定"。
+        // np461: log the incoming x0-x3. Guest-heap pointers mean Horizon's convention is "out params by
+        // pointer" (*x0 = write end, *x1 = read end) and our register-return convention is wrong.
+        // np461 ★ 出参是**指针**，不是返回寄存器：实测 x0/x1 都是客体堆地址（相隔 8 字节）。
+        // 原来只把句柄放在 x1/x2 返回 ⇒ SDK 的结构体里从来没被写过 ⇒ 读端是栈垃圾（实测 0x4），
+        // 于是 SDK 的等待在 100% CPU 上空转、看门狗 15 秒报"卡在 nvn:EndRecording"。
+        // 现在按 Horizon 的约定写回：*x0 = 写端, *x1 = 读端（两个都写，日志里能核对方向）。
+        // np461: the out params are POINTERS, not return registers (x0/x1 are guest-heap addresses 8 bytes
+        // apart). Returning them in x1/x2 left the SDK's struct untouched, so the read end was stack garbage
+        // (0x4 observed) and the SDK's wait spun at 100% CPU. Write back per Horizon: *x0 = write, *x1 = read.
+        if (regs[0]) *(uint32_t *)regs[0] = hw;
+        if (regs[1]) *(uint32_t *)regs[1] = hr;
+        { static int n45; if (n45 < 5) { n45++;
+            LOG("SVC 0x45 CreateEvent #%d: x0=%#llx x1=%#llx x2=%#llx x3=%#llx → 写端 %#x 读端 %#x",
+                n45, regs[0], regs[1], regs[2], regs[3], hw, hr); } }
         regs[0] = 0; regs[1] = hw; regs[2] = hr; return 1;
     }
     case 0x11: case 0x12: case 0x17: {  // SignalEvent(写端) / ClearEvent(任一端) / ResetSignal(读端，未触发报错) | SignalEvent(write end) / ClearEvent(either end) / ResetSignal(read end, error if not signaled)
@@ -784,6 +801,7 @@ int svc_thread(int num, uint64_t *regs) {
                     LOG("WaitSync 越界句柄 h=%#x 调用者=%s+%#llx 超时=%lld n=%d",
                         hs[i], mc ? mc->name : "?", mc ? (uint64_t)regs[30] - (uint64_t)mc->base : (uint64_t)regs[30],
                         (long long)ns, n);
+                    // np462：这里**不能**调 dm_backtrace_scan —— SVC 现场没有可信的 fp，实测它自己就崩（pc=dm_backtrace_scan+0x8c）。
                 }
             }
         { static unsigned nt; if (waitlog && nt++ % 50 == 0) {   // np419b：采样式 | sampled

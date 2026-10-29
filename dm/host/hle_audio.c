@@ -475,6 +475,33 @@ HLE_FORCE("_ZN2nn5audio25GetReleasedAudioOutBufferEPNS0_8AudioOutE", "取已播�
 // np456: the return type must be Result (uint32_t): right after the `bl`, the caller does
 // `mov x19,x0; cbz w19`, i.e. it uses the return value. Declaring it `void` left garbage in x0,
 // so the game treated it as a failure and took the assert branch (`udf #0` at main+0x1cfa0bc).
+// np463：`OpenAudioRenderer` 也接管。真身要走 audren:u 的 IPC（我们只有假句柄），必然失败，
+// 于是调用方的 config 一直是 NULL，SDK 内部还会去等一个永远不来的 IPC 应答
+// （实测：`WaitSync 越界句柄 h=0x4 调用者=sdk+0x7b11fc 超时≈100ms`，100% CPU 空转，卡在 nvn:EndRecording）。
+// 这里直接返回成功 + 一个假句柄；配套的 Start/Stop/Close 一并空转。
+// 目标只是"初始化不失败、能走到首帧"；真出声是之后的事（现有 AudioOut 通路不受影响）。
+// np463: take over OpenAudioRenderer too. The real body needs audren:u IPC (we only have a fake handle),
+// so the caller's config stays NULL and the SDK also waits for an IPC reply that never comes
+// (observed: WaitSync on handle 0x4 from sdk+0x7b11fc, ~100 ms timeout, 100% CPU, stuck in nvn:EndRecording).
+// Return success with a dummy handle here; Start/Stop/Close are no-ops too.
+HLE_FORCE("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11SystemEventERKNS0_22AudioRendererParameterEPvm",
+          "打开音频渲染器：宿主无 audren 服务，给假句柄并返回成功", uint32_t, h_audio_open,
+          uint32_t *handle, void *event, const void *param, void *workbuf, size_t worksize) {
+    (void)event; (void)param; (void)workbuf; (void)worksize;
+    if (handle) *handle = 0x41520001u;
+    static int once; if (!once++) LOG("audio：OpenAudioRenderer 假实现（返回成功，句柄 %#x）", 0x41520001u);
+    return 0;
+}
+HLE_FORCE("_ZN2nn5audio18StartAudioRendererENS0_19AudioRendererHandleE", "启动渲染器：空实现", uint32_t, h_audio_start, uint32_t h) {
+    (void)h; static int once; if (!once++) LOG("audio：StartAudioRenderer 空实现"); return 0;
+}
+HLE_FORCE("_ZN2nn5audio17StopAudioRendererENS0_19AudioRendererHandleE", "停止渲染器：空实现", uint32_t, h_audio_stop, uint32_t h) {
+    (void)h; return 0;
+}
+HLE_FORCE("_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE", "关闭渲染器：空实现", uint32_t, h_audio_close, uint32_t h) {
+    (void)h; return 0;
+}
+
 HLE_FORCE("_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPKNS0_19AudioRendererConfigE",
           "AudioRenderer 更新：宿主无 audio 服务，空实现并返回成功", uint32_t, h_audio_ReqUpdate,
           uint32_t handle, const void *cfg) {
