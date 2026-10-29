@@ -453,10 +453,16 @@ uint64_t dm_tlsval(unsigned slot) { return slot < TLS_MAX ? g_tlsval[slot] : 0; 
 // game reads its first byte (non-zero = event pending). On device nn::oe's init chain fills it; ours never
 // runs, leaving a wild pointer (np496 crashed on that ldrb). Host fallback: build a minimal event object
 // (first byte = 1) and point the slot at it, so the wait loop always "has an event" and returns success.
-// np498 修正：首字节必须是 **0**（无事件）。1cf5580 返回 0 = "本轮没有事件"是**正常路径**
-// （真机空闲时也返回 0），主循环 1cf5b54 会跳过事件处理继续跑。给 1 反而让游戏走"消费事件"
-// 分支，把我们的假对象当完整事件结构解引用 → LockMutex(NULL) 崩（sdk+0x860c4）。
-static uint8_t g_oe_event_obj[0x40];   // 全零：无事件，但指针合法
+// np503 修正（推翻 np498 的判断）：重读 1cf5580/1cf5a10 反汇编——两个事件对象的消费路径
+// 只读首字节，非 0 时**直接 ret（空消费）**，不碰对象其他字段。np498 那次 LockMutex(NULL)
+// 实际是音频内存池链（1cf9690，当时三池 API 还没接管），与事件对象无关。
+// 首字节=1 ⇒ 1cf5580 返回 1 ⇒ 12f2dc0 层走"有事件"处理 ⇒ 游戏认为"应用已启动"。
+// 这正是放出 RootTask 的脉冲。若三池接管不到位再崩，也是已知的下一环。
+// np503 实测：=1 时脉冲能到（1cf5580 返回 1、走事件处理），但同一大函数 12f2580 后段的
+// "事件参数块处理"（12f30d0 → 1cf2fb0，找 tag 0x2001 的消息节点）会因参数块全 0 而崩
+// —— 脉冲需要配套的参数块布局（nn::oe 消息），见 np502。在全零（安全）与完整实现之间，
+// 先回 0 保主循环健康；np504 再做参数块。
+static uint8_t g_oe_event_obj[0x40];   // 全零：无事件，主循环健康空转
 void dm_pin_oe_event(void) {
     module_t *mm = NULL;
     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mm = &g_mod[i]; break; }
