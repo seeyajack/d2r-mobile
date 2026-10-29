@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <string.h>
 #include "hle.h"
+#include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <stdatomic.h>
 
@@ -153,9 +154,12 @@ static pthread_mutex_t g_guard_mu = PTHREAD_MUTEX_INITIALIZER;
 HLE_FORCE("__cxa_guard_acquire", "宿主实现 C++ 静态构造守卫（客体版本依赖 nn::os 锁，会误报已构造）",
           int, h_guard_acquire, uint64_t *g) {
     if (!g) return 1;
-    pthread_mutex_lock(&g_guard_mu);
-    unsigned char b = *(volatile unsigned char *)g;
-    pthread_mutex_unlock(&g_guard_mu);
+    // np510：g 可能指向**未提交的客体堆页**（主循环放出后新的静态构造路径传来），直接读会 SIGSEGV。
+    // 安全读：读不到（页未映射）就当作"需要构造"返回 1。
+    unsigned char b = 0;
+    vm_size_t _gr = 0;
+    int ok = !vm_read_overwrite(mach_task_self(), (vm_address_t)g, 1, (vm_address_t)&b, &_gr) && _gr == 1;
+    if (!ok) { if (g_flag.imports) LOG("guard_acquire %p 页不可读 → 视为需构造", (void *)g); return 1; }
     if (g_flag.imports) LOG("guard_acquire %p 字节=%u -> %d", (void *)g, b, b == 0);
     // DM_GUARD_FORCE=1（排障）：恒返回 1，用来区分"守卫被误判已构造"与"根本没走守卫"
     if (getenv("DM_GUARD_FORCE")) return 1;
@@ -165,8 +169,15 @@ HLE_FORCE("__cxa_guard_release", "宿主实现 C++ 静态构造守卫：置已�
           void, h_guard_release, uint64_t *g) {
     if (!g) return;
     if (g_flag.imports) LOG("guard_release %p", (void *)g);
+    // np510：同样做安全写——页不可写就跳过（下次 acquire 会再返回"需构造"，构造函数会重跑，
+    // 这是可接受的降级：比 SIGSEGV 杀进程好）。
     pthread_mutex_lock(&g_guard_mu);
-    *(volatile unsigned char *)g = 1;
+    // 页可读性探测（acquire 已通过同款检查；可读页直接写，实验上安全）
+    unsigned char probe = 0; vm_size_t _gr = 0;
+    if (!vm_read_overwrite(mach_task_self(), (vm_address_t)g, 1, (vm_address_t)&probe, &_gr) && _gr == 1)
+        *(volatile unsigned char *)g = 1;
+    else if (g_flag.imports)
+        LOG("【黄】guard_release %p 页不可写 → 跳过，构造函数下次会重跑", (void *)g);
     pthread_mutex_unlock(&g_guard_mu);
 }
 HLE_FORCE("__cxa_guard_abort", "宿主实现 C++ 静态构造守卫：放弃",
@@ -479,4 +490,43 @@ void dm_pin_oe_event(void) {
         *(volatile void **)(uintptr_t)slot = (void *)g_oe_event_obj;
         LOG("oe 事件队列已接管：main+%#llx %p → %p（全零=无事件）", (unsigned long long)slots[i], cur, (void *)g_oe_event_obj);
     }
+}
+
+
+// np508 ★ 帧消息注入：1cf2fb0 每帧找 tag=0x2001 的消息节点，找不到就 NULL 解引用崩。
+// 缓冲地址链：main+0x2cbe0018（单例指针）→ [it]+0x9f8（消息缓冲基址，1c506f8 登记）→ +0x560+0x14（节点类型半字）。
+// 周期线程每 16ms 检查：单例就绪且节点类型 ≠ 0x2001 就写进去（幂等）。
+// np508: frame-message injection. 1cf2fb0 scans for a node with tag 0x2001 every frame and dies on NULL
+// when absent. Buffer chain: main+0x2cbe0018 (singleton ptr) -> [it]+0x9f8 (buffer base, registered at
+// 1c506f8) -> +0x560+0x14 (node type halfword). A 16 ms thread writes 0x2001 there once the singleton is up
+// (idempotent).
+static uint8_t g_oe_msg[0x40] __attribute__((aligned(8)));   // 消息节点：+0x14 = 0x2001
+static void *oe_msg_thread(void *a) {
+    (void)a;
+    for (;;) {
+        usleep(16000);
+        module_t *mm = NULL;
+        for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mm = &g_mod[i]; break; }
+        if (!mm) continue;
+        uint8_t *b = mm->base;
+        uint64_t sing = *(volatile uint64_t *)(b + 0x2cbe0018);
+        if (!sing) continue;
+        uint64_t buf = *(volatile uint64_t *)(sing + 0x9f8);
+        if (!buf) continue;
+        // np509：缓冲地址必须落在 main 模块范围内才写——否则单例字段还没初始化，
+        // 读了垃圾当基址会把消息写到随机地址（实测踩坏守卫字节，崩在 h_guard_acquire）。
+        uint64_t lo = (uint64_t)(uintptr_t)b, hi = lo + mm->size;
+        if (buf < lo || buf + 0x560 + 0x40 >= hi) continue;
+        volatile uint16_t *tag = (volatile uint16_t *)(buf + 0x560 + 0x14);
+        if (*tag != 0x2001) {
+            *tag = 0x2001;
+            LOG("oe 帧消息已注入：buf=%#llx node=%#llx tag=0x2001", (unsigned long long)buf, (unsigned long long)(buf + 0x560));
+        }
+    }
+    return NULL;
+}
+void dm_oe_msg_start(void) {
+    static int started; if (started) return; started = 1;
+    pthread_t t; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, 256 << 10);
+    if (!pthread_create(&t, &at, oe_msg_thread, NULL)) LOG("oe 帧消息线程已起（16ms 注入 tag 0x2001）");
 }
