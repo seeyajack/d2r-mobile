@@ -6,6 +6,7 @@
 #include <locale.h>
 #include <pthread.h>
 #include <string.h>
+#pragma GCC optimize("no-stack-protector")   // np518：本文件 HLE 运行在宿主上下文，canary 读可能炸（0x2342d8 槽指向未提交页）
 #include "hle.h"
 #include <dlfcn.h>
 #include <mach/mach.h>
@@ -128,6 +129,7 @@ uint64_t dm_entropy64(void) {
 // 后面 memset 那个"指针"就 SIGSEGV（np240 真机实测：memset(-1, 0, 0x40)）。
 // 另外 Horizon 的 LC_ALL 是掩码 0x7fffffff，宿主 libc（musl）的 LC_ALL 是 6——
 // 不换算的话宿主 libc 会以"类别非法"为由返回 NULL，照样崩。所以两边都要处理。
+__attribute__((no_stack_protector))
 HLE("setlocale", char *, h_setlocale, int category, const char *locale) {
     if ((unsigned)category == 0x7fffffff) category = LC_ALL;   // Horizon 的 LC_ALL 掩码 → 宿主 libc 的 LC_ALL
     char *r = setlocale(category, locale);
@@ -161,37 +163,31 @@ HLE("freelocale", void, h_freelocale, void *l) {
 // （BotW：locale::__global() 返回 0，sdk+0x29e0e4）。
 // 宿主这份只看守卫字节，不依赖客体的锁；用 HLE_FORCE 压过模块内定义（force 表先于 st_shndx 查）。
 static pthread_mutex_t g_guard_mu = PTHREAD_MUTEX_INITIALIZER;
-HLE_FORCE("__cxa_guard_acquire", "宿主实现 C++ 静态构造守卫（客体版本依赖 nn::os 锁，会误报已构造）",
-          int, h_guard_acquire, uint64_t *g) {
+// np517：no_stack_protector 版本——这两个函数会被**未提交页的 canary 读**炸
+// （prologue 的 canary 序列是编译器生成的，C 层无法保护，只能关掉该函数的栈保护）。
+// 手工注册 force 表（不用 HLE_FORCE 宏，以便加属性）。
+__attribute__((no_stack_protector))
+static int h_guard_acquire(uint64_t *g) {
     if (!g) return 1;
-    // np510：g 可能指向**未提交的客体堆页**（主循环放出后新的静态构造路径传来），直接读会 SIGSEGV。
-    // 安全读：读不到（页未映射）就当作"需要构造"返回 1。
     unsigned char b = 0;
     vm_size_t _gr = 0;
     int ok = !vm_read_overwrite(mach_task_self(), (vm_address_t)g, 1, (vm_address_t)&b, &_gr) && _gr == 1;
-    if (!ok) { if (g_flag.imports) LOG("guard_acquire %p 页不可读 → 视为需构造", (void *)g); return 1; }
-    if (g_flag.imports) LOG("guard_acquire %p 字节=%u -> %d", (void *)g, b, b == 0);
-    // DM_GUARD_FORCE=1（排障）：恒返回 1，用来区分"守卫被误判已构造"与"根本没走守卫"
-    if (getenv("DM_GUARD_FORCE")) return 1;
-    return b == 0;          // 1 = 该我构造；0 = 已经构造过
+    if (!ok) return 1;   // 页不可读 → 视为需构造
+    return b == 0;
 }
-HLE_FORCE("__cxa_guard_release", "宿主实现 C++ 静态构造守卫：置已构造",
-          void, h_guard_release, uint64_t *g) {
+__attribute__((no_stack_protector))
+static void h_guard_release(uint64_t *g) {
     if (!g) return;
-    if (g_flag.imports) LOG("guard_release %p", (void *)g);
-    // np510：同样做安全写——页不可写就跳过（下次 acquire 会再返回"需构造"，构造函数会重跑，
-    // 这是可接受的降级：比 SIGSEGV 杀进程好）。
-    pthread_mutex_lock(&g_guard_mu);
-    // 页可读性探测（acquire 已通过同款检查；可读页直接写，实验上安全）
     unsigned char probe = 0; vm_size_t _gr = 0;
     if (!vm_read_overwrite(mach_task_self(), (vm_address_t)g, 1, (vm_address_t)&probe, &_gr) && _gr == 1)
         *(volatile unsigned char *)g = 1;
-    else if (g_flag.imports)
-        LOG("【黄】guard_release %p 页不可写 → 跳过，构造函数下次会重跑", (void *)g);
-    pthread_mutex_unlock(&g_guard_mu);
+    // 页不可写 → 跳过（构造函数下次会重跑）
 }
-HLE_FORCE("__cxa_guard_abort", "宿主实现 C++ 静态构造守卫：放弃",
-          void, h_guard_abort, uint64_t *g) { (void)g; }
+__attribute__((no_stack_protector))
+static void h_guard_abort(uint64_t *g) { (void)g; }
+static const hle_force_ent hle_force_h_guard_acquire = {"__cxa_guard_acquire", (void *)h_guard_acquire, "宿主实现 C++ 静态构造守卫（no_stack_protector 版）"};
+static const hle_force_ent hle_force_h_guard_release = {"__cxa_guard_release", (void *)h_guard_release, "宿主实现 C++ 静态构造守卫（no_stack_protector 版）"};
+static const hle_force_ent hle_force_h_guard_abort = {"__cxa_guard_abort", (void *)h_guard_abort, "宿主实现 C++ 静态构造守卫（no_stack_protector 版）"};
 
 // ── locale::__global()（np242）──
 // libc++ 的 std::locale 全局对象工厂。客体那份（sdk+0x29e018）走惰性构造：
