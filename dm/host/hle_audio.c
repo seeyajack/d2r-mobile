@@ -460,6 +460,23 @@ HLE_FORCE("_ZN2nn5audio25GetReleasedAudioOutBufferEPNS0_8AudioOutE", "取已播�
     return b;
 }
 
+// np454：`nn::audio::RequestUpdateAudioRenderer` —— 1.6.0 会调，而 sdk 的真身**不判空**：
+// 进来就 `ldp x0,x2,[x19,#0x48]`（x19 = 第二个参数 AudioRendererConfig*），
+// 空指针直接 addr=0x48 崩（pc=sdk+0x1b8f98，调用点 main+0x1cf9724）。
+// 我们这个环境里没有 audio 服务，`OpenAudioRenderer` 走真身必然失败 ⇒ 调用方的 config 一直是 0。
+// 我们自己的音频通路是 AudioOut（FMOD 那一条，本文件上半部分），这条 Renderer API 不影响出声，
+// 所以先做**空实现**把它挡下来：不碰那个 config，只记一次日志。
+// np454: 1.6.0 calls this and the real sdk body has no null check -- it dereferences the
+// AudioRendererConfig* argument immediately (addr=0x48 crash). We have no audio service, so the caller's
+// config stays 0. Our audio path is AudioOut (handled above), so this Renderer API is a no-op here.
+HLE_FORCE("_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPKNS0_19AudioRendererConfigE",
+          "AudioRenderer 更新：宿主无 audio 服务，空实现（config 可能为 NULL，sdk 真身不判空）", void, h_audio_ReqUpdate,
+          uint32_t handle, const void *cfg) {
+    (void)handle; (void)cfg;
+    static int once; if (!once++) LOG("audio：RequestUpdateAudioRenderer 空实现（handle=%u cfg=%p）", handle, cfg);
+}
+
+
 // 前端生命周期 / 音频会话打断：暂停真出声，期间由静音接收端接手按实时消耗（节奏不断）；恢复时切回 AudioUnit。
 // 前端在 切后台 / 打断开始 时调 1，回前台 / 打断结束（shouldResume）时调 0。
 // Front-end lifecycle / audio session interruption: suspend real audio output, with the silent sink taking over real-time consumption meanwhile (pacing unbroken); switch back to the AudioUnit on resume.
