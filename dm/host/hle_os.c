@@ -441,3 +441,29 @@ uint64_t dm_last_tls4(void) { return atomic_load(&g_last_tls4); }
 // np291：崩时复刻客体 0xa0e2f8「取线程默认分配器」用。崩溃发生在客体主线程（= 跑 dm_main 的
 // 宿主线程），所以直接读本线程的 g_tlsval 与客体看到的是同一份。
 uint64_t dm_tlsval(unsigned slot) { return slot < TLS_MAX ? g_tlsval[slot] : 0; }
+
+
+// np497 ★ 生命周期事件队列（1.6.0 的 nn::oe 事件等待 main+0x1cf5580 读它）：
+//   [main+0x2d23e58] = 对象指针；游戏 `ldrb [obj]` 读**首字节**（非 0 = 有事件）。
+//   真机由 nn::oe 初始化链填；我们环境里该链没走到 ⇒ 指针是野的（np496 崩在 ldrb）。
+//   宿主兜底：构造一个最小事件对象（首字节=1，表示"有事件"），把指针槽指向它。
+//   第一版是"永久有事件"：游戏主循环每次都会收到"事件"，走 1cf5580 的成功分支。
+//   若后续发现事件被消费后主循环空转，再演进为真队列（投递"进入前台"一条）。
+// np497: the lifecycle-event queue read by main+0x1cf5580: [main+0x2d23e58] is the object pointer and the
+// game reads its first byte (non-zero = event pending). On device nn::oe's init chain fills it; ours never
+// runs, leaving a wild pointer (np496 crashed on that ldrb). Host fallback: build a minimal event object
+// (first byte = 1) and point the slot at it, so the wait loop always "has an event" and returns success.
+// np498 修正：首字节必须是 **0**（无事件）。1cf5580 返回 0 = "本轮没有事件"是**正常路径**
+// （真机空闲时也返回 0），主循环 1cf5b54 会跳过事件处理继续跑。给 1 反而让游戏走"消费事件"
+// 分支，把我们的假对象当完整事件结构解引用 → LockMutex(NULL) 崩（sdk+0x860c4）。
+static uint8_t g_oe_event_obj[0x40];   // 全零：无事件，但指针合法
+void dm_pin_oe_event(void) {
+    module_t *mm = NULL;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mm = &g_mod[i]; break; }
+    if (!mm) { LOG("【红】oe 事件：main 模块未装载"); return; }
+    uint64_t slot = (uint64_t)(uintptr_t)mm->base + 0x2d23e58;
+    void *want = (void *)g_oe_event_obj;
+    void *cur = *(void **)(uintptr_t)slot;
+    *(volatile void **)(uintptr_t)slot = want;
+    LOG("oe 事件队列已接管：main+0x2d23e58 %p → %p（首字节=1，主循环 1cf5580 将读到事件）", cur, want);
+}

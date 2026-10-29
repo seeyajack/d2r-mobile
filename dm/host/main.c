@@ -116,6 +116,7 @@ static void guest_main(void) {
     { void dm_map_null_page(void); dm_map_null_page(); }
     run_module_inits();   // rtld 回调 B：各模块 DT_INIT（全局构造函数） | rtld callback B: each module's DT_INIT (global constructors)
     { void dm_pin_alloc_got(void); dm_pin_alloc_got(); void dm_dump_alloc_state(const char *); dm_dump_alloc_state("模块构造后"); }
+    { void dm_pin_oe_event(void); dm_pin_oe_event(); }   // np497：生命周期事件队列指针兜底（1.6.0 主循环 1cf5580 读它）
     dm_prof_mark("③ 各模块 init_array");
     ((fnp)req("_ZN2nn2os11SetHostArgcEi"))((void *)(uint64_t)g_argc);
     ((fnp)req("_ZN2nn2os11SetHostArgvEPPc"))(g_argv);

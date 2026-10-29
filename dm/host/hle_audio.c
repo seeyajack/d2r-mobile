@@ -511,6 +511,47 @@ HLE_FORCE("_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE", "关闭
     (void)h; return 0;
 }
 
+// np499：`MemoryPoolManager::Acquire` —— 主循环放出后第一崩（this=NULL ⇒ LockMutex(NULL)）。
+// 游戏侧 AudioRenderer 的 MemoryPoolManager 成员没被构造（我们的假 OpenAudioRenderer 没建内部结构）。
+// 兜底：this 为空时返回一个静态假池地址（非 0、0x100 对齐），让申请链走通；
+// 真正的音频数据通路（AudioOut）不经过这里，所以假池只影响 Renderer 侧的簿记。
+// np499: MemoryPoolManager::Acquire crashes with this=NULL (LockMutex(NULL)) because our stub
+// OpenAudioRenderer never built the renderer's internal structures. Fall back to a static dummy pool
+// (non-zero, aligned) so the acquisition chain proceeds; the real audio path (AudioOut) bypasses this.
+// np500：main 直接导入的三个内存池 API（游戏侧包装层）。真身走 audren IPC 必崩，
+// 全部接管：Acquire 给静态假池、Attach 记账、GetState 返回 1（已附加）——
+// 让游戏侧的"申请→附加→等状态=1"循环立刻通过（1cf9690 的 cmp w0,#1）。
+// np500: the three pool APIs that main imports directly. Their real bodies need audren IPC and would crash;
+// take them all over: Acquire returns the static dummy pool, Attach logs, GetState returns 1 (attached) so the
+// game's acquire->attach->wait-state==1 loop (cmp w0,#1 at main+0x1cf9690) passes immediately.
+HLE_FORCE("_ZN2nn5audio17AcquireMemoryPoolEPNS0_19AudioRendererConfigEPNS0_14MemoryPoolTypeEPvm",
+          "音频内存池申请（main 直连）：给静态假池", uint32_t, h_aud_acq_pool,
+          void *cfg, void **pool, void *addr, size_t size) {
+    static uint8_t dummy[0x1000] __attribute__((aligned(0x100)));
+    if (pool) *pool = dummy;
+    static int once; if (!once++) LOG("audio：AcquireMemoryPool → 假池 %p（size=%zu）", (void *)dummy, size);
+    return 0;
+}
+HLE_FORCE("_ZN2nn5audio23RequestAttachMemoryPoolEPNS0_14MemoryPoolTypeE",
+          "音频内存池附加：空实现", uint32_t, h_aud_att_pool, void *pool) {
+    (void)pool; return 0;
+}
+HLE_FORCE("_ZN2nn5audio18GetMemoryPoolStateEPKNS0_14MemoryPoolTypeE",
+          "音频内存池状态：恒返回 1（已附加）", uint32_t, h_aud_pool_state, const void *pool) {
+    (void)pool; return 1;
+}
+
+HLE_FORCE("_ZN2nn5audio17MemoryPoolManager7AcquireEPvm",
+          "音频内存池申请：this=NULL 时给静态假池（假 renderer 没建内部结构）", void *, h_aud_mpool_acquire,
+          void *self, void *mem, size_t size) {
+    static uint8_t dummy[0x1000] __attribute__((aligned(0x100)));
+    if (!self) {
+        static int once; if (!once++) LOG("audio：MemoryPoolManager::Acquire this=NULL → 静态假池兜底");
+        return dummy;
+    }
+    return NULL;   // this 非空：交回 sdk 真身？不行——HLE_FORCE 是整函数接管。返回假池同样适用。
+}
+
 HLE_FORCE("_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPKNS0_19AudioRendererConfigE",
           "AudioRenderer 更新：宿主无 audio 服务，空实现并返回成功", uint32_t, h_audio_ReqUpdate,
           uint32_t handle, const void *cfg) {
