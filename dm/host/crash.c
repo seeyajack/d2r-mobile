@@ -121,12 +121,23 @@ static int in_code(uint64_t a) {
     }
     return 0;
 }
+// np465：**崩溃处理自己不能崩**。原来这里直接解引用 `fp+k`，而 fp 落在栈映射末尾时
+// （实测 addr=0x5e0be30000）读越界 ⇒ 处理器自己 SIGSEGV，把真正的崩点盖掉。
+// 改用 vm_read_overwrite：失败就跳过，绝不碰未映射页。
+// np465: the crash handler must never crash. It used to dereference fp+k directly; when fp sits at the end
+// of the stack mapping (addr=0x5e0be30000 observed) that read faults and hides the real crash. Use
+// vm_read_overwrite instead: on failure just skip.
+static int scan_rd(uint64_t a, void *out, size_t n) {
+    vm_size_t g = 0;
+    return !vm_read_overwrite(mach_task_self(), a, n, (vm_address_t)out, &g) && g == n;
+}
 void dm_backtrace_scan(uint64_t fp) {
     if (!fp || (fp & 7)) return;
     fprintf(stderr, "[dm] bt(栈扫描):");
     int shown = 0;
     for (int k = 0; k < 0x600 && shown < 16; k += 8) {   // 变量名不能叫 off：那是个宏（crash_off） | do not name it `off`, that is a macro
-        uint64_t v = *(volatile uint64_t *)(fp + k);
+        uint64_t v = 0;
+        if (!scan_rd(fp + k, &v, sizeof v)) continue;   // np465：读不到就跳过（不再直接解引用）
         if (!in_code(v)) continue;
         // np400：**候选返回地址必须"前一条是 bl/blr"**。栈上还会放函数地址（vtable、函数指针表），
         // 它们落在代码段里但不是返回地址 —— np397 的 `sdk+0x8dd58`（ro::Bind）就是这么来的，
@@ -135,7 +146,8 @@ void dm_backtrace_scan(uint64_t fp) {
         // addresses (vtables, pointer tables) that live in code but are not return addresses -- that is exactly how
         // np397 produced sdk+0x8dd58 (ro::Bind), which the np398 experiment proved is never called.
         if (v < 4) continue;
-        uint32_t prev = *(volatile uint32_t *)(v - 4);
+        uint32_t prev = 0;
+        if (!scan_rd(v - 4, &prev, sizeof prev)) continue;   // np465：同上
         int is_bl = (prev & 0xFC000000u) == 0x94000000u;          // bl  #imm26
         int is_blr = (prev & 0xFFFFFC1Fu) == 0xD63F0000u;         // blr xN
         if (!is_bl && !is_blr) continue;

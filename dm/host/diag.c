@@ -264,6 +264,16 @@ static int probe_hit(ucontext_t *uc) {   // 由 probe_install 注册给 crash.c 
                 }
             } else fprintf(stderr, "?");
         }
+        // np464：`@h<偏移>` —— 转储 [x0+偏移] 的 16 字节。看对象内部（类型字节、句柄字段）用它。
+        // np464: `@h<offset>` -- dump 16 bytes at x0+offset, for inspecting object internals.
+        if (g_probe[i].count == 5) {
+            uint8_t nb[16]; vm_size_t g = 0;
+            uint64_t at4 = UC_X(uc, 0) + (uint64_t)g_probe[i].dump;
+            fprintf(stderr, " [x0+%#lx]=", g_probe[i].dump);
+            if (!vm_read_overwrite(mach_task_self(), at4, sizeof nb, (vm_address_t)nb, &g) && g == sizeof nb) {
+                for (int k = 0; k < (int)sizeof nb; k++) fprintf(stderr, "%02x", nb[k]);
+            } else fprintf(stderr, "?");
+        }
         if (g_probe[i].count == 3) {
             uint8_t nb[16]; vm_size_t g = 0;
             uint64_t at2 = UC_SP(uc) + (uint64_t)g_probe[i].dump;
@@ -298,7 +308,7 @@ static void probe_add(module_t *m, uint64_t off, long dump, probe_fn fn, int cou
     g_probe[g_nprobe].slot = sl; g_probe[g_nprobe].dump = dump; g_probe[g_nprobe].fn = fn;
     g_probe[g_nprobe].count = count;
     snprintf(g_probe[g_nprobe].name, sizeof g_probe[0].name, "%s+%#llx", m->name, off);
-    LOG("探针 %s（原指令 %08x）%s", g_probe[g_nprobe].name, sl[0], g_probe[g_nprobe].count == 1 ? "［计数模式］" : g_probe[g_nprobe].count == 2 ? "［取串］" : g_probe[g_nprobe].count == 3 ? "［栈转储］" : g_probe[g_nprobe].count == 4 ? "［模块内存转储］" : "");
+    LOG("探针 %s（原指令 %08x）%s", g_probe[g_nprobe].name, sl[0], g_probe[g_nprobe].count == 1 ? "［计数模式］" : g_probe[g_nprobe].count == 2 ? "［取串］" : g_probe[g_nprobe].count == 3 ? "［栈转储］" : g_probe[g_nprobe].count == 4 ? "［模块内存转储］" : g_probe[g_nprobe].count == 5 ? "［x0 转储］" : "");
     g_nprobe++;
 }
 
@@ -631,6 +641,7 @@ void probe_install(void) {
                 else if (at_[1] == 's') { count = 2; dump = (long)strtol(at_ + 2, 0, 16); }   // @s<偏移>：把 [x0+偏移] 当 char* 再打出来（np434b） | @s<offset>: treat [x0+offset] as a char* and print it
                 else if (at_[1] == 'p') { count = 3; dump = (long)strtol(at_ + 2, 0, 16); }   // @p<偏移>：转储 [sp+偏移] 16 字节（判据常放在栈上） | @p<offset>: dump 16 bytes at sp+offset
                 else if (at_[1] == 'm') { count = 4; dump = (long)strtoull(at_ + 2, 0, 16); }   // @m<偏移>：转储 [模块基址+偏移] 16 字节（np451：查加载期填的表/蹦床） | @m<offset>: dump 16 bytes at module_base+offset
+                else if (at_[1] == 'h') { count = 5; dump = (long)strtoull(at_ + 2, 0, 16); }   // @h<偏移>：转储 [x0+偏移] 16 字节（np464：看对象内部结构，如 SystemEventType） | @h<offset>: dump 16 bytes at x0+offset
                 else dump = at_[1] == '*' ? (0x1000000 | strtol(at_ + 2, 0, 16)) : strtol(at_ + 1, 0, 16);   // @偏移 / @*偏移 | @offset / @*offset
             }
             probe_add(m, strtoull(c + 1, 0, 16), dump, NULL, count);
