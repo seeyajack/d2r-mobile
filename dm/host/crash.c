@@ -121,6 +121,12 @@ static int in_code(uint64_t a) {
     }
     return 0;
 }
+static void dump_nvn_last_calls(void);   // np480：定义在下方
+// np480：给看门狗路径用的 NVN 最近调用转储（dump_nvn_last_calls 是 static，这里包一层）。
+// 用途：EndRecording 之后没有 QueueSubmit——最后调的 16 个 NVN 入口能直接指出游戏在做什么
+// （Fence？Sync？还是别的 Submit 变体）。
+// np480: NVN last-calls dump for the watchdog path (dump_nvn_last_calls is static; wrap it).
+void dm_dump_nvn_last_calls(void) { dump_nvn_last_calls(); }
 // np465：**崩溃处理自己不能崩**。原来这里直接解引用 `fp+k`，而 fp 落在栈映射末尾时
 // （实测 addr=0x5e0be30000）读越界 ⇒ 处理器自己 SIGSEGV，把真正的崩点盖掉。
 // 改用 vm_read_overwrite：失败就跳过，绝不碰未映射页。

@@ -477,6 +477,8 @@ static void thr_bt(thr_t *t) {
     thread_resume(t->mport);
 }
 void svc_thread_dump(void) {
+    // np480：先倒 NVN 最近调用（EndRecording 后没有 QueueSubmit——看最后调的 16 个入口就知道差哪一步）
+    { void dm_dump_nvn_last_calls(void); dm_dump_nvn_last_calls(); }
     static const char *kinds[] = {"运行/未在等", "锁", "条件变量", "地址", "同步对象"};
     int nh = 0; for (int i = 1; i < MAX_H; i++) nh += g_h[i].type != O_FREE;
     fprintf(stderr, "[dm] 句柄表占用 %d / %d，累计建线程 %llu\n", nh, MAX_H, g_next_id - 0x51);
