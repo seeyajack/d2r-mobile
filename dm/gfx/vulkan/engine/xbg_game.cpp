@@ -1952,6 +1952,9 @@ static void dump_missing_shader(const std::string &key,const void *control,uint6
     // 离线拿它所有前缀的哈希与 17,308 个包记录的代码哈希求交——命中就说明这条路可行。
     uint64_t hint=0;
     for(size_t off=0x848;off<=0x860;off+=8){uint64_t v=0;memcpy(&v,p+off,8);if(v && (!hint || v<hint))hint=v;}
+    // np537：这两个字段不一定是指针（实测 65f0 这个着色器里就是 0x8f0 这种小整数），
+    //   直接按指针读会把进程读崩 ⇒ 只在与控制块同 4GB 段时才去解引用。
+    if(hint && (hint>>32)!=(reinterpret_cast<uint64_t>(control)>>32))hint=0;
     if(hint){
         xbg_logf("codehint %s %p",key.c_str(),reinterpret_cast<void*>(uintptr_t(hint)));
         const uint8_t *c=reinterpret_cast<const uint8_t *>(uintptr_t(hint));
