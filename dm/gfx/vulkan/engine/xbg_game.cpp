@@ -1920,10 +1920,32 @@ bool spv_override(const std::string &key,std::vector<uint32_t> &words){
     std::vector<uint32_t> w(size_t(n)/4);bool ok=fread(w.data(),1,size_t(n),f)==size_t(n);fclose(f);if(!ok || w[0]!=0x07230203u)return false;
     words.swap(w);xbg_logf("NVN spv override %s words=%zu",key.c_str(),words.size());return true;
 }
+// np525 ★ 缺着色器包时把现场留下来。
+//   为什么：原来只在 fatal 里报一句"缺 xxx.xgs"，证据全丢，于是分不清两种完全不同的情况——
+//   ① 这款游戏确实多了一个着色器（离线索引该重出）；② 运行时控制块与离线静态块**系统性不同**
+//      （那样 17,308 个包会全部对不上，整条离线链要按运行时形态重算）。
+//   做法：把控制段原样 0x880 字节写到 <shader_directory>/<键>.ctl（只写 .ctl，不影响 .xgs 计数/校验），
+//   离线拿它与 romfs 里最接近的控制段逐字节比对即可定谳。
+// np525: keep the evidence when a bundle is missing ...
+static void dump_missing_shader(const std::string &key,const void *control){
+    if(!control)return;
+    std::string path=std::string(cfg.shader_directory)+"/"+key+".ctl";
+    bool ok=false;
+    if(FILE *f=fopen(path.c_str(),"wb")){ok=fwrite(control,1,0x880,f)==0x880;fclose(f);}
+    xbg_logf("NVN missing shader %s: control@%p dumped=%d -> %s",key.c_str(),control,int(ok),path.c_str());
+    // 沙箱里的 .ctl 沙盒外读不到（shell 受 SELinux 限制），所以再把字节按 hex 打进日志：
+    // hilog 能读到，离线拼回 2176 字节即可。xbg_logf 的行缓冲是 1024，每段 0x180（=768 hex 字符）留足余量。
+    const uint8_t *p=reinterpret_cast<const uint8_t *>(control);
+    for(size_t off=0;off<0x880;off+=0x180){
+        char line[1024];int n=snprintf(line,sizeof line,"ctlhex %s +%03zx ",key.c_str(),off);
+        for(size_t i=0;i<0x180 && off+i<0x880;i++)n+=snprintf(line+n,sizeof line-n,"%02x",p[off+i]);
+        xbg_logf("%s",line);
+    }
+}
 Shader *load_shader(const void *control){
     std::string key=control_key(control);auto found=shaders.find(key);if(found!=shaders.end())return found->second.get();
     const uint64_t load_t0=timing_clock();
-    std::string path=std::string(cfg.shader_directory)+"/"+key+".xgs";FILE *f=fopen(path.c_str(),"rb");if(!f)xbg_fatalf("Missing genuine shader bundle %s",path.c_str());
+    std::string path=std::string(cfg.shader_directory)+"/"+key+".xgs";FILE *f=fopen(path.c_str(),"rb");if(!f){dump_missing_shader(key,control);xbg_fatalf("Missing genuine shader bundle %s",path.c_str());}
     fseek(f,0,SEEK_END);long length=ftell(f);rewind(f);need(length>=32 && length<=16*1024*1024,"Invalid shader bundle length");std::vector<uint8_t> bytes(length);need(fread(bytes.data(),1,bytes.size(),f)==bytes.size(),"Shader bundle read failed");fclose(f);
     xbg_shader_header h;memcpy(&h,bytes.data(),sizeof(h));need(h.magic==0x31534758 && h.version==1 && h.stage<6 && h.binding_count<=256 && h.input_count<=16 && h.c1_bytes<=65536 && h.spirv_bytes%4==0,"Invalid shader bundle header");
     size_t offset=sizeof(h),expected=offset+size_t(h.binding_count)*sizeof(xbg_shader_binding)+size_t(h.input_count)*4+h.c1_bytes+h.spirv_bytes;need(expected==bytes.size(),"Shader bundle extent mismatch");
