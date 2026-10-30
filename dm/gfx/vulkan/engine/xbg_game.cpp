@@ -2014,10 +2014,25 @@ static Shader *placeholder_shader(const std::string &key,unsigned stage){
 }
 Shader *load_shader(const void *control,uint64_t code,unsigned slot){
     std::string key=control_key(control);auto found=shaders.find(key);if(found!=shaders.end())return found->second.get();
+    // np531 ★ 掩码键（masked key）：控制块 +0x848..+0x868 是三个指向**元数据**的指针，
+    //   随 ASLR/堆布局变（实测：同一着色器两轮只差 6 个字节，全在这三个字段里），
+    //   所以 raw 键每轮都不同、与任何离线出的包名都对不上（真机 NVN shader loaded 计数 0）。
+    //   把这 0x20 字节掩掉后哈希才稳定（两次取样一致 ⇒ 可以当作稳定身份）。
+    //   查找顺序：raw → masked。raw 在前是为了 D2R（它的包就是按 raw 出的）；BotW 走 masked。
+    std::string mkey;
+    {uint8_t buf[0x880];memcpy(buf,control,0x880);memset(buf+0x848,0,0x20);char k[17];if(xbg_shader_control_key(buf,k)==0)mkey=k;}
+    if(!mkey.empty()){auto m=shaders.find(mkey);if(m!=shaders.end())return m->second.get();}
     const uint64_t load_t0=timing_clock();
     std::string path=std::string(cfg.shader_directory)+"/"+key+".xgs";FILE *f=fopen(path.c_str(),"rb");
+    if(!f && !mkey.empty() && mkey!=key){
+        std::string mp=std::string(cfg.shader_directory)+"/"+mkey+".xgs";FILE *mf=fopen(mp.c_str(),"rb");
+        if(mf){f=mf;path=mp;key=mkey;}
+    }
     if(!f){
-        dump_missing_shader(key,control,code);
+        // 取证/落盘一律用**掩码键**（稳定身份），raw 键只用来区分"这次是不是同一个着色器"。
+        const std::string&id=(!mkey.empty() && mkey!=key)?mkey:key;
+        if(!mkey.empty() && mkey!=key)xbg_logf("shaderkey raw=%s masked=%s",key.c_str(),mkey.c_str());
+        dump_missing_shader(id,control,code);
         const char *sk=getenv("DM_SHADER_SKIP");
         if(sk && *sk=='1'){g_shader_skip_abort=true;xbg_logf("【诊断】缺着色器 %s → 本帧丢弃剩余命令（DM_SHADER_SKIP=1，画面会是错的）",key.c_str());return nullptr;}
         const char *ph=getenv("DM_SHADER_PLACEHOLDER");
