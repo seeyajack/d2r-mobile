@@ -1941,6 +1941,12 @@ static void dump_missing_shader(const std::string &key,const void *control,uint6
         for(size_t i=0;i<0x180 && off+i<0x880;i++)n+=snprintf(line+n,sizeof line-n,"%02x",p[off+i]);
         xbg_logf("%s",line);
     }
+    // np530：下面的"深度取证"（codehint/codehex/ptrprobe/datahex）会去读指针目标，
+    //   其中 ptrprobe 读的是"同 4GB 段"的候选地址——那不等于一定有效，实测会把进程读崩。
+    //   所以只留 .ctl 与 ctlhex（控制块本身一定有效），深度取证改成 DM_SHADER_DUMP=1 显式开。
+    // np530: the deep dumps below dereference pointer targets (ptrprobe only checks the 4 GB segment, which is not
+    //   proof of validity) and did crash the process. Keep the always-safe .ctl + ctlhex; make the rest opt-in.
+    const char *dv=getenv("DM_SHADER_DUMP");if(!dv || *dv!='1')return;
     // 控制块尾部三个 8 字节字段是指向**代码段**的指针（np525 实测：同一次崩点两轮只在这 6 个字节上不同）。
     // 想把键改成"代码段哈希"就必须先证明能拿到代码，所以把最小那个指针起 4 KB 也打出来，
     // 离线拿它所有前缀的哈希与 17,308 个包记录的代码哈希求交——命中就说明这条路可行。
@@ -1986,6 +1992,11 @@ static void dump_missing_shader(const std::string &key,const void *control,uint6
 //   好在一轮里看清"着色器之外还剩几道门"。画面必然是错的，因此默认关闭、必须显式开关、每次都报红。
 //   用引擎自带的最小 SPIR-V（清屏 vs/ps、亮度过场 cs）当占位；gs/hs/ds 没有内置件，直接放弃（仍走 fatal）。
 // np528: placeholder shader for diagnostics only ...
+// np529 ★ 缺着色器时"丢弃本帧剩余命令"的开关（诊断用，DM_SHADER_SKIP=1）：
+//   比占位着色器更保守——完全不建管线、不碰 inputs/bindings 形状，只是把这一帧剩下的命令扔掉，
+//   让流程能继续跑到 present，好回答"着色器之外还剩几道门"。画面必然是错的。
+// np529: drop the rest of this frame's commands when a shader bundle is missing (diagnostics only).
+static bool g_shader_skip_abort=false;
 static Shader *placeholder_shader(const std::string &key,unsigned stage){
     const uint32_t *w=nullptr;size_t n=0;
     switch(stage){
@@ -2007,6 +2018,8 @@ Shader *load_shader(const void *control,uint64_t code,unsigned slot){
     std::string path=std::string(cfg.shader_directory)+"/"+key+".xgs";FILE *f=fopen(path.c_str(),"rb");
     if(!f){
         dump_missing_shader(key,control,code);
+        const char *sk=getenv("DM_SHADER_SKIP");
+        if(sk && *sk=='1'){g_shader_skip_abort=true;xbg_logf("【诊断】缺着色器 %s → 本帧丢弃剩余命令（DM_SHADER_SKIP=1，画面会是错的）",key.c_str());return nullptr;}
         const char *ph=getenv("DM_SHADER_PLACEHOLDER");
         if(ph && *ph=='1'){
             Shader *q=placeholder_shader(key,slot);
@@ -3637,7 +3650,9 @@ void poll_retire(){
 }
 void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
     need(depth<64,"NVN command CALL nesting limit exceeded");
+    if(depth==0)g_shader_skip_abort=false;                 // 每帧重新开始判 | restart the decision each frame
     for(;;){need(budget++<10000000,"NVN command count/cycle limit exceeded");
+        if(g_shader_skip_abort)return;                     // np529：本帧缺过着色器 ⇒ 剩余命令全丢，保住这一帧能走到 present
         if(gfx_async && (budget&63)==0)poll_retire();
         // Bound host arena use per frame slot; only at command boundaries.
         {Slot &cur=slots[slot_index];if(cur.recording && cur.stream.used_total+cur.readback.used_total>arena_flush_bytes){SiteScope site(SITE_ARENA);submit_slots(false);}}
@@ -3665,7 +3680,7 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
         case OP_VIEWPORTS:{auto a=payload<p_viewports>(p,n);need(a.first==0 && a.n==1,"Multiple viewports unsupported");state.viewport.x=a.v[0][0];state.viewport.y=a.v[0][1];state.viewport.width=a.v[0][2];state.viewport.height=a.v[0][3];break;}
         case OP_SCISSOR:{auto a=payload<p_scissor>(p,n);need(a.w>=0 && a.h>=0,"Invalid scissor dimensions");state.scissor={{a.x,a.y},{uint32_t(a.w),uint32_t(a.h)}};break;}
         case OP_DEPTH_RANGE:{auto a=payload<p_depth_range>(p,n);state.viewport.minDepth=a.n;state.viewport.maxDepth=a.f;break;}
-        case OP_BIND_PROGRAM:{CPU_SCOPE(Program);auto a=payload<p_bind_program>(p,n);need(!a.prog || a.prog->nstage<=6,"Invalid bound program");for(unsigned st=0;st<6;st++)if(a.stages&(1u<<nvn_stage[st]))state.shader[st]=nullptr;if(!a.prog)break;const std::array<Shader*,6> &loaded=program_shaders(a.prog);for(unsigned i=0;i<a.prog->nstage;i++){Shader *s=loaded[i];if(a.stages&(1u<<nvn_stage[s->stage]))state.shader[s->stage]=s;}break;}
+        case OP_BIND_PROGRAM:{CPU_SCOPE(Program);auto a=payload<p_bind_program>(p,n);need(!a.prog || a.prog->nstage<=6,"Invalid bound program");for(unsigned st=0;st<6;st++)if(a.stages&(1u<<nvn_stage[st]))state.shader[st]=nullptr;if(!a.prog)break;const std::array<Shader*,6> &loaded=program_shaders(a.prog);for(unsigned i=0;i<a.prog->nstage;i++){Shader *s=loaded[i];if(!s)continue;if(a.stages&(1u<<nvn_stage[s->stage]))state.shader[s->stage]=s;}break;}
         case OP_BIND_STATE:{auto a=payload<p_bind_state>(p,n);switch(a.kind){case 0:{blend_st b;memcpy(&b,a.bytes,sizeof(b));state.blend[b.target]=b;break;}case 1:memcpy(&state.color,a.bytes,sizeof(state.color));break;case 2:memcpy(&state.mask,a.bytes,sizeof(state.mask));break;case 3:memcpy(&state.ms,a.bytes,sizeof(state.ms));break;case 4:memcpy(&state.poly,a.bytes,sizeof(state.poly));break;case 5:memcpy(&state.ds,a.bytes,sizeof(state.ds));break;default:xbg_fatalf("Unknown NVN state object %d",a.kind);}break;}
         case OP_BIND_VATTR:{auto a=variable_payload<p_bind_vattr>(p,n);need(a.first==0 && a.n>=0 && a.n<=16 && n>=offsetof(p_bind_vattr,st)+size_t(a.n)*4,"Invalid vertex attribute record");need(xbg_vertex_attributes_replace(state.attrib,reinterpret_cast<const uint32_t*>(a.st),a.n)==0,"Invalid vertex attribute replacement");break;}
         case OP_BIND_VSTREAM:{auto a=variable_payload<p_bind_vstream>(p,n);need(a.first>=0 && a.n>=0 && a.first+a.n<=16 && n>=offsetof(p_bind_vstream,st)+size_t(a.n)*sizeof(vs_st),"Invalid vertex stream record");memcpy(state.stream+a.first,a.st,a.n*sizeof(vs_st));break;}
