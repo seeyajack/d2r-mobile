@@ -1927,7 +1927,7 @@ bool spv_override(const std::string &key,std::vector<uint32_t> &words){
 //   做法：把控制段原样 0x880 字节写到 <shader_directory>/<键>.ctl（只写 .ctl，不影响 .xgs 计数/校验），
 //   离线拿它与 romfs 里最接近的控制段逐字节比对即可定谳。
 // np525: keep the evidence when a bundle is missing ...
-static void dump_missing_shader(const std::string &key,const void *control){
+static void dump_missing_shader(const std::string &key,const void *control,uint64_t code){
     if(!control)return;
     std::string path=std::string(cfg.shader_directory)+"/"+key+".ctl";
     bool ok=false;
@@ -1941,11 +1941,51 @@ static void dump_missing_shader(const std::string &key,const void *control){
         for(size_t i=0;i<0x180 && off+i<0x880;i++)n+=snprintf(line+n,sizeof line-n,"%02x",p[off+i]);
         xbg_logf("%s",line);
     }
+    // 控制块尾部三个 8 字节字段是指向**代码段**的指针（np525 实测：同一次崩点两轮只在这 6 个字节上不同）。
+    // 想把键改成"代码段哈希"就必须先证明能拿到代码，所以把最小那个指针起 4 KB 也打出来，
+    // 离线拿它所有前缀的哈希与 17,308 个包记录的代码哈希求交——命中就说明这条路可行。
+    uint64_t hint=0;
+    for(size_t off=0x848;off<=0x860;off+=8){uint64_t v=0;memcpy(&v,p+off,8);if(v && (!hint || v<hint))hint=v;}
+    if(hint){
+        xbg_logf("codehint %s %p",key.c_str(),reinterpret_cast<void*>(uintptr_t(hint)));
+        const uint8_t *c=reinterpret_cast<const uint8_t *>(uintptr_t(hint));
+        for(size_t off=0;off<0x1000;off+=0x180){
+            char line[1024];int n=snprintf(line,sizeof line,"codehex %s +%03zx ",key.c_str(),off);
+            for(size_t i=0;i<0x180 && off+i<0x1000;i++)n+=snprintf(line+n,sizeof line-n,"%02x",c[off+i]);
+            xbg_logf("%s",line);
+        }
+    }
+    // np526：控制块里像指针的字段，逐个看它指向哪——目标是代码段的话，头 4 字节应是 0x12345678。
+    // 只认与控制块同一段（高 24 位相同）的地址，既过滤掉小整数/魔数，也把越界读的风险压到很低。
+    {
+        const uint64_t self=reinterpret_cast<uint64_t>(control);
+        for(size_t off=0;off<0x880;off+=8){
+            uint64_t v=0;memcpy(&v,p+off,8);
+            // 只认与控制块**高 32 位相同**的地址（同一个 4GB 段）：既滤掉小整数/魔数，也避免野指针。
+            // 注意别用 ~0ull<<40 之类的掩码——这台机器的地址只有 40 位，高 24 位全 0，相与恒为 0，条件会永远不成立。
+            if(v<=0x10000)continue;                       // 小整数 / 魔数，不碰
+            if((v>>32)!=(self>>32))continue;              // 不在同一个 4GB 段，不碰
+            uint64_t head=0;memcpy(&head,reinterpret_cast<const void*>(uintptr_t(v)),8);
+            char bytes[17];for(int k=0;k<8;k++)snprintf(bytes+2*k,3,"%02x",reinterpret_cast<const uint8_t*>(&head)[k]);
+            xbg_logf("ptrprobe %s +%03zx -> %p head=%s",key.c_str(),off,reinterpret_cast<void*>(uintptr_t(v)),bytes);
+        }
+    }
+    // np527：代码段在 NVNshaderData.data 里（不是控制块里）。抓 0x2000 字节，离线拿它的所有前缀哈希
+    // 与 17,308 个包记录里的代码哈希求交：命中就同时得到"代码起点对不对"和"代码长度规则"。
+    if(code && (code>>32)==(reinterpret_cast<uint64_t>(control)>>32)){
+        const uint8_t *c=reinterpret_cast<const uint8_t *>(uintptr_t(code));
+        xbg_logf("datahex %s %p head=%02x%02x%02x%02x",key.c_str(),reinterpret_cast<void*>(uintptr_t(code)),c[0],c[1],c[2],c[3]);
+        for(size_t off=0;off<0x2000;off+=0x180){
+            char line[1024];int n=snprintf(line,sizeof line,"datahex %s +%03zx ",key.c_str(),off);
+            for(size_t i=0;i<0x180 && off+i<0x2000;i++)n+=snprintf(line+n,sizeof line-n,"%02x",c[off+i]);
+            xbg_logf("%s",line);
+        }
+    }
 }
-Shader *load_shader(const void *control){
+Shader *load_shader(const void *control,uint64_t code){
     std::string key=control_key(control);auto found=shaders.find(key);if(found!=shaders.end())return found->second.get();
     const uint64_t load_t0=timing_clock();
-    std::string path=std::string(cfg.shader_directory)+"/"+key+".xgs";FILE *f=fopen(path.c_str(),"rb");if(!f){dump_missing_shader(key,control);xbg_fatalf("Missing genuine shader bundle %s",path.c_str());}
+    std::string path=std::string(cfg.shader_directory)+"/"+key+".xgs";FILE *f=fopen(path.c_str(),"rb");if(!f){dump_missing_shader(key,control,code);xbg_fatalf("Missing genuine shader bundle %s",path.c_str());}
     fseek(f,0,SEEK_END);long length=ftell(f);rewind(f);need(length>=32 && length<=16*1024*1024,"Invalid shader bundle length");std::vector<uint8_t> bytes(length);need(fread(bytes.data(),1,bytes.size(),f)==bytes.size(),"Shader bundle read failed");fclose(f);
     xbg_shader_header h;memcpy(&h,bytes.data(),sizeof(h));need(h.magic==0x31534758 && h.version==1 && h.stage<6 && h.binding_count<=256 && h.input_count<=16 && h.c1_bytes<=65536 && h.spirv_bytes%4==0,"Invalid shader bundle header");
     size_t offset=sizeof(h),expected=offset+size_t(h.binding_count)*sizeof(xbg_shader_binding)+size_t(h.input_count)*4+h.c1_bytes+h.spirv_bytes;need(expected==bytes.size(),"Shader bundle extent mismatch");
@@ -1977,7 +2017,7 @@ Shader *load_shader(const void *control){
 std::map<uint64_t,std::array<Shader*,6>> program_cache;
 const std::array<Shader*,6> &program_shaders(const prog_t *prog){
     if(prog->serial){auto it=program_cache.find(prog->serial);if(it!=program_cache.end())return it->second;}
-    std::array<Shader*,6> out{};for(unsigned i=0;i<prog->nstage && i<6;i++)out[i]=load_shader(prog->sd[i].control);
+    std::array<Shader*,6> out{};for(unsigned i=0;i<prog->nstage && i<6;i++)out[i]=load_shader(prog->sd[i].control,(uint64_t)prog->sd[i].data);
     if(!prog->serial){static std::array<Shader*,6> scratch;scratch=out;return scratch;}
     return program_cache.emplace(prog->serial,out).first->second;
 }
