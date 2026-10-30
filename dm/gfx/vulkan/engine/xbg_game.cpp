@@ -1982,10 +1982,38 @@ static void dump_missing_shader(const std::string &key,const void *control,uint6
         }
     }
 }
-Shader *load_shader(const void *control,uint64_t code){
+// np528 ★ 占位着色器：**只用于诊断**，让"缺包就死"变成"缺包先跳过去画个错的"，
+//   好在一轮里看清"着色器之外还剩几道门"。画面必然是错的，因此默认关闭、必须显式开关、每次都报红。
+//   用引擎自带的最小 SPIR-V（清屏 vs/ps、亮度过场 cs）当占位；gs/hs/ds 没有内置件，直接放弃（仍走 fatal）。
+// np528: placeholder shader for diagnostics only ...
+static Shader *placeholder_shader(const std::string &key,unsigned stage){
+    const uint32_t *w=nullptr;size_t n=0;
+    switch(stage){
+        case 0:w=xbg_clear_vs;n=sizeof xbg_clear_vs/sizeof *xbg_clear_vs;break;
+        case 4:w=xbg_clear_fs_float;n=sizeof xbg_clear_fs_float/sizeof *xbg_clear_fs_float;break;
+        case 5:w=xbg_bright_lut_cs;n=sizeof xbg_bright_lut_cs/sizeof *xbg_bright_lut_cs;break;
+        default:return nullptr;
+    }
+    Shader *p=new Shader();
+    p->key=key;p->stage=stage;p->discards=true;
+    VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};ci.codeSize=n*4;ci.pCode=w;
+    VK(vkCreateShaderModule(cfg.device,&ci,nullptr,&p->module));
+    xbg_logf("【诊断】占位着色器 %s stage=%u：画面会是错的，只用来探路",key.c_str(),stage);
+    return p;
+}
+Shader *load_shader(const void *control,uint64_t code,unsigned slot){
     std::string key=control_key(control);auto found=shaders.find(key);if(found!=shaders.end())return found->second.get();
     const uint64_t load_t0=timing_clock();
-    std::string path=std::string(cfg.shader_directory)+"/"+key+".xgs";FILE *f=fopen(path.c_str(),"rb");if(!f){dump_missing_shader(key,control,code);xbg_fatalf("Missing genuine shader bundle %s",path.c_str());}
+    std::string path=std::string(cfg.shader_directory)+"/"+key+".xgs";FILE *f=fopen(path.c_str(),"rb");
+    if(!f){
+        dump_missing_shader(key,control,code);
+        const char *ph=getenv("DM_SHADER_PLACEHOLDER");
+        if(ph && *ph=='1'){
+            Shader *q=placeholder_shader(key,slot);
+            if(q){Shader *r=shaders.emplace(key,std::unique_ptr<Shader>(q)).first->second.get();return r;}
+        }
+        xbg_fatalf("Missing genuine shader bundle %s",path.c_str());
+    }
     fseek(f,0,SEEK_END);long length=ftell(f);rewind(f);need(length>=32 && length<=16*1024*1024,"Invalid shader bundle length");std::vector<uint8_t> bytes(length);need(fread(bytes.data(),1,bytes.size(),f)==bytes.size(),"Shader bundle read failed");fclose(f);
     xbg_shader_header h;memcpy(&h,bytes.data(),sizeof(h));need(h.magic==0x31534758 && h.version==1 && h.stage<6 && h.binding_count<=256 && h.input_count<=16 && h.c1_bytes<=65536 && h.spirv_bytes%4==0,"Invalid shader bundle header");
     size_t offset=sizeof(h),expected=offset+size_t(h.binding_count)*sizeof(xbg_shader_binding)+size_t(h.input_count)*4+h.c1_bytes+h.spirv_bytes;need(expected==bytes.size(),"Shader bundle extent mismatch");
@@ -2017,7 +2045,7 @@ Shader *load_shader(const void *control,uint64_t code){
 std::map<uint64_t,std::array<Shader*,6>> program_cache;
 const std::array<Shader*,6> &program_shaders(const prog_t *prog){
     if(prog->serial){auto it=program_cache.find(prog->serial);if(it!=program_cache.end())return it->second;}
-    std::array<Shader*,6> out{};for(unsigned i=0;i<prog->nstage && i<6;i++)out[i]=load_shader(prog->sd[i].control,(uint64_t)prog->sd[i].data);
+    std::array<Shader*,6> out{};for(unsigned i=0;i<prog->nstage && i<6;i++)out[i]=load_shader(prog->sd[i].control,(uint64_t)prog->sd[i].data,i);
     if(!prog->serial){static std::array<Shader*,6> scratch;scratch=out;return scratch;}
     return program_cache.emplace(prog->serial,out).first->second;
 }
