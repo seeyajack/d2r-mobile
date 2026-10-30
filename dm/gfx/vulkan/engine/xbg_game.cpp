@@ -2013,26 +2013,32 @@ static Shader *placeholder_shader(const std::string &key,unsigned stage){
     return p;
 }
 Shader *load_shader(const void *control,uint64_t code,unsigned slot){
-    std::string key=control_key(control);auto found=shaders.find(key);if(found!=shaders.end())return found->second.get();
-    // np531 ★ 掩码键（masked key）：控制块 +0x848..+0x868 是三个指向**元数据**的指针，
-    //   随 ASLR/堆布局变（实测：同一着色器两轮只差 6 个字节，全在这三个字段里），
-    //   所以 raw 键每轮都不同、与任何离线出的包名都对不上（真机 NVN shader loaded 计数 0）。
-    //   把这 0x20 字节掩掉后哈希才稳定（两次取样一致 ⇒ 可以当作稳定身份）。
-    //   查找顺序：raw → masked。raw 在前是为了 D2R（它的包就是按 raw 出的）；BotW 走 masked。
+    // np532 ★ 主键 = 控制段(按自身长度) + **代码段**，与 dm/gfx/tools/shader_split.py 和
+    //   nxnative 宿主 keys_hash 同一算法。之前只哈希控制段前 0x880 字节，既带进了随 ASLR 变的指针，
+    //   又漏掉了代码段（大量着色器共用控制段、只有代码不同），所以包名永远对不上。
+    //   两个旧键保留作后备：control-only 兼容 D2R 的包；masked 在 ctl_len 异常时兜底。
+    std::string pkey;{
+        // 代码段指针只在"与控制块同一个 4GB 段"时才用：键里要读 ncode 字节，野指针会当场崩。
+        // nxnative 那边靠 mtl_addr() 做映射校验，我们这里用段比较作等价保险。
+        const void *ck=(code && (code>>32)==(reinterpret_cast<uint64_t>(control)>>32))?reinterpret_cast<const void*>(uintptr_t(code)):nullptr;
+        char k[17];if(xbg_shader_prog_key(control,ck,k)==0)pkey=k;
+    }
+    std::string key=control_key(control);
     std::string mkey;
     {uint8_t buf[0x880];memcpy(buf,control,0x880);memset(buf+0x848,0,0x20);char k[17];if(xbg_shader_control_key(buf,k)==0)mkey=k;}
-    if(!mkey.empty()){auto m=shaders.find(mkey);if(m!=shaders.end())return m->second.get();}
+    const std::string *cands[3]={&pkey,&key,&mkey};
+    for(const std::string *c:cands){if(c->empty())continue;auto it=shaders.find(*c);if(it!=shaders.end())return it->second.get();}
     const uint64_t load_t0=timing_clock();
-    std::string path=std::string(cfg.shader_directory)+"/"+key+".xgs";FILE *f=fopen(path.c_str(),"rb");
-    if(!f && !mkey.empty() && mkey!=key){
-        std::string mp=std::string(cfg.shader_directory)+"/"+mkey+".xgs";FILE *mf=fopen(mp.c_str(),"rb");
-        if(mf){f=mf;path=mp;key=mkey;}
+    FILE *f=nullptr;std::string path;
+    for(const std::string *c:cands){
+        if(c->empty())continue;
+        std::string p=std::string(cfg.shader_directory)+"/"+*c+".xgs";
+        if((f=fopen(p.c_str(),"rb"))){path=p;key=*c;break;}
     }
     if(!f){
-        // 取证/落盘一律用**掩码键**（稳定身份），raw 键只用来区分"这次是不是同一个着色器"。
-        const std::string&id=(!mkey.empty() && mkey!=key)?mkey:key;
-        if(!mkey.empty() && mkey!=key)xbg_logf("shaderkey raw=%s masked=%s",key.c_str(),mkey.c_str());
-        dump_missing_shader(id,control,code);
+        // 取证/落盘用主键（prog key，跨运行稳定）；另外两个键打进日志便于对照。
+        xbg_logf("shaderkey prog=%s ctl=%s masked=%s",pkey.c_str(),key.c_str(),mkey.c_str());
+        dump_missing_shader(pkey.empty()?key:pkey,control,code);
         const char *sk=getenv("DM_SHADER_SKIP");
         if(sk && *sk=='1'){g_shader_skip_abort=true;xbg_logf("【诊断】缺着色器 %s → 本帧丢弃剩余命令（DM_SHADER_SKIP=1，画面会是错的）",key.c_str());return nullptr;}
         const char *ph=getenv("DM_SHADER_PLACEHOLDER");
@@ -2073,6 +2079,16 @@ Shader *load_shader(const void *control,uint64_t code,unsigned slot){
 std::map<uint64_t,std::array<Shader*,6>> program_cache;
 const std::array<Shader*,6> &program_shaders(const prog_t *prog){
     if(prog->serial){auto it=program_cache.find(prog->serial);if(it!=program_cache.end())return it->second;}
+    // np536：把每个阶段各自的键打出来，先排除"控制段/代码段配错对"这一种错法。
+    if(getenv("DM_SHADER_STAGEKEYS")){
+        for(unsigned i=0;i<prog->nstage && i<6;i++){
+            const uint8_t *c=reinterpret_cast<const uint8_t*>(prog->sd[i].control);
+            if(!c)continue;
+            uint32_t own=0,n704=0;memcpy(&own,c+0x20,4);memcpy(&n704,c+0x704,4);
+            char k[17];xbg_shader_prog_key(c,reinterpret_cast<const void*>(uintptr_t(prog->sd[i].data)),k);
+            xbg_logf("stagekey %u ctl=%p data=%p own=%#x n704=%#x key=%s",i,(const void*)c,(void*)(uintptr_t)prog->sd[i].data,own,n704,k);
+        }
+    }
     std::array<Shader*,6> out{};for(unsigned i=0;i<prog->nstage && i<6;i++)out[i]=load_shader(prog->sd[i].control,(uint64_t)prog->sd[i].data,i);
     if(!prog->serial){static std::array<Shader*,6> scratch;scratch=out;return scratch;}
     return program_cache.emplace(prog->serial,out).first->second;

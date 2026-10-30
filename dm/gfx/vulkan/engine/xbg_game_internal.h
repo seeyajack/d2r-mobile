@@ -15,6 +15,8 @@ void xbg_logf(const char *format,...);
 __attribute__((noreturn)) void xbg_fatalf(const char *format,...);
 int xbg_backend_failed(void);
 int xbg_shader_control_key(const void *control_0x880,char out_hex17[17]);
+// np532：正解键 —— 控制段按自身长度 + 代码段（与 shader_split.py / nxnative keys_hash 同一算法）。
+int xbg_shader_prog_key(const void *control_0x880,const void *code,char out_hex17[17]);
 int xbg_device_integer(int property,int *value);
 void xbg_legacy_pool_add(void *memory,size_t bytes);
 void xbg_legacy_pool_del(void *memory);
