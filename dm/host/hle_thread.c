@@ -27,6 +27,7 @@
 #include <mach/mach.h>
 #include <pthread/qos.h>
 #include <dlfcn.h>
+#include <setjmp.h>   // np562（照上游 955f274）：客体线程退回宿主栈再 pthread_exit | np562 (after upstream 955f274): guest threads exit on the host stack
 
 #define R_TIMEOUT     0xEA01u   // 内核模块 1，描述 117 | Kernel module 1, description 117
 #define R_CANCELLED   0xEC01u   // 118
@@ -65,6 +66,19 @@ static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
 #define MAX_H 4096
 static struct { int type; void *obj; } g_h[MAX_H];
 static pthread_key_t g_keythr;
+// np562 ★（照上游 955f274，OnePlus 13 实测）：客体线程的「回宿主栈」跳回点。
+//   thread_exit 原来在**客体自己的栈**上跑 pthread_exit——它要跑各 TLS 析构、jemalloc 退还线程缓存
+//   会整理空闲块、调用很深；客体栈有的只有十几 KB（我们这儿实测 16 KB），必溢出。
+//   做法：thread_main 进客体栈**之前**在自己的（1 MiB 宿主）栈上 sigsetjmp，thread_exit 收尾后
+//   siglongjmp 回来，pthread_exit 落在宿主栈上。跳回点不放进 thr_t：t 可能在 thread_exit 里就被释放。
+//   门（gate）从不换 x18 ⇒ 跳回时恢复的是普通宿主状态，安全。
+// np562 (after upstream 955f274, measured on a OnePlus 13): the guest thread's jump point back to the host
+//   stack. thread_exit used to run pthread_exit on the guest's own stack -- TLS destructors, jemalloc's tcache
+//   flush with its deep call chain -- and guest stacks can be as small as 16 KB (measured here), so it overflows.
+//   thread_main sigsetjmps on its own 1 MiB host stack before entering the guest stack; thread_exit siglongjmps
+//   back and pthread_exit runs on the host stack. The jump point is not kept in thr_t because t may be freed
+//   inside thread_exit. The gate never swaps x18, so the jump restores plain host state.
+static pthread_key_t g_keyhome;
 static uint64_t g_next_id = 0x51;
 static thr_t *g_wait;          // 全部在等的线程（锁 / 条件 / 地址 / 同步） | All waiting threads (lock / condition / address / synchronization)
 
@@ -359,8 +373,18 @@ static void *thread_main(void *p) {
     guest_thread_init();
     { void guest_flush_icache(int); guest_flush_icache(0); }   // np304：本线程执行前清补丁点 icache（不广播，只能各清各的） | np304: flush patched points before this thread runs guest code (no broadcast, so each thread flushes its own)
     pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); pthread_mutex_unlock(&G);
-    dm_thread_enter(t->entry, t->arg, t->stack_top);   // 不返回：客体须经 ExitThread 退出 | Does not return: the guest must exit through ExitThread
-    die("客体线程入口返回");
+    {   // np562：记下回宿主栈的跳回点，再进客体栈（见 g_keyhome 的注释） | record the jump home, then enter the guest stack
+        sigjmp_buf home;
+        pthread_setspecific(g_keyhome, &home);
+        if (sigsetjmp(home, 0) == 0) {
+            dm_thread_enter(t->entry, t->arg, t->stack_top);   // 不返回：客体须经 ExitThread 退出 | Does not return: the guest must exit through ExitThread
+            die("客体线程入口返回");
+        }
+        // 已跳回宿主栈：这里打日志是安全的（1 MiB 栈）。前 20 次与之后每 50 次记一行，真机上看得到线程确实从这条路退；t 可能已释放，不碰它
+        // Back on the host stack: logging is safe here (1 MiB stack). First 20 exits and every 50th log a line; t may already be freed, so it is not touched
+        { static int n; int k = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED); if (k <= 20 || k % 50 == 0) LOG("客体线程回到宿主栈退出（第 %d 次）", k); }
+        pthread_exit(NULL);
+    }
 }
 static void thr_free(thr_t *t) {   // 持 G；从全部线程链摘下并释放 | Holding G; unlink from the all-threads chain and free
     for (thr_t **p = &g_all; *p; p = &(*p)->all) if (*p == t) { *p = t->all; break; }
@@ -377,6 +401,10 @@ static void thread_exit(thr_t *t) {
     pthread_setspecific(g_keythr, NULL);
     if (t->closed) thr_free(t);
     pthread_mutex_unlock(&G);
+    // np562：回宿主栈去退出（g_keyhome）；没有跳回点的（进程主线程）照旧就地退出
+    // np562: go back to the host stack to exit (g_keyhome); a thread without a jump point (the process main thread) exits in place
+    sigjmp_buf *home = pthread_getspecific(g_keyhome);
+    if (home) { pthread_setspecific(g_keyhome, NULL); siglongjmp(*home, 1); }
     pthread_exit(NULL);
 }
 void dm_thread_returned(void) { die("客体线程入口函数返回（Horizon 要求 ExitThread）"); }
@@ -385,6 +413,7 @@ void dm_thread_returned(void) { die("客体线程入口函数返回（Horizon �
 // Register the main thread and return its handle (passed to nnosInitialize as the main thread handle)
 uint32_t svc_thread_main_init(void) {
     pthread_key_create(&g_keythr, NULL);
+    pthread_key_create(&g_keyhome, NULL);   // np562：回宿主栈的跳回点 | jump point back to the host stack
     thr_t *t = calloc(1, sizeof *t);
     pthread_cond_init(&t->cv, NULL);
     t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt);
