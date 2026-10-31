@@ -920,7 +920,8 @@ int svc_thread(int num, uint64_t *regs) {
         //   0x2F0 步长的内部表）与死锁无关，却把 60 条配额吃光（np566 教训）。
         // np568: log only heap-area keys. Init-time churn on main-module CVs ate the whole quota.
         if (key >= dm_guest_heap_lo() && cv_take(&g_cv_sig, 60)) { ++g_cv_sig;
-            LOG("[cv] 0x1d h=%#x key=%#llx cnt=%d 唤醒=%d 仍有等待者=%d", cur()->handle, (unsigned long long)key, cnt, n, left); }
+            LOG("[cv] 0x1d h=%#x key=%#llx cnt=%d 唤醒=%d 仍有等待者=%d lr=%#llx", cur()->handle, (unsigned long long)key, cnt, n, left,
+                (unsigned long long)regs[30]); }
         // np567：0x1d 的 key 直方图（去重记账，随 [stall] 打出）——回答"这个条件变量
         //   整个生命周期里被 signal 过几次、被谁"。卡死判据：0x100d 等的 key=0x…a518 计数为 0。
         // np567: per-key histogram of 0x1d (dedup bookkeeping, dumped with [stall]) -- it answers "how many times
