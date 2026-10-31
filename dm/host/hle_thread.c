@@ -305,6 +305,24 @@ static inline int cas32(uint64_t a, uint32_t *exp, uint32_t v) { return __atomic
 
 // 释放 addr 处的锁：交给等在它上面的第一个线程，或清零（持 G）
 // Release the lock at addr: hand it to the first thread waiting on it, or clear it to zero (holding G)
+// np560：0x1c/0x1d 交接取证计数器（DM_CV_PROBE=1 打开，只打前若干条）。
+//   注意不能写成静态初始化里读 getenv：.so 加载时 envs 还没设（那是 napi 起宿主之前设的），
+//   必须在第一次调用时惰性读。
+// np560: counters for 0x1c/0x1d hand-off evidence (on with DM_CV_PROBE=1, first few only). Read the env lazily:
+//   at .so load time the env is not set yet (napi sets it just before starting the host).
+static int g_cv_probe = -1, g_cv_sig;
+// np560：取号式限流（0x1c 与 0x1d 各自计数）。
+//   上一版只在结果行自增、交接行不自增 ⇒ 交接行无限打，np560 一轮 35,876 行，把日志预算与判读全冲垮。
+//   env 也必须惰性读：.so 加载时 envs 还没设（napi 起宿主前才设）。
+// np560: ticket-based throttling, one counter per op. The previous version incremented only in the result line, not the
+//   hand-off line, so hand-offs printed forever (35,876 lines in one run). The env must be read lazily: it is not set at
+//   .so load time.
+static int cv_enabled(void) {
+    if (g_cv_probe < 0) g_cv_probe = getenv("DM_CV_PROBE") ? 0 : (1 << 20);
+    return g_cv_probe == 0;
+}
+static int cv_take(int *n, int cap) { if (!cv_enabled() || *n >= cap) return 0; ++*n; return 1; }
+
 static void lock_handoff(uint64_t addr) {
     thr_t *w = pick(1, addr); int more = 0;
     if (!w) { st32(addr, 0); return; }
@@ -772,12 +790,28 @@ int svc_thread(int num, uint64_t *regs) {
         st32(key, 1);
         t->wkey = key; t->waddr = addr; t->wtag = (uint32_t)regs[2];
         lock_handoff(addr); CV_TEST_HOOK();
+        if (cv_take(&g_cv_probe, 120)) LOG("[cv] handoff h=%#x addr=%#llx 交接后 word=%#x waiters=%d", t->handle,
+                                  (unsigned long long)addr, ld32(addr),
+                                  (ld32(addr) & WAITERS_BIT) ? 1 : 0);
 #else   // 仅单测 t_condvar 的负对照：还原修复前「先放锁、后置键」的顺序 | Negative control for the unit test t_condvar only: restores the pre-fix order "release the lock first, set the key after"
         lock_handoff(addr); CV_TEST_HOOK();
         st32(key, 1);
         t->wkey = key; t->waddr = addr; t->wtag = (uint32_t)regs[2];
 #endif
         int64_t r = block(t, 2, (int64_t)regs[3]);   // 超时：不重新拿锁（用户态自己拿） | Timeout: the lock is not re-acquired (user mode takes it itself)
+        // np560：0x1c 的交接取证（DM_CV_PROBE=1，前 120 条）。
+        //   要分清三种病：① 锁被交回给持有者自己（pick 过滤错）② 每次都被立刻唤醒（假唤醒/wake 配错）
+        //   ③ 每次都是超时返回（超时语义错）。这三者的读数完全不同：
+        //   ① → handoff 后锁字 = 自己的 tag；② → r 正常但耗时≈0；③ → r=R_TIMEOUT。
+        // np560: hand-off evidence for 0x1c (DM_CV_PROBE=1, first 120). Three different illnesses:
+        //   1) the lock is handed back to its owner (pick filter wrong); 2) every wait is woken at once (spurious wake /
+        //   wake mismatch); 3) every wait times out (timeout semantics wrong). Their readings differ: 1) the word after
+        //   hand-off equals our own tag; 2) r is normal but elapsed ~0; 3) r == R_TIMEOUT.
+        if (cv_take(&g_cv_probe, 120)) {
+            LOG("[cv] 0x1c h=%#x addr=%#llx key=%#llx tag=%#x to=%lld r=%d word=%#x", t->handle,
+                (unsigned long long)addr, (unsigned long long)key, t->wtag, (long long)(int64_t)regs[3],
+                (int)r, ld32(addr));
+        }
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }
@@ -787,6 +821,8 @@ int svc_thread(int num, uint64_t *regs) {
         for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // 按内核顺序；转为锁等待或被唤醒后不再是 kind 2 | In kernel order; once turned into a lock wait or woken it is no longer kind 2
         int left = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
         if (!left) st32(key, 0);
+        if (cv_take(&g_cv_sig, 60)) {
+            LOG("[cv] 0x1d h=%#x key=%#llx cnt=%d 唤醒=%d 仍有等待者=%d", cur()->handle, (unsigned long long)key, cnt, n, left); }
         pthread_mutex_unlock(&G);
         regs[0] = 0; return 1;
     }
