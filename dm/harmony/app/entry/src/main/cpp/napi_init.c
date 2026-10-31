@@ -368,6 +368,208 @@ static napi_value CopyFdToFile(napi_env env, napi_callback_info info) {
     return out;
 }
 
+// np593：内容通道的**第二种入口** —— 直接解开一个 tar 到目标目录。
+//   为什么要有：全量 romfs 是 41,052 个文件 / 14 GB，用 USB/MTP 逐个拷要 30–140 分钟
+//   （MTP 是逐文件握手，瓶颈不是带宽）；而"1 个 tar 一次拷"只受带宽限制（USB3 约 5–15 分钟），
+//   并且**不再需要遍历 SAF 目录**（用户选一个文件即可，绕开 listFile(uri) 认不认 URI 的不确定点）。
+//   支持 ustar + GNU 长名（'L'）+ pax 扩展头（'x'，bsdtar 对长路径会用）——Windows 的 tar.exe
+//   就是 bsdtar，默认就可能写 pax，所以这三样必须都认。
+//   返回：解开成功的**普通文件个数**（double）；失败 -errno。
+// np593: the second entry of the content channel -- untar a single archive straight into a destination.
+//   The full romfs is 41,052 files / 14 GB and copying it over USB/MTP takes 30-140 minutes (MTP shakes hands
+//   per file; bandwidth is not the limit), whereas one tar is bounded by bandwidth alone (USB3 ~5-15 min) and
+//   no longer needs a SAF directory walk (the user picks ONE file, sidestepping whether listFile(uri) accepts a
+//   URI). Supports ustar, GNU long names ('L') and pax headers ('x', which bsdtar writes for long paths --
+//   Windows' tar.exe IS bsdtar, so all three must be understood).
+//   Returns the number of regular files extracted (double); on failure -errno.
+static void rd_skip(int fd, long long n, char *buf) {
+    while (n > 0) {
+        size_t chunk = (size_t)(n > (1 << 20) ? (1 << 20) : n);
+        ssize_t r = read(fd, buf, chunk);
+        if (r <= 0) return;
+        n -= r;
+    }
+}
+// 解包状态（供 ArkTS 轮询）。**必须在原生线程上跑**：14 GB 的解包要几分钟，
+// 放在 ArkTS 的调用线程上会把 UI 卡死，系统会按"应用无响应"处理。
+// Unpack state (polled from ArkTS). It MUST run on a native thread: unpacking 14 GB takes minutes and would
+// freeze the UI thread, which the system treats as "application not responding".
+enum { UT_IDLE = 0, UT_RUN = 1, UT_DONE = 2, UT_ERR = 3 };
+static volatile int g_ut_state;
+static volatile long long g_ut_files, g_ut_dirs, g_ut_bytes;
+static volatile int g_ut_err;
+static pthread_mutex_t g_ut_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void *untar_worker(void *p) {
+    struct job { int fd; char dest[1200]; } *j = (struct job *)p;
+    static char *buf;
+    buf = (char *)malloc(1u << 20);
+    char hdr[512];
+    char name[1200], pend[1200];
+    name[0] = 0; pend[0] = 0;
+    long long files = 0, dirs = 0, bytes = 0;
+    int err = 0;
+    for (;;) {
+        ssize_t r = read(j->fd, hdr, sizeof hdr);
+        if (r == 0) break;                                  // 正常结束
+        if (r != (ssize_t)sizeof hdr) { err = EIO; break; }
+        int allzero = 1;
+        for (int i = 0; i < 512; i++) if (hdr[i]) { allzero = 0; break; }
+        if (allzero) break;                                  // 归档尾部两个全零块
+        char tf = hdr[156];
+        long long size = 0;
+        for (int i = 124; i < 136 && hdr[i] >= '0' && hdr[i] <= '7'; i++) size = size * 8 + (hdr[i] - '0');
+        {   // 名字：ustar 的 prefix 字段优先拼上
+            char nm[101];
+            memcpy(nm, hdr, 100); nm[100] = 0;
+            if (!memcmp(hdr + 257, "ustar", 5) && hdr[345]) {
+                char pre[156];
+                memcpy(pre, hdr + 345, 155); pre[155] = 0;
+                snprintf(name, sizeof name, "%s/%s", pre, nm);
+            } else {
+                snprintf(name, sizeof name, "%s", nm);
+            }
+        }
+        if (pend[0]) { snprintf(name, sizeof name, "%s", pend); pend[0] = 0; }
+        long long pad = (512 - (size % 512)) % 512;
+        if (tf == 'x' || tf == 'g' || tf == 'L' || tf == 'K') {
+            // 扩展头：pax 是 "len key=value\n"，GNU 'L' 是纯长名
+            long long left = size;
+            while (left > 0) {
+                size_t chunk = (size_t)(left > (1 << 20) ? (1 << 20) : left);
+                ssize_t rr = read(j->fd, buf, chunk);
+                if (rr <= 0) break;
+                if (tf == 'L') {
+                    size_t k = (size_t)rr;
+                    if (k > sizeof pend - 1) k = sizeof pend - 1;
+                    memcpy(pend, buf, k); pend[k] = 0;
+                    for (size_t q = 0; q < k; q++) if (pend[q] == '\n' || pend[q] == 0) { pend[q] = 0; break; }
+                } else if (tf == 'x') {
+                    char *q0 = buf, *e0 = buf + rr;
+                    while (q0 < e0) {
+                        char *nl = (char *)memchr(q0, '\n', (size_t)(e0 - q0));
+                        if (!nl) break;
+                        char *eq = (char *)memchr(q0, '=', (size_t)(nl - q0));
+                        if (eq) {
+                            char *sp = (char *)memchr(q0, ' ', (size_t)(eq - q0));
+                            char *k = sp ? sp + 1 : q0;
+                            if ((size_t)(eq - k) == 4 && !memcmp(k, "path", 4)) {
+                                size_t vl = (size_t)(nl - eq - 1);
+                                if (vl > sizeof pend - 1) vl = sizeof pend - 1;
+                                memcpy(pend, eq + 1, vl); pend[vl] = 0;
+                            }
+                        }
+                        q0 = nl + 1;
+                    }
+                }
+                left -= rr;
+            }
+            rd_skip(j->fd, pad, buf);
+            continue;
+        }
+        if (tf == '5') {
+            char full[2400];
+            snprintf(full, sizeof full, "%s/%s", j->dest, name);
+            mkdirs(full); dirs++;
+            g_ut_dirs = dirs;
+            rd_skip(j->fd, pad, buf);
+            continue;
+        }
+        if (tf == '0' || tf == 0) {
+            char full[2400];
+            snprintf(full, sizeof full, "%s/%s", j->dest, name);
+            { char d2[2400]; snprintf(d2, sizeof d2, "%s", full);
+              char *sl = strrchr(d2, '/');
+              if (sl && sl != d2) { *sl = 0; mkdirs(d2); } }
+            int fd = open(full, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (fd >= 0) {
+                long long left = size;
+                while (left > 0) {
+                    size_t chunk = (size_t)(left > (1 << 20) ? (1 << 20) : left);
+                    ssize_t rr = read(j->fd, buf, chunk);
+                    if (rr <= 0) break;
+                    ssize_t off = 0;
+                    while (off < rr) {
+                        ssize_t w = write(fd, buf + off, (size_t)(rr - off));
+                        if (w <= 0) break;
+                        off += w;
+                    }
+                    left -= rr;
+                    bytes += rr;
+                    g_ut_bytes = bytes;
+                }
+                close(fd);
+                files++;
+                g_ut_files = files;
+            }
+            rd_skip(j->fd, pad, buf);
+            continue;
+        }
+        rd_skip(j->fd, size + pad, buf);                      // 符号链接等：跳过
+    }
+    if (buf) { free(buf); buf = NULL; }
+    OH_LOG_Print(LOG_APP, LOG_INFO, DM_LOG_DOMAIN, "dm-host",
+                 "untar 结束：文件 %{public}lld 个、目录 %{public}lld 个、%{public}lld MB err=%{public}d → %{public}s",
+                 files, dirs, bytes >> 20, err, j->dest);
+    close(j->fd);
+    free(j);
+    pthread_mutex_lock(&g_ut_lock);
+    g_ut_err = err;
+    g_ut_state = err ? UT_ERR : UT_DONE;
+    pthread_mutex_unlock(&g_ut_lock);
+    return NULL;
+}
+
+// untarTo(srcFd, destDir)：起一个原生线程解包，**立刻返回**（0 = 已开跑，-EBUSY = 已有一个在跑）。
+// untarTo(srcFd, destDir): start a native thread and return at once (0 = started, -EBUSY = one is running).
+static napi_value UntarTo(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2];
+    napi_value out = NULL;
+    if (napi_get_cb_info(env, info, &argc, argv, NULL, NULL) != napi_ok || argc < 2) {
+        napi_throw_error(env, NULL, "untarTo 需要 2 个参数：srcFd, destDir");
+        return NULL;
+    }
+    int32_t src = -1;
+    napi_get_value_int32(env, argv[0], &src);
+    char dest[1200];
+    size_t dn = 0;
+    napi_get_value_string_utf8(env, argv[1], dest, sizeof dest, &dn);
+    if (src < 0 || !dest[0]) { napi_create_int32(env, -EBADF, &out); return out; }
+    pthread_mutex_lock(&g_ut_lock);
+    if (g_ut_state == UT_RUN) { pthread_mutex_unlock(&g_ut_lock); napi_create_int32(env, -EBUSY, &out); return out; }
+    g_ut_state = UT_RUN; g_ut_files = 0; g_ut_dirs = 0; g_ut_bytes = 0; g_ut_err = 0;
+    pthread_mutex_unlock(&g_ut_lock);
+    mkdirs(dest);
+    struct job { int fd; char dest[1200]; } *j = (struct job *)calloc(1, sizeof *j);
+    j->fd = src;
+    snprintf(j->dest, sizeof j->dest, "%s", dest);
+    pthread_t th;
+    if (pthread_create(&th, NULL, untar_worker, j) != 0) { free(j); napi_create_int32(env, -EAGAIN, &out); return out; }
+    pthread_detach(th);
+    napi_create_int32(env, 0, &out);
+    return out;
+}
+
+// untarPoll()：给 ArkTS 轮询用。返回 "idle" / "run files=… MB=…" / "done files=… MB=…" / "err -N files=…"
+static napi_value UntarPoll(napi_env env, napi_callback_info info) {
+    (void)info;
+    char txt[160];
+    int st;
+    long long f, d, b;
+    int e;
+    pthread_mutex_lock(&g_ut_lock);
+    st = g_ut_state; f = g_ut_files; d = g_ut_dirs; b = g_ut_bytes; e = g_ut_err;
+    pthread_mutex_unlock(&g_ut_lock);
+    if (st == UT_IDLE) snprintf(txt, sizeof txt, "idle");
+    else if (st == UT_RUN) snprintf(txt, sizeof txt, "run files=%lld dirs=%lld MB=%lld", f, d, b >> 20);
+    else if (st == UT_DONE) snprintf(txt, sizeof txt, "done files=%lld dirs=%lld MB=%lld", f, d, b >> 20);
+    else snprintf(txt, sizeof txt, "err -%d files=%lld MB=%lld", e, f, b >> 20);
+    napi_value v = NULL;
+    napi_create_string_utf8(env, txt, NAPI_AUTO_LENGTH, &v);
+    return v;
+}
+
 // readLog(path)：读宿主日志尾部（起 guest 崩了之后，重启 app 时由 ArkTS 调它回看）。
 // 单独一个接口而不是靠 probe()：probe() 只在**本进程**调过 start() 时才知道日志路径，
 // 而崩溃后是新进程，路径得由 ArkTS 重新给。
@@ -811,6 +1013,8 @@ static napi_value Init(napi_env env, napi_value exports) {
         { "writeFile", NULL, WriteFile, NULL, NULL, NULL, napi_default, NULL },
         { "writeFileGz", NULL, WriteFileGz, NULL, NULL, NULL, napi_default, NULL },
         { "copyFdToFile", NULL, CopyFdToFile, NULL, NULL, NULL, napi_default, NULL },
+        { "untarTo", NULL, UntarTo, NULL, NULL, NULL, napi_default, NULL },
+        { "untarPoll", NULL, UntarPoll, NULL, NULL, NULL, napi_default, NULL },
     };
     napi_define_properties(env, exports, sizeof desc / sizeof desc[0], desc);
     return exports;

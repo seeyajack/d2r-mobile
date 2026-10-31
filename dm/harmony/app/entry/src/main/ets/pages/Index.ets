@@ -183,6 +183,59 @@ struct Index {
     return 0;
   }
 
+  // np593：**内容通道第二入口（推荐）** —— 选一个 .tar，原生线程解开到 <filesDir>/romfs。
+  //
+  // 为什么推荐这条而不是"选目录逐文件拷"：全量 romfs 是 41,052 个文件 / 14 GB，用 USB/MTP 逐个拷
+  // 要 30–140 分钟（MTP 是**逐文件握手**，瓶颈不是带宽），而"一个 tar 一次拷"只受带宽限制
+  // （USB3 约 5–15 分钟）。而且用户只需要选**一个文件**，绕开 `listFile(<目录 URI>)` 认不认 URI 的不确定点。
+  //
+  // 解包在原生线程跑（14 GB 要几分钟，放在 UI 线程会被系统判"应用无响应"），这里每秒轮询一次进度。
+  // np593: the second (recommended) entry of the content channel -- pick one .tar and unpack it on a native
+  // thread into <filesDir>/romfs. Copying 41,052 small files over USB/MTP takes 30-140 minutes because MTP
+  // shakes hands per file (bandwidth is not the limit), while one tar is bandwidth-bound only (USB3 ~5-15 min);
+  // and the user picks a single FILE, which sidesteps whether listFile(<dir URI>) accepts a URI. The unpack runs
+  // on a native thread (minutes for 14 GB; on the UI thread the system would call it "not responding"), so this
+  // polls the progress once a second.
+  private async unpackTar(ctx: common.UIAbilityContext): Promise<void> {
+    const dest = ctx.filesDir + '/romfs';
+    let uris: string[] = [];
+    try {
+      const p = new picker.DocumentViewPicker(ctx);
+      const opt = new picker.DocumentSelectOptions();
+      opt.selectMode = picker.DocumentSelectMode.FILE;
+      opt.maxSelectNumber = 1;
+      uris = await p.select(opt);
+    } catch (e) {
+      this.status = '选包失败：' + (e as Error).message;
+      return;
+    }
+    if (uris.length === 0) { this.status = '没有选包（取消）'; return; }
+    const uri = uris[0];
+    let fd = -1;
+    try {
+      fd = fs.openSync(uri, fs.OpenMode.READ_ONLY).fd;
+      const rc: number = dms2.untarTo(fd, dest);
+      if (rc !== 0) { this.status = '解包没起来 rc=' + rc; return; }
+      this.status = '解包中…（进度每秒刷新；大包要几分钟）';
+      // 轮询：原生侧跑完/出错就停
+      const timer = setInterval(() => {
+        const st: string = dms2.untarPoll();
+        this.status = '解包 ' + st;
+        if (st.startsWith('done') || st.startsWith('err')) {
+          clearInterval(timer);
+          try { fs.closeSync(fd); } catch (e) { }
+          const have: number = dms2.dirFileCount(dest);
+          this.status = '解包结束：' + st + '；沙箱 romfs 现有 ' + have + ' 个文件';
+          trace(ctx, '内容通道(tar)：' + uri + ' → ' + st + ' 沙箱=' + have);
+        }
+      }, 1000);
+      trace(ctx, '内容通道(tar)：开始解 ' + uri + ' → ' + dest + '（fd=' + fd + '）');
+    } catch (e) {
+      if (fd >= 0) { try { fs.closeSync(fd); } catch (e2) { } }
+      this.status = '解包异常：' + (e as Error).message;
+    }
+  }
+
   private writeFails: number = 0;   // np345：本轮解出的写入失败总数（extractRaw 里累加）
 
   // np592：**内容通道** —— 用 SAF 让用户选一个目录，把整棵树拷进 <filesDir>/romfs。
@@ -296,6 +349,24 @@ struct Index {
       // np592: content channel. Tap -> the system picker (pick a DIRECTORY) -> the whole tree is copied into
       // <filesDir>/romfs. The path is not hard-coded; SAF grants this app read access to whatever tree you pick.
       // Then tap "start guest" as usual: DM_ROMFS already points at that sandbox copy (no native change).
+      // np593：推荐入口。先在电脑上 `tar -cf romfs160.tar -C <romfs160> .`，把这一个文件拷进手机，
+      // 再点这里选它 —— 41,052 个小文件逐个拷要 30–140 分钟，一个大文件只受带宽限制。
+      // np593: the recommended entry. On the PC run `tar -cf romfs160.tar -C <romfs160> .`, copy that ONE file
+      // to the phone, then pick it here -- 41k small files over MTP take 30-140 min, one big file is
+      // bandwidth-bound only.
+      Button('选内容包 .tar → 解开到沙箱（推荐）')
+        .width('100%')
+        .backgroundColor('#4a3a6b')
+        .fontColor('#ffffff')
+        .onClick(async () => {
+          try {
+            const ctx = getContext(this) as common.UIAbilityContext;
+            await this.unpackTar(ctx);
+          } catch (e) {
+            this.status = '解包入口抛异常：' + e;
+          }
+        })
+
       Button('选内容目录 → 拷进沙箱（14GB 全量 romfs 用这个）')
         .width('100%')
         .backgroundColor('#2e3d5c')
