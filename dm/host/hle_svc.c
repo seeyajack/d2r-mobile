@@ -59,6 +59,19 @@ void dm_guest_commit_stack(void) {
     int rc = mprotect(g_stack, g_stack_cap, PROT_READ | PROT_WRITE);
     if (rc) LOG("【红】提交客体栈区失败 errno=%d（%s）", errno, strerror(errno));
     else LOG("客体栈区已提交可读写：%p +%zu MiB", (void *)g_stack, g_stack_cap >> 20);
+    // np553：栈区**底部再留 1 MB 溢出余量**。
+    //   实测客体线程 #1 的栈顶只比栈区起点高 0x3FE0（16 KB），它用了 0x4A60 就掉到栈区外面
+    //   （sp 比起点低 0xA80，落在 alias 区）⇒ ACCERR。真机上那里就是普通 RAM，溢出只是踩坏相邻数据、
+    //   不会当场缺页；我们把它提交成可写，行为才和硬件一致（顺带把"栈恰好用穿"从崩溃变成可观测）。
+    // np553: keep a 1 MB overflow margin below the stack region. Thread #1's stack top is only 0x3FE0
+    //   (16 KB) above the region start and it used 0x4A60, so sp fell 0xA80 below the region (into the
+    //   alias area) and faulted with ACCERR. On hardware that area is ordinary RAM and an overflow merely
+    //   corrupts neighbours; committing it keeps our behaviour close to the hardware.
+    if (g_alias && (uint8_t *)(g_stack - (1u << 20)) >= g_alias) {
+        if (mprotect(g_stack - (1u << 20), 1u << 20, PROT_READ | PROT_WRITE) == 0)
+            LOG("栈区底部溢出余量已提交 1 MiB");
+        else LOG("【黄】栈区底部余量提交失败 errno=%d", errno);
+    }
 }
 void *dm_guest_main_stack(size_t *size) { if (size) *size = g_main_stack_size; return g_main_stack_lo; }
 
