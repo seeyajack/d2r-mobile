@@ -667,8 +667,10 @@ static pthread_t g_sample_pt;
 #define SRING 1024
 static struct { uint64_t t, pc, lr, bt[16]; uint64_t x19, x20; int n; uint32_t h; } g_sring[SRING];   // x19/x20：停住时能看出"在操作哪个对象" | x19/x20: tells which object is being operated on when it stops
 static _Atomic unsigned g_shead;
+static unsigned g_sig_seen;   // np580：SIGUSR2 递送计数（区分"信号没送达"与"ring/直方图没打印"）
 static void on_sample(int sig, siginfo_t *si, void *uc_) {
     (void)sig; (void)si; ucontext_t *uc = uc_;
+    atomic_fetch_add(&g_sig_seen, 1);
     unsigned i = atomic_load(&g_shead) % SRING;
     extern uint64_t now_ns(void);
     uint32_t thr_cur_handle(void);
@@ -712,7 +714,7 @@ static void hist_add(uint64_t pc) {
 }
 static void hist_print(void) {
     if (!g_hist_total) return;
-    fprintf(stderr, "[dm] PC 直方图：%u 条采样，前 8：", g_hist_total);
+    fprintf(stderr, "[dm] PC 直方图：%u 条采样（SIGUSR2 送达 %u），前 8：", g_hist_total, atomic_load(&g_sig_seen));
     for (int rank = 0; rank < 8; rank++) {
         int best = -1; uint32_t bn = 0;
         for (int s = 0; s < HIST_SLOT; s++) if (g_hist[s].n > bn) { bn = g_hist[s].n; best = s; }
