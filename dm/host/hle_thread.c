@@ -274,6 +274,18 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
                         q->last_svc, (unsigned long long)q->nsvc, kn,
                         (unsigned long long)q->waddr, (unsigned long long)own, (unsigned long long)q->last_lr);
                 }
+                // np567：随 [stall] 打 0x1d 的 key 直方图（谁 signal 过哪个条件变量、几次）。
+                //   卡死判据：0x100d 等的 key 计数为 0 ⇒ 那个条件变量从未被 signal。
+                // np567: dump the 0x1d per-key histogram with [stall]. Stall criterion: the key 0x100d waits
+                //   on has count 0 ⇒ that condition variable was never signalled.
+                {
+                    extern void dm_cv_hist(uint64_t (*out)[2], int *n, int max);
+                    uint64_t rows[32][2]; int nr = 0;
+                    dm_cv_hist(rows, &nr, 32);
+                    for (int i = 0; i < nr; i++)
+                        LOG("[cvh] key=%#llx n=%llu by=%#llx", (unsigned long long)rows[i][0],
+                            (unsigned long long)rows[i][1] >> 32, (unsigned long long)(rows[i][1] & 0xFFFFFFFFu));
+                }
             }
         }
     }
@@ -325,6 +337,8 @@ static inline int cas32(uint64_t a, uint32_t *exp, uint32_t v) { return __atomic
 // np560: counters for 0x1c/0x1d hand-off evidence (on with DM_CV_PROBE=1, first few only). Read the env lazily:
 //   at .so load time the env is not set yet (napi sets it just before starting the host).
 static int g_cv_probe = -1, g_cv_sig;
+// np566：handoff 交接对象打点的计数（复用 cv_enabled() 的开关，DM_CV_PROBE 也打开它）
+static unsigned g_nhandoff;
 // np560：取号式限流（0x1c 与 0x1d 各自计数）。
 //   上一版只在结果行自增、交接行不自增 ⇒ 交接行无限打，np560 一轮 35,876 行，把日志预算与判读全冲垮。
 //   env 也必须惰性读：.so 加载时 envs 还没设（napi 起宿主前才设）。
@@ -337,10 +351,33 @@ static int cv_enabled(void) {
 }
 static int cv_take(int *n, int cap) { if (!cv_enabled() || *n >= cap) return 0; ++*n; return 1; }
 
+// np567：0x1d 的 per-key 直方图（条件变量 → signal 次数/最后发起者），随 [stall] 打出。
+// np567: per-key histogram of 0x1d (condition → signal count / last signaller), dumped with [stall].
+static struct { uint64_t key; unsigned n; uint32_t h; } g_cv_hist[32]; static int g_cvh_n;
+void dm_cv_hist(uint64_t (*out)[2], int *n, int max) {
+    for (int i = 0; i < g_cvh_n && i < max; i++) {
+        out[i][0] = g_cv_hist[i].key;
+        out[i][1] = ((uint64_t)g_cv_hist[i].n << 32) | g_cv_hist[i].h;
+    }
+    *n = g_cvh_n < max ? g_cvh_n : max;
+}
+
 static void lock_handoff(uint64_t addr) {
     thr_t *w = pick(1, addr); int more = 0;
     if (!w) { st32(addr, 0); return; }
     for (thr_t *t = g_wait; t; t = t->next) if (t != w && t->wkind == 1 && t->waddr == addr) { more = 1; break; }
+    // np566：交接对象打点（DM_HANDOFF_PROBE=1）。要回答的问题：0x100d 持锁又在 0x1c 里循环时，
+    //   释放锁的 handoff **把锁交给了谁**？如果答案总是"0x100d 自己"（它还挂在同地址的锁等待链上），
+    //   那就是它每次被交回、醒来、又进 0x1c —— 饥饿的直接机制，pick 的去重/过滤就是嫌疑。
+    // np566: record hand-off targets (DM_HANDOFF_PROBE=1). Question: while 0x100d holds the lock and spins in 0x1c,
+    //   WHO receives the lock at release? If it is always 0x100d itself (still linked on the same lock's wait chain),
+    //   it gets the lock back every time, wakes, re-enters 0x1c -- the direct starvation mechanism.
+    if (cv_enabled() && g_nhandoff < 240) {
+        thr_t *cur_t = cur();
+        ++g_nhandoff;
+        LOG("[ho] rel=%#x -> w=%#x addr=%#llx word=%#x more=%d", cur_t ? cur_t->handle : 0, w->handle,
+            (unsigned long long)addr, ld32(addr), more);
+    }
     st32(addr, w->wtag | (more ? WAITERS_BIT : 0));
     wake(w, 0);
 }
@@ -794,7 +831,21 @@ int svc_thread(int num, uint64_t *regs) {
         thr_t *t = cur(); uint64_t addr = regs[1];
         pthread_mutex_lock(&G);
         int64_t r = 0;
-        if (ld32(addr) == ((uint32_t)regs[0] | WAITERS_BIT)) { t->waddr = addr; t->wtag = (uint32_t)regs[2]; r = block(t, 1, -1); }
+        uint32_t word = ld32(addr);
+        if (word == ((uint32_t)regs[0] | WAITERS_BIT)) { t->waddr = addr; t->wtag = (uint32_t)regs[2]; r = block(t, 1, -1); }
+        // np566：条件不满足的现场（前 120 条）。主线程 4 万次 svc 0x1a 全走这条 else ⇒ 从不登记为
+        //   等待者 ⇒ pick/handoff 永远看不到它（[ho]=0 自洽）。为什么条件不满足：锁字 ≠ w0|WAITERS_BIT。
+        //   可能：(a) 锁字没 WAITERS_BIT（游戏用户态 CAS 置位前就发 svc）；(b) w0 ≠ 锁字里的 tag
+        //   （tag 复用/错误）。读数直接分辨。
+        // np566: snapshot when the condition fails (first 120). The main thread's 40k svc-0x1a all take this else,
+        //   never registering as a waiter -- that is why pick/handoff never see it ([ho]=0 is consistent). Why the
+        //   mismatch: word ≠ w0|WAITERS_BIT. Either (a) the word lacks WAITERS_BIT (svc before the user-mode CAS
+        //   set it), or (b) w0 ≠ the tag in the word (tag reuse/mismatch). The readings tell them apart.
+        else if (cv_take(&g_nhandoff, 120)) {
+            LOG("[lk] miss h=%#x addr=%#llx word=%#x w0=%#llx w2=%#llx wb=%d tag=%d",
+                t->handle, (unsigned long long)addr, word, (unsigned long long)regs[0], (unsigned long long)regs[2],
+                !!(word & WAITERS_BIT), word & ~WAITERS_BIT);
+        }
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }
@@ -850,8 +901,18 @@ int svc_thread(int num, uint64_t *regs) {
         for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // 按内核顺序；转为锁等待或被唤醒后不再是 kind 2 | In kernel order; once turned into a lock wait or woken it is no longer kind 2
         int left = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
         if (!left) st32(key, 0);
-        if (cv_take(&g_cv_sig, 60)) {
+        if (cv_take(&g_cv_sig, 60)) { ++g_cv_sig;
             LOG("[cv] 0x1d h=%#x key=%#llx cnt=%d 唤醒=%d 仍有等待者=%d", cur()->handle, (unsigned long long)key, cnt, n, left); }
+        // np567：0x1d 的 key 直方图（去重记账，随 [stall] 打出）——回答"这个条件变量
+        //   整个生命周期里被 signal 过几次、被谁"。卡死判据：0x100d 等的 key=0x…a518 计数为 0。
+        // np567: per-key histogram of 0x1d (dedup bookkeeping, dumped with [stall]) -- it answers "how many times
+        //   was this condition signalled, by whom". Stall criterion: the key 0x100d waits on has a count of 0.
+        {
+            int i;
+            for (i = 0; i < g_cvh_n; i++) if (g_cv_hist[i].key == key) break;
+            if (i == g_cvh_n && g_cvh_n < 32) { g_cv_hist[g_cvh_n].key = key; g_cv_hist[g_cvh_n].n = 0; g_cv_hist[g_cvh_n].h = 0; g_cvh_n++; }
+            if (i < g_cvh_n) { g_cv_hist[i].n++; g_cv_hist[i].h = cur()->handle; }
+        }
         pthread_mutex_unlock(&G);
         regs[0] = 0; return 1;
     }
