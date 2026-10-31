@@ -3060,12 +3060,42 @@ bool ui_cover_all(double hf){
         x0=std::min(x0,nx);x1=std::max(x1,nx);y0=std::min(y0,ny);y1=std::max(y1,ny);}
     return x0<0.002f && x1>0.998f && y0<0.002f && std::fabs(y1-float(hf))<0.002f;
 }
+// np539：建管线的阶段路标。np538 的现象是"两条 `NVN shader … loaded` 之后 1 毫秒就 SIGSEGV"，
+//   而现场拿不到（信号 11 冻结了 stderr 转发线程）⇒ 至少先知道死在哪一段：取描述符 / 建 render pass /
+//   组装顶点输入 / 算管线键 / 真的调 vkCreateGraphicsPipelines。
+//   默认只跟**前 2 次** draw（DM_DRAW_TRACE=N 可改，0 = 关），常态运行不产生噪声。
+// np539: stage breadcrumbs for pipeline creation. np538 died 1 ms after the two "NVN shader ... loaded" lines with
+//   no site to look at (SIGSEGV freezes the stderr forwarding thread), so at minimum learn which stage it dies in:
+//   descriptor setup / render pass / vertex input / pipeline key / the actual vkCreateGraphicsPipelines call.
+//   Only the first 2 draws are traced (DM_DRAW_TRACE=N overrides, 0 = off), so normal runs stay quiet.
+static int g_trace_draws = 0;
+static int trace_limit() { static int n = -1; if (n < 0) { const char *e = getenv("DM_DRAW_TRACE"); n = e ? atoi(e) : 2; } return n; }
+void dtrace(const char *what) { if (g_trace_draws < trace_limit()) xbg_logf("DRAWTRACE %s", what); }
+// np539：命令级路标。np539 真机证明崩点**不在 draw()**（DRAWTRACE 一条都没有），而是在 BIND_PROGRAM
+//   之后的下一条命令里。所以把每条命令的 op 打出来（默认只打前 240 条，DM_OP_TRACE=N 可改，0 = 关），
+//   崩在哪就看最后一条 OPTRACE —— op 编号见 gfx/nvn/nvn_obj.h 的 enum。
+// np539: command-level breadcrumbs. The np539 device run proved the crash is not inside draw() (no DRAWTRACE at
+//   all) but in the command right after BIND_PROGRAM, so log every command's op (first 240; DM_OP_TRACE=N
+//   overrides, 0 = off); the last OPTRACE line names the handler it died in. Op numbers: enum in gfx/nvn/nvn_obj.h.
+static int g_op_trace = 0;
+static int op_trace_limit() { static int n = -1; if (n < 0) { const char *e = getenv("DM_OP_TRACE"); n = e ? atoi(e) : 2000; } return n; }
+void dispatch_op_trace(unsigned op, unsigned size, unsigned depth) {
+    if (g_op_trace >= op_trace_limit()) return;
+    ++g_op_trace; xbg_logf("OPTRACE %u size=%u depth=%u", op, size, depth);
+}
+// np540：把"最后一条命令"记在全局里，崩溃现场直接读——路标可能因预算/日志回绕丢尾巴，这个不会。
+// np540: keep the last dispatched command in a global so the crash site can read it; the OPTRACE lines can be lost
+// to the budget or a log wrap, this cannot. extern "C" 是为了让 dm/host/crash.c 能直接按名字取到。
+extern "C" { volatile unsigned dm_last_cmd_op = 0xffffffffu; volatile unsigned dm_last_cmd_size = 0; }
+void dispatch_set_last(unsigned op, unsigned size) { dm_last_cmd_op = op; dm_last_cmd_size = size; }
 void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instances=1,uint32_t first_instance=0){preflight_cpu_reads();CPU_SCOPE(Draw);DrawRoot draw_timing_root(&cpu_scope);provenance_draw();
     need(state.rt.n>=0 && state.rt.n<=8,"Invalid draw color target count");
+    dtrace("1 enter");
     VkShaderModule modules[5]{};for(unsigned i=0;i<5;i++)if(state.shader[i])modules[i]=state.shader[i]->module;
     uint32_t active_colors=0;for(int i=0;i<state.rt.n;i++)if(state.rt.color[i])active_colors|=1u<<i;
     static std::vector<VkPipelineShaderStageCreateInfo> stages;stages.assign(5,VkPipelineShaderStageCreateInfo{});uint32_t stage_count=0;   // draw(): graphics thread only, not re-entrant
     int stage_result=xbg_graphics_stages(modules,state.rt.depth!=nullptr,active_colors,state.mask.mask,state.ms.a2c,stages.data(),&stage_count);
+    dtrace("2 stages");
     if(stage_result)xbg_fatalf("Invalid graphics stage/depth-only state: %d",stage_result);stages.resize(stage_count);need(count>=0 && first>=0,"Negative draw range");if(!count || (indexed && indexed->instances==0))return;provenance_draw();
     const int orig_count=count;std::vector<uint32_t> quad_indices;p_draw_idx quad_indexed{};
     if(prim==7 && !indexed){
@@ -3084,8 +3114,10 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
         if(uh>0 && uh<1){if(ui_cover_all(uh))ui_vs=1/uh;else if(ui_uy>0){auto u=state.ub[0][0];if(u.address && u.size>=64 && u.size<=4096){g_ui_moff=2*ui_uy;g_ui_moff_addr=u.address;}}}
         if(ui_vs==1 && g_ui_moff==0)ui_uy=0;}
     Commands c(true);Descriptors &d=acquire_descriptors();descriptors(d,c,false);Pass p;create_pass(p,c);
+    dtrace("3 pass");
     static std::vector<VkVertexInputAttributeDescription> attributes;attributes.clear();VkVertexInputBindingDescription binding_slots[16];uint32_t binding_used=0;
     int zero_binding=-1;
+    dtrace("4 attr");
     for(size_t input=0;input<state.shader[0]->inputs.size();input++){
         uint32_t loc=state.shader[0]->inputs[input];need(loc<16,"Vertex input location out of bounds");va_st a;memcpy(&a,&state.attrib[loc],4);
         if(!a.fmt){
@@ -3113,8 +3145,10 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};blend.attachmentCount=attachments.size();blend.pAttachments=attachments.data();memcpy(blend.blendConstants,state.blend_color,16);need(state.color.logic_op==3,"Non-copy logic operation unsupported");
     VkDynamicState dynamic[]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};dy.dynamicStateCount=2;dy.pDynamicStates=dynamic;
     VkPipelineTessellationStateCreateInfo tess{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};tess.patchControlPoints=state.patch_size;need((state.shader[1]!=nullptr)==(state.shader[2]!=nullptr),"Incomplete tessellation shader pair");
+    dtrace("6 ci");
     VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};ci.stageCount=stages.size();ci.pStages=stages.data();ci.pVertexInputState=&vi;ci.pInputAssemblyState=&ia;ci.pViewportState=&vp;ci.pRasterizationState=&rs;ci.pMultisampleState=&ms;ci.pDepthStencilState=&ds;ci.pColorBlendState=&blend;ci.pDynamicState=&dy;ci.pTessellationState=state.shader[1]?&tess:nullptr;ci.layout=d.pipeline_layout;ci.renderPass=p.pass;
     PipelineLease pipeline;{CPU_SCOPE(Pipeline);
+        dtrace("7 key");
         static std::vector<uint32_t> fast;fast.clear();bool use_fast=pipeline_fast_enabled && !ab_off("pipefast") && d.entry->definition.valid && p.definition->valid;
         bool memo=use_fast && pipe_memo && !ab_off("pipememo");
         if(memo){pipe_memo_fill(pipe_memo_next,&d.entry->definition,p.definition,p.pass,d.pipeline_layout,prim,p.samples,active_colors);
@@ -3122,9 +3156,10 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
         if(use_fast && !pipeline.pipeline){uint64_t a=uint64_t(uintptr_t(&d.entry->definition)),b=uint64_t(uintptr_t(p.definition));uint32_t ids[4]={uint32_t(a),uint32_t(a>>32),uint32_t(b),uint32_t(b>>32)};
             static XbgPipelineKey fkey;fkey.count=0;fkey.valid=true;   // 16 KB: one static, graphics thread only
             if(xbg_graphics_pipeline_key(fkey,ci,{ids,2,true},{ids+2,2,true})){fast.assign(fkey.words,fkey.words+fkey.count);auto f=pipeline_fast.find(fast);if(f!=pipeline_fast.end()){pipeline.pipeline=f->second;++pipeline_fast_hits;}}else use_fast=false;}
-        if(!pipeline.pipeline){XbgPipelineKey key;bool cacheable=xbg_graphics_pipeline_key(key,ci,d.entry->definition.view(),p.definition->view());pipeline_lookup(pipeline,key,cacheable,&ci,nullptr,async_skippable(attachments,ds));
+        if(!pipeline.pipeline){dtrace("8 create");XbgPipelineKey key;bool cacheable=xbg_graphics_pipeline_key(key,ci,d.entry->definition.view(),p.definition->view());pipeline_lookup(pipeline,key,cacheable,&ci,nullptr,async_skippable(attachments,ds));
             if(use_fast && cacheable && !pipeline.transient)pipeline_fast.emplace(fast,pipeline.pipeline);}
         if(memo && use_fast && pipeline.pipeline && !pipeline.transient){pipe_memo_key=pipe_memo_next;pipe_memo_pipeline=pipeline.pipeline;pipe_memo_valid=true;}}
+    if(g_trace_draws<trace_limit()){++g_trace_draws;xbg_logf("DRAWTRACE 9 pipeline=%p prim=%d count=%d",(void*)(uintptr_t)pipeline.pipeline,prim,orig_count);}
     // gfx-async-pipelines: this draw is skipped while its pipeline builds in the background
     if(!pipeline.pipeline)return;
     if(pipe_stats){uint64_t fr=stats.presents.load();if(fr>=3000 && fr<3060){auto &u=pstat_use[pipeline.pipeline];++u.draws;if(u.what.empty())u.what=pstat_what()+" "+std::to_string(p.width)+"x"+std::to_string(p.height);}
@@ -3691,6 +3726,8 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
         // Bound host arena use per frame slot; only at command boundaries.
         {Slot &cur=slots[slot_index];if(cur.recording && cur.stream.used_total+cur.readback.used_total>arena_flush_bytes){SiteScope site(SITE_ARENA);submit_slots(false);}}
         size_t available=command_available(pc);need(available>=8,"Truncated command header");op_hdr h;memcpy(&h,pc,8);need(h.size>=8 && !(h.size&7) && h.size<=available,"NVN command size outside pool");const uint8_t *p=pc+8;size_t n=h.size-8;cur_op=h.op;
+        dispatch_set_last((unsigned)h.op,(unsigned)h.size);
+        dispatch_op_trace((unsigned)h.op,(unsigned)h.size,depth);
         switch(h.op){
         case OP_END:return;
         case OP_BEGIN:break;
@@ -3706,7 +3743,17 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
                 break;}
             complete_all();cpu_access(addr,4,10);snapshot_invalidate(addr,4);auto ptr=reinterpret_cast<uint32_t*>(addr);if(mode==NVN_EVENT_SIGNAL_MODE_ADD)__atomic_fetch_add(ptr,v,__ATOMIC_SEQ_CST);else{need(mode==NVN_EVENT_SIGNAL_MODE_WRITE,"Unknown event mode");__atomic_store_n(ptr,v,__ATOMIC_SEQ_CST);}break;}
         case OP_COPY_B2B:{need(n>=24,"Truncated buffer copy");uint64_t a[3];memcpy(a,p,24);need(a[0]&&a[1]&&a[2]<=256ull*1024*1024,"Invalid buffer copy");if(gpu_buffer_copy(a[0],a[1],a[2]))break;cpu_access(a[0],a[2],11);invalidate_cpu_range(a[1],a[2]);memmove(reinterpret_cast<void*>(a[1]),reinterpret_cast<void*>(a[0]),a[2]);break;}
-        case OP_UPDATE_UB:{need(n>=16,"Truncated uniform update");uint64_t a[2];memcpy(a,p,16);need(a[0] && a[1]<=n-16,"Invalid uniform update");invalidate_cpu_range(a[0],a[1]);memcpy(reinterpret_cast<void*>(a[0]),p+16,a[1]);break;}
+        case OP_UPDATE_UB:{need(n>=16,"Truncated uniform update");uint64_t a[2];memcpy(a,p,16);need(a[0] && a[1]<=n-16,"Invalid uniform update");
+            // np541：崩点取证。np541 真机：第一条 UPDATE_UB 就往 0xbd40466d98 写（没有映射过）⇒ 直接 SEGV。
+            //   这里把目标地址、长度、该页是否已映射打出来（前 8 次），再和 BIND_UBO 的地址对照，
+            //   就能分清"游戏给的地址本来就在未映射区"和"录制/回放把地址读错了"。
+            // np541: crash-site evidence. On device the very first UPDATE_UB wrote to 0xbd40466d98 (never mapped) and
+            //   SEGV'd. Log the destination, length and whether that page is mapped (first 8 times) and compare with the
+            //   BIND_UBO addresses: that separates "the game's address is outside anything we mapped" from "recording /
+            //   replay read the address wrong".
+            {static int nub;if(nub<8){++nub;void *pg=(void*)(uintptr_t)(a[0]&~0xfffull);unsigned char mv=0;
+                xbg_logf("UBUPDATE #%d dst=%#llx n=%llu page_mapped=%d",nub,(unsigned long long)a[0],(unsigned long long)a[1],mincore(pg,0x1000,&mv)==0);}}
+            invalidate_cpu_range(a[0],a[1]);memcpy(reinterpret_cast<void*>(a[0]),p+16,a[1]);break;}
         case OP_SET_RT:state.rt=payload<p_set_rt>(p,n);break;
         case OP_CLEAR_COLOR:{auto a=payload<p_clear_color>(p,n);clear_attachment(&a,nullptr);break;}
         case OP_COUNT_+9:{auto a=payload<xbg_typed_clear>(p,n);clear_attachment(&a.color,nullptr,a.scalar);break;}
@@ -3719,7 +3766,12 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
         case OP_BIND_VATTR:{auto a=variable_payload<p_bind_vattr>(p,n);need(a.first==0 && a.n>=0 && a.n<=16 && n>=offsetof(p_bind_vattr,st)+size_t(a.n)*4,"Invalid vertex attribute record");need(xbg_vertex_attributes_replace(state.attrib,reinterpret_cast<const uint32_t*>(a.st),a.n)==0,"Invalid vertex attribute replacement");break;}
         case OP_BIND_VSTREAM:{auto a=variable_payload<p_bind_vstream>(p,n);need(a.first>=0 && a.n>=0 && a.first+a.n<=16 && n>=offsetof(p_bind_vstream,st)+size_t(a.n)*sizeof(vs_st),"Invalid vertex stream record");memcpy(state.stream+a.first,a.st,a.n*sizeof(vs_st));break;}
         case OP_BIND_VBUF:{auto a=variable_payload<p_bind_vbuf>(p,n);need(a.first>=0 && a.n>=0 && a.first+a.n<=16 && n>=offsetof(p_bind_vbuf,r)+size_t(a.n)*sizeof(NVNbufferRange),"Invalid vertex buffer record");memcpy(state.vb+a.first,a.r,a.n*sizeof(NVNbufferRange));break;}
-        case OP_BIND_UBO:case OP_BIND_SSBO:{auto a=payload<p_bind_buf>(p,n);need(a.stage>=0 && a.stage<6 && a.index>=0 && a.index<16,"Invalid shader buffer slot");(h.op==OP_BIND_UBO?state.ub:state.sb)[a.stage][a.index]={a.addr,a.size};++buf_gen[a.stage];break;}
+        case OP_BIND_UBO:case OP_BIND_SSBO:{auto a=payload<p_bind_buf>(p,n);need(a.stage>=0 && a.stage<6 && a.index>=0 && a.index<16,"Invalid shader buffer slot");
+            // np541：与 UBUPDATE 成对取证——看游戏绑定给着色器的缓冲区地址是不是也在未映射区。
+            // np541: pairs with UBUPDATE -- check whether the buffer addresses bound to the shaders are also unmapped.
+            {static int nb;if(nb<16){++nb;void *pg=(void*)(uintptr_t)(a.addr&~0xfffull);unsigned char mv=0;
+                xbg_logf("BINDBUF #%d op=%u st=%d idx=%d addr=%#llx size=%llu page_mapped=%d",nb,(unsigned)h.op,a.stage,a.index,(unsigned long long)a.addr,(unsigned long long)a.size,mincore(pg,0x1000,&mv)==0);}}
+            (h.op==OP_BIND_UBO?state.ub:state.sb)[a.stage][a.index]={a.addr,a.size};++buf_gen[a.stage];break;}
         case OP_BIND_TEX:case OP_BIND_SAMP:case OP_BIND_IMG:{auto a=variable_payload<p_bind_handles>(p,n);need(a.stage>=0 && a.stage<6 && a.first>=0 && a.n>=0 && a.n<=32 && a.first+a.n<=(h.op==OP_BIND_IMG?16:128) && n>=offsetof(p_bind_handles,h)+size_t(a.n)*8,"Invalid descriptor binding record");uint64_t *dst=h.op==OP_BIND_IMG?state.img[a.stage]:h.op==OP_BIND_SAMP?state.samp[a.stage]:state.tex[a.stage];memcpy(dst+a.first,a.h,a.n*8);++tex_gen[a.stage];break;}
         case OP_STENCIL:{auto a=payload<p_stencil>(p,n);need(a.face>=0 && a.face<=3 && a.which>=0 && a.which<=2,"Invalid stencil state");for(unsigned i=0;i<2;i++)if(a.face&(1<<i)){if(a.which==0)state.stencil_compare[i]=a.value_mask;else if(a.which==1)state.stencil_write[i]=a.mask;else state.stencil_ref[i]=a.ref;}break;}
         case OP_POLY_OFFSET:{auto a=payload<p_poly_offset>(p,n);state.bias[0]=a.factor;state.bias[1]=a.units;state.bias[2]=a.clamp;break;}
