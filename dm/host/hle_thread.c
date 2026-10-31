@@ -1124,6 +1124,17 @@ int svc_thread(int num, uint64_t *regs) {
                         for (int q = 0; q < 8; q++) fprintf(stderr, "%s%08x", q ? " " : "", w[q]);
                     }
                 }
+                // np590：把**已绑定的 SystemEvent** 全打一遍（只看 +0x10..+0x20 那几个字）。
+                //   要判的是"失败的那个对象是不是我们建过的那两个"：
+                //   - 若某个已绑定事件的读端字段仍是 0x10xx ⇒ 失败的是**第三个、从没建过**的事件；
+                //   - 若它变成了 4 ⇒ 有人在我们建完之后把结构体覆盖了。
+                // np590: dump every bound SystemEvent (only +0x10..+0x20). The question is whether the failing
+                //   object is one of the two we created: a read-end still 0x10xx means the failure is a THIRD,
+                //   never-created event; if it became 4, something overwrote the struct after we built it.
+                {
+                    fprintf(stderr, " bound:");
+                    void dm_se_report(void); dm_se_report();
+                }
                 fputc('\n', stderr);
             }
         }
@@ -1277,6 +1288,18 @@ int svc_thread(int num, uint64_t *regs) {
 // CreateSystemEvent(inter-process=true), and the SDK creates the kernel event through SVC 0x45; the write-end handle is recorded, after which any thread (including the host audio thread) can signal it.
 static struct { void *ev; uint32_t wh; } g_se[512];
 static int g_nse;
+// np590：把已绑定的 SystemEvent 逐个报一遍（只看 +0x10..+0x20）。给"句柄无效"那条日志用：
+//   要判的是"失败的对象是不是我们建过的那个" —— 读端字段还是 0x10xx = 是别的事件；变成 4 = 被覆盖了。
+// np590: report every bound SystemEvent (only +0x10..+0x20). Used by the invalid-handle log: a read-end field
+//   still at 0x10xx means the failure is some other event; if it turned into 4, the struct was overwritten.
+void dm_se_report(void) {
+    fprintf(stderr, " n=%d", g_nse);
+    for (int i = 0; i < g_nse && i < 8; i++) {
+        uint32_t w[8]; vm_size_t got = 0;
+        if (!vm_read_overwrite(mach_task_self(), (vm_address_t)(uintptr_t)g_se[i].ev, sizeof w, (vm_address_t)w, &got) && got == sizeof w)
+            fprintf(stderr, " {ev=%p wh=%#x rd=%#x}", g_se[i].ev, g_se[i].wh, w[5]);
+    }
+}
 static pthread_mutex_t g_se_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t se_find(void *ev) {
     for (int i = 0; i < g_nse; i++) if (g_se[i].ev == ev) return g_se[i].wh;
@@ -1297,6 +1320,20 @@ void hle_bind_system_event(void *ev, int autoclear) {      // 必须在客体线
     // np459: log the write-end handle the SDK produced. A garbage value (e.g. 0x4) means the SDK's
     // CreateSystemEvent never really created the kernel event, and later waits spin on that value.
     LOG("SystemEvent 绑定：ev=%p 写端句柄=%#x", ev, wh);
+    // np590：把结构体本体打出来。要判的是"读端字段到底写进去没有"：
+    //   SDK 的 TryWaitSystemEvent 读的是读端句柄，实测它拿到 4，而 GetWritableHandle 拿到 0x1011
+    //   ⇒ 两个字段里只有一个是对的。这里一次看清 ev 的头 0x20 字节。
+    // np590: dump the struct itself. The question is whether the READ-end field was written at all: the SDK's
+    //   TryWaitSystemEvent reads it and gets 4, while GetWritableHandle gets 0x1011 -- so only one of the two
+    //   fields is right. One dump of the first 0x20 bytes settles it.
+    {
+        uint32_t w[8]; vm_size_t got = 0;
+        if (!vm_read_overwrite(mach_task_self(), (vm_address_t)(uintptr_t)ev, sizeof w, (vm_address_t)w, &got) && got == sizeof w) {
+            fprintf(stderr, "[dm]   ev 头 0x20：");
+            for (int q = 0; q < 8; q++) fprintf(stderr, "%s%08x", q ? " " : "", w[q]);
+            fputc('\n', stderr);
+        }
+    }
     pthread_mutex_lock(&g_se_lock);
     if (g_nse >= (int)(sizeof g_se / sizeof g_se[0])) die("SystemEvent 绑定表满");
     g_se[g_nse].ev = ev; g_se[g_nse++].wh = wh;
