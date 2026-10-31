@@ -731,6 +731,7 @@ static void *sampler(void *p) {
     uint64_t hist_next = 0;
     for (;;) {
         usleep(us);
+        { static unsigned hb; if (++hb % 500 == 0) fprintf(stderr, "[dm] sampler 心跳 #%u g_shead=%u sig_seen=%u", hb, atomic_load(&g_shead), atomic_load(&g_sig_seen)); }
         if (g_sample_name && !strcmp(g_sample_name, "*")) {        // 全部客体线程轮一遍 | Cycle through all guest threads
             int thr_list(pthread_t *out, int max); pthread_t all[64]; int n = thr_list(all, 64);
             for (int k = 0; k < n; k++) { pthread_kill(all[k], SIGUSR2); usleep(200); }
