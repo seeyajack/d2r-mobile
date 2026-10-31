@@ -269,10 +269,11 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
                     int kq = q->wkind; const char *kn = (const char *[]){ "none", "lock", "cond", "addr", "sync" }[(kq >= 0 && kq < 5) ? kq : 0];
                     uint64_t own = 0;
                     if (kq == 1 && q->waddr) { uint32_t tag = 0; memcpy(&tag, (const void *)(uintptr_t)q->waddr, 4); own = tag & ~0x40000000u; }
-                    LOG("[stall] h=%#x st=%s%s svc=%#x n=%llu wait=%s addr=%#llx owner=%#llx lr=%#llx",
+                    LOG("[stall] h=%#x st=%s%s svc=%#x n=%llu wait=%s addr=%#llx owner=%#llx lr=%#llx wseq=%llu prio=%d",
                         q->handle, q->started ? "run" : "idle", q->exited ? "/exit" : "",
                         q->last_svc, (unsigned long long)q->nsvc, kn,
-                        (unsigned long long)q->waddr, (unsigned long long)own, (unsigned long long)q->last_lr);
+                        (unsigned long long)q->waddr, (unsigned long long)own, (unsigned long long)q->last_lr,
+                        (unsigned long long)q->wseq, q->prio);
                 }
                 // np567：随 [stall] 打 0x1d 的 key 直方图（谁 signal 过哪个条件变量、几次）。
                 //   卡死判据：0x100d 等的 key 计数为 0 ⇒ 那个条件变量从未被 signal。
