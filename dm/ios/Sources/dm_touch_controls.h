@@ -40,6 +40,7 @@ typedef struct {
               The gesture layer only fixes the type; on seeing it the front end forwards the start point and current point to the host (dm_ui_drag_*), and the scroll / slider is done by the host according to the game's own hit testing */
     int ui_drag;
     int shop_drag;   /* 从商人货架的货上起拖（不拿起）：松手按落点买 / 不买 | Drag starting from goods on the vendor shelf (not picked up): on release, buy / do not buy by the drop point */
+    int cam_drag; float cam_x, cam_y;   /* 镜头实验：右半屏空白处拖动看四周（已定型、上一次的点） | camera experiment: drag on the empty right half to look around (fixed, previous point) */
     int locked_drag; /* 单件任务槽占用时从别的物品上起拖：不拿起，松手不发任何键 | Drag starting from another item while the single-item quest slot is occupied: do not pick up, and send no key on release */
 } dm_tc_finger;
 typedef struct {
@@ -92,6 +93,14 @@ typedef struct {
        A tap in game state (no panel open) = tap the game world: the finger did not land on any widget target (including landing in the stick area without dragging), less than 0.35 seconds from press to lift, displacement within the tap threshold
               → world_tap_seq is incremented, and on seeing a change the front end calls the host's dm_world_tap (tap an item name to pick up / tap an NPC to talk / tap a chest; tapping empty ground sends nothing). */
     unsigned world_tap_seq; float world_tap_x, world_tap_y;
+    /* 镜头实验：cam_on = 前端每次按下前填的档（0 关、1 越肩、2 第一人称）；cam_pitch / cam_yaw = 右半屏拖出来还没交出去的弧度，前端取走后清零
+       Camera experiment: cam_on = the mode the front end fills in before each touch-down (0 off, 1 over-the-shoulder, 2 first person); cam_pitch / cam_yaw =
+       radians dragged on the right half not yet handed over, zeroed once the front end takes them */
+    int cam_on; float cam_pitch, cam_yaw;
+    /* cam_orbit = 前端填：越肩档右半屏左右拖也转镜头（原神式，宿主 dm_cam_style = 1；0 = 越肩只认上下，同原来）
+       cam_orbit = filled in by the front end: in over-the-shoulder a horizontal drag on the right half also turns the camera (Genshin style, host
+       dm_cam_style = 1; 0 = over-the-shoulder takes vertical only, as before) */
+    int cam_orbit;
     int close_left; double close_next_s;   /* 面板外点按后还要按几下 B、下一下最早什么时候（按到面板关掉为止） | After a tap outside the panel, how many more B presses remain and the earliest time of the next one (press until the panel is closed) */
     /* 商人页：这次按下落在货架的货上（前端按宿主命中结果 7 置位）。从货上起拖 = 想买：不发「拿起」、光标留在那件货上（宿主买的是光标选中的那件）；
        松手时 shop_drop_seq 加一，前端按落点决定——落在背包类物品区 = 买，拖回货架 / 面板外 / 别处 = 不买
@@ -160,10 +169,12 @@ void dm_tc_resize(dm_tc_state *state, float width, float height);
 void dm_tc_enable_targets(dm_tc_state *state, uint32_t mask);
 /* 导航模式（面板 / 对话 / 前端页开着）下可用的控件：右侧五个虚拟手柄圆钮（确认 / 返回 / 操作 / 绑定 / 下一页 = A B X Y R）。
    底栏十字位置的「关闭」不再给：面板的关闭入口只留一个（外框右上角的关闭按钮；圆钮还在时另有「返回」）。
-   pad = 0：五个圆钮也不给（局内手指直接点界面接上之后用，开关 DM_TOUCH_NAV_PAD=0，缺省 1）。两个前端共用这一处，不各写各的。
+   pad = 0：五个圆钮也不给。这是缺省——局内手指直接点界面已接上（点按 / 双击 / 拖放 / 点页签 / 面板外点按），各前端只在 DM_TOUCH_NAV_PAD=1 时（调试用）给 pad = 1。两个前端共用这一处，不各写各的。
    Widgets available in navigation mode (a panel / dialog / front-end page is open): the five virtual controller round buttons on the right (confirm / back / action / bind / next page = A B X Y R).
       The "close" at the bottom bar's cross position is no longer offered: only one close entry for panels remains (the close button at the top-right corner of the frame; while the round buttons are present there is also "back").
-      pad = 0: the five round buttons are not offered either (used once in-run fingers tapping the UI directly is hooked up; switch DM_TOUCH_NAV_PAD=0, default 1). Both front ends share this one place and do not each write their own. */
+      pad = 0: the five round buttons are not offered either. This is the default -- fingers tapping the UI directly are hooked up in a run (tap / double-tap /
+      drag / tab tap / tap outside the panel), and the front ends pass pad = 1 only with DM_TOUCH_NAV_PAD=1 (for debugging). Both front ends share this one place
+      and do not each write their own. */
 static inline uint32_t dm_tc_nav_mask(int pad) { return pad ? ((1u<<DM_TC_MAIN)|(1u<<DM_TC_SKILL1)|(1u<<DM_TC_SKILL2)|(1u<<DM_TC_SKILL3)|(1u<<DM_TC_SKILL4)) : 0; }
 /* 模式变化释放全部手势；导航模式只按键，不启用技能拖拽和地图取消区。 | A mode change releases all gestures; navigation mode only presses keys and does not enable skill dragging or the map cancel area. */
 void dm_tc_set_navigation_mode(dm_tc_state *state, int navigation_mode);

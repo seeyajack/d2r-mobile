@@ -20,6 +20,8 @@ import android.text.SpanWatcher;
 import android.text.Spannable;
 import android.text.Spanned;
 import android.text.TextWatcher;
+import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.inputmethod.BaseInputConnection;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -39,7 +41,9 @@ import java.io.OutputStream;
 import java.lang.ref.WeakReference;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.HashSet;
 import java.util.Locale;
+import java.util.Set;
 
 public class DmActivity extends Activity implements SurfaceHolder.Callback, DisplayManager.DisplayListener {
     static native int nativeStart(String filesDir, String extDir, String romfsSrc, String lang);
@@ -48,6 +52,29 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     static native void nativeTouch(int n, int[] ids, float[] xs, float[] ys);
     static native void nativeFocus(int ev);
     static native void nativeTextResult(long id, boolean accepted, String text);
+    // 越肩镜头的体感转向（CamSensor）：开哪种传感器（0 = 不开），每次转动的弧度
+    // Sensor steering of the over-the-shoulder camera (CamSensor): which sensor to listen to (0 = none), each turn in radians
+    static native int nativeCamSensor();
+    static native void nativeCamTurn(float rad);
+    // 镜头档（nativeStart 之后才准）与「此刻在局里、镜头在出图」（CamButtons）
+    // The camera mode (valid only after nativeStart) and "in a game right now with the camera drawing" (CamButtons)
+    static native int nativeCamMode();
+    static native int nativeCamActive();
+    // 越肩档的操作风格（1 = 原神式：没有左右转按钮）
+    // The over-the-shoulder control style (1 = Genshin style: no turn buttons)
+    static native int nativeCamStyle();
+    // 拖技能键瞄准时地上那个环（CamThreats）：5 × 5 网格点，返回 25 = 正在瞄
+    // The ground ring while a skill button is dragged to aim (CamThreats): a 5 x 5 grid of points, returns 25 = aiming
+    static native int nativeCamAim(float[] out);
+    // 画面外的怪（CamThreats）：每条 5 个数，返回条数
+    // Monsters off the picture (CamThreats): 5 numbers each, returns the count
+    static native int nativeCamThreats(float[] out);
+    // 小地图上的朝向箭头（CamThreats）：4 个数，返回 1 = 该画
+    // Heading arrow on the minimap (CamThreats): 4 numbers, returns 1 = draw it
+    static native int nativeCamHeading(float[] out);
+    static native void nativePad(long buttons, int lx, int ly, int rx, int ry);
+    static native void nativePadMode(int pad);
+    static native void nativePadGlyph(int glyph);
 
     private static WeakReference<DmActivity> current = new WeakReference<>(null);
     private static volatile int bootFailure;
@@ -61,6 +88,9 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     private boolean libraryLoaded;
     private boolean resumed;
     private DisplayManager displays;
+    private CamSensor camSensor;
+    private CamButtons camButtons;
+    private CamThreats camThreats;
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
@@ -73,6 +103,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         current = new WeakReference<>(this);
         displays = getSystemService(DisplayManager.class);
         if (displays != null) displays.registerDisplayListener(this, null);
+        camSensor = new CamSensor(this);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         getWindow().getAttributes().layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
         view = new SurfaceView(this);
@@ -86,6 +117,54 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     private void immersive() {
         WindowInsetsController c = getWindow().getInsetsController();
         if (c != null) { c.hide(WindowInsets.Type.systemBars()); c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE); }
+    }
+
+    // 实体手柄：按键与摇杆在 PadInput 里合成宿主的手柄状态（nativePad → dm_pad_set），与触屏的虚拟手柄在游戏取手柄时合并。
+    // 手柄事件在这里吃掉，不再往下传给视图（否则会触发触摸控件、系统返回等）。
+    // Physical controller: keys and sticks are merged in PadInput into the host controller state (nativePad -> dm_pad_set), combined with
+    // the touch stick when the game reads the controller. Controller events are consumed here and not passed on to the views.
+    @Override public boolean dispatchKeyEvent(KeyEvent e) {
+        if (PadInput.onKey(e)) return true;
+        return super.dispatchKeyEvent(e);
+    }
+
+    @Override public boolean onGenericMotionEvent(MotionEvent e) {
+        if (PadInput.onMotion(e)) return true;
+        return super.onGenericMotionEvent(e);
+    }
+
+    // 手柄布局下碰屏 = 切回触屏布局，这一根手指整根不执行（此刻触控控件还没露出来，落点可能正好压在看不见的按钮上；
+    // iOS 的 front_ios.m 同样把这根手指吞掉）。之后的手指正常。
+    // Touching the screen in the controller layout = back to the touch layout, and that finger is swallowed for its whole life (the touch
+    // widgets are not shown yet and the landing point may sit on an invisible button; iOS front_ios.m swallows it the same way).
+    private final Set<Integer> swallowed = new HashSet<>();
+
+    @Override public boolean dispatchTouchEvent(MotionEvent e) {
+        int action = e.getActionMasked();
+        if (action == MotionEvent.ACTION_DOWN) {
+            boolean wasPad = PadInput.isPadMode();
+            PadInput.onTouch();
+            if (wasPad) swallowed.add(e.getPointerId(0));
+        }
+        boolean swallowThis = false;
+        for (int i = 0; i < e.getPointerCount(); i++) if (swallowed.contains(e.getPointerId(i))) swallowThis = true;
+        if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) swallowed.clear();
+        else if (action == MotionEvent.ACTION_POINTER_UP) swallowed.remove(e.getPointerId(e.getActionIndex()));
+        if (swallowThis) return true;
+        return super.dispatchTouchEvent(e);
+    }
+
+    // 手柄布局隐藏触控控件（iOS 由覆盖层的 _padMode 控制） | The controller layout hides the touch widgets (iOS does it through _padMode)
+    static void onPadMode(boolean pad) {
+        DmActivity a = current.get();
+        if (a == null) return;
+        a.applyPadMode(pad);
+    }
+
+    private void applyPadMode(boolean pad) {
+        if (touchOverlay == null) return;
+        touchOverlay.setInputEnabled(!pad);
+        touchOverlay.setVisibility(pad ? View.GONE : View.VISIBLE);
     }
 
     // 资源在玩家放的位置读（缺省 Download/S2X/D2R Mobile/data），要「所有文件访问」权限；没有就引导去系统设置页，回来再启动
@@ -267,7 +346,20 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             showStartError(resource == 0 ? getString(R.string.dmAndroidStartFailed, result) : getString(resource)); return;
         }
         started = true;
-        touchOverlay.setInputEnabled(true);
+        applyPadMode(PadInput.isPadMode());
+        if (camSensor != null) camSensor.start(nativeCamSensor());
+        // 越肩镜头的左右转按钮：盖在触屏层上面，只收按钮上的触摸。镜头可以在局中从「自定义」页打开（dm_cam.c dm_cam_mode），所以总是加上：
+        // 镜头没在出图时按钮不画、触摸全部漏给下面的触屏层（nativeCamActive，每帧问一次）
+        // Turn buttons of the over-the-shoulder camera: above the touch layer, taking only touches on the buttons. The camera can be turned on mid-game from
+        // the Custom page (dm_cam.c dm_cam_mode), so they are always added: while the camera is not drawing the buttons are not drawn and every touch falls
+        // through to the touch layer below (nativeCamActive, asked every frame)
+        // 画面外的怪的箭头与地图上的朝向箭头放在按钮下面一层：只画不收触摸，镜头关着时什么都不画
+        // The off-picture monster arrows and the map heading arrow go one layer below the buttons: drawing only, no touches, nothing drawn while the camera is off
+        if (camButtons == null) {
+            camThreats = new CamThreats(this); gameFrame.addView(camThreats, new FrameLayout.LayoutParams(-1, -1));
+            camButtons = new CamButtons(this); gameFrame.addView(camButtons, new FrameLayout.LayoutParams(-1, -1)); }
+        if (camButtons != null) camButtons.start();
+        if (camThreats != null) camThreats.start();
         nativeFocus(3);
     }
 
@@ -389,8 +481,8 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     @Override public void onDisplayAdded(int id) { updateRefresh(); }
     @Override public void onDisplayRemoved(int id) { updateRefresh(); }
     @Override public void onDisplayChanged(int id) { updateRefresh(); }
-    @Override protected void onResume() { super.onResume(); resumed = true; immersive(); startHost(); updateRefresh(); if (started) { nativeFocus(3); if (touchOverlay != null && bootFailure == 0) touchOverlay.setInputEnabled(true); } }
-    @Override protected void onPause() { resumed = false; if (inputDialog != null) inputDialog.dismiss(); releaseTouches(); if (touchOverlay != null) touchOverlay.setInputEnabled(false); if (started) nativeFocus(0); super.onPause(); }
+    @Override protected void onResume() { super.onResume(); resumed = true; immersive(); startHost(); updateRefresh(); if (started) { nativeFocus(3); if (touchOverlay != null && bootFailure == 0) applyPadMode(PadInput.isPadMode()); if (camSensor != null) camSensor.start(nativeCamSensor()); if (camButtons != null) camButtons.start(); if (camThreats != null) camThreats.start(); } }
+    @Override protected void onPause() { resumed = false; if (camSensor != null) camSensor.stop(); if (camButtons != null) camButtons.stop(); if (camThreats != null) camThreats.stop(); if (inputDialog != null) inputDialog.dismiss(); releaseTouches(); PadInput.reset(); if (touchOverlay != null) touchOverlay.setInputEnabled(false); if (started) nativeFocus(0); super.onPause(); }
     @Override protected void onStart() { super.onStart(); if (started) nativeFocus(2); }
     @Override protected void onStop() { if (started) nativeFocus(1); com.xiaoboluo.d2r.widget.HeroWidgetProvider.requestUpdate(this); super.onStop(); }
     @Override protected void onDestroy() { if (displays != null) displays.unregisterDisplayListener(this); if (inputDialog != null) inputDialog.dismiss(); if (current.get() == this) current.clear(); super.onDestroy(); }

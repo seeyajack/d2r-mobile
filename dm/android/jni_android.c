@@ -13,6 +13,7 @@
 //   resource dir (default /sdcard/Download/S2X/D2R Mobile/data)  the player's 18 .data archives + .build.config; the App creates romfs/data/ in the internal dir linking to each of them
 //   <internal dir>/save, temp        saves and temporary files
 #include "../host/dm.h"
+#include "../host/dm_input.h"
 #include "../host/front.h"
 #include "../host/hle.h"
 #include <android/log.h>
@@ -27,6 +28,11 @@
 #include "dm_overlay_contract.h"
 #include <sys/stat.h>
 #include <unistd.h>
+
+// 手柄 / 触屏布局与键帽切换（dm_padmode.c 里定义、没有头文件；iOS 由 front_ios.m 直接调）
+// Controller / touch layout and key-cap switching (defined in dm_padmode.c without a header; iOS calls it from front_ios.m)
+void dm_padmode_request(int pad);
+void dm_padmode_request_glyph(int glyph);
 
 void front_android_set_window(void *win, int w, int h);
 void front_android_set_refresh(float hz);
@@ -194,16 +200,16 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     // on the Redmi K50 Ultra camp GPU -0.5 ms and live image memory 827 -> 320 MB.
     setenv("DM_GFX_NATIVE_BC", "1", 0);
     // 片元着色器的四元组邻居交换改用精细导数（引擎的 gfx-quad-derivatives；标记文件仍优先）：Adreno 上辅助调用在子组洗牌里取到垃圾，
-    // 罪恶洞穴打斗时单位周围出现黑方块。
+    // 罪恶洞穴打斗时单位周围出现黑方块。Adreno 740/750 上引擎缺省关掉它（那两个驱动会丢掉设备，见 xbg_adreno_policy.h）。
     // Fragment-shader quad-neighbour shuffles go through fine derivatives (the engine's gfx-quad-derivatives; a marker file
     // still wins): on Adreno helper invocations read garbage in subgroup shuffles, and black squares appeared around units in
-    // the Den of Evil fight.
+    // the Den of Evil fight. On Adreno 740/750 the engine defaults it off (those drivers drop the device; see xbg_adreno_policy.h).
     setenv("DM_GFX_QUAD_DERIVATIVES", "1", 0);
     // 按 32 道线程束翻译的计算着色器，在 64 道的子组里每 32 道各当一个线程束（引擎的 gfx-warp32；标记文件仍优先）：Adreno 上
-    // 杂物、草地、流体与 PPR 着色器的线程束聚合追加丢了 32–63 号车道、条目互相覆盖。
+    // 杂物、草地、流体与 PPR 着色器的线程束聚合追加丢了 32–63 号车道、条目互相覆盖。Adreno 740/750 上引擎缺省关掉它。
     // Compute shaders translated for 32-lane warps run every 32 lanes of a 64-lane subgroup as their own warp (the engine's
     // gfx-warp32; a marker file still wins): on Adreno the clutter, grass, fluid and PPR shaders' warp-aggregated appends lost
-    // lanes 32-63 and overwrote entries.
+    // lanes 32-63 and overwrote entries. On Adreno 740/750 the engine defaults it off.
     setenv("DM_GFX_WARP32", "1", 0);
     // 翻译器输出的两项等价整理（引擎的 gfx-ldc-fold 与 gfx-forward-temps；标记文件仍优先）：常量缓冲区按字寻址时可推出的分量下标
     // 换成常量，只写一次的临时变量直接转发。Redmi K50 Ultra 营地（比例 0.75）GPU 每帧 15.70 → 14.34 ms，结果不变。
@@ -312,6 +318,42 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
 }
 
 static ANativeWindow *g_win;
+// 越肩镜头的体感转向（dm/host/dm_cam.c、CamSensor.java）：开哪种传感器（0 = 不开），以及每次转动的弧度（正 = 往画面右边转）
+// Sensor steering of the over-the-shoulder camera (dm/host/dm_cam.c, CamSensor.java): which sensor to listen to (0 = none), and each turn in radians
+// (positive = towards the right of the picture)
+int dm_cam_sensor_mode(void); void dm_cam_turn(float rad); int dm_cam_mode(void); int dm_cam_on(void);
+JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeCamSensor(JNIEnv *env, jclass cls) { (void)env; (void)cls; return dm_cam_sensor_mode(); }
+// 镜头档（DM_CAM，nativeStart 读进环境之后才准）与「此刻在局里、镜头在出图」（CamButtons 据此显示左右转按钮）
+// The camera mode (DM_CAM, valid only after nativeStart has loaded the environment) and "in a game right now with the camera drawing" (CamButtons shows the
+// turn buttons by it)
+JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeCamMode(JNIEnv *env, jclass cls) { (void)env; (void)cls; return dm_cam_mode(); }
+JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeCamActive(JNIEnv *env, jclass cls) { (void)env; (void)cls; return dm_cam_on(); }
+// 越肩档的操作风格（dm_cam.c dm_cam_style）：1 = 原神式，转镜头靠右半屏拖动，CamButtons 不出左右转按钮
+// The over-the-shoulder control style (dm_cam.c dm_cam_style): 1 = Genshin style, the camera turns by dragging the right half, so CamButtons shows no turn
+// buttons
+int dm_cam_style(void);
+JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeCamStyle(JNIEnv *env, jclass cls) { (void)env; (void)cls; return dm_cam_style(); }
+// 瞄准环（dm_cam.c dm_cam_aim）：5 × 5 网格点（x、y，0..1），返回 25 = 正在瞄；CamThreats 每帧取一次
+// Aim ring (dm_cam.c dm_cam_aim): a 5 x 5 grid of points (x, y, 0..1), returns 25 = aiming; CamThreats takes it once per frame
+int dm_cam_aim(float out[50]);
+JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeCamAim(JNIEnv *env, jclass cls, jfloatArray out) {
+    (void)cls; float buf[50]; if ((*env)->GetArrayLength(env, out) < 50) return 0; int n = dm_cam_aim(buf);
+    if (n == 25) (*env)->SetFloatArrayRegion(env, out, 0, 50, buf); return n; }
+// 画面外的怪（dm_cam.c dm_cam_threats）：每条 5 个数（屏幕 x、y、箭头方向、紧迫度、档位），返回条数；CamThreats 每帧取一次
+// Monsters off the picture (dm_cam.c dm_cam_threats): 5 numbers each (screen x, y, arrow direction, urgency, tier), returns the count; CamThreats takes them
+// once per frame
+int dm_cam_threats(float *out, int max);
+JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeCamThreats(JNIEnv *env, jclass cls, jfloatArray out) {
+    (void)cls; jsize len = (*env)->GetArrayLength(env, out); float buf[16 * 5]; int max = len / 5 < 16 ? len / 5 : 16;
+    int n = dm_cam_threats(buf, max); if (n > 0) (*env)->SetFloatArrayRegion(env, out, 0, n * 5, buf); return n; }
+// 小地图上的朝向箭头（dm_cam.c dm_cam_map_heading）：4 个数（中心 x、y、箭头方向、小地图框高），返回 1 = 该画；CamThreats 每帧取一次
+// Heading arrow on the minimap (dm_cam.c dm_cam_map_heading): 4 numbers (centre x, y, arrow direction, minimap frame height), returns 1 = draw it;
+// CamThreats takes it once per frame
+int dm_cam_map_heading(float out[4]);
+JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeCamHeading(JNIEnv *env, jclass cls, jfloatArray out) {
+    (void)cls; float buf[4]; if ((*env)->GetArrayLength(env, out) < 4 || !dm_cam_map_heading(buf)) return 0;
+    (*env)->SetFloatArrayRegion(env, out, 0, 4, buf); return 1; }
+JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeCamTurn(JNIEnv *env, jclass cls, jfloat rad) { (void)env; (void)cls; dm_cam_turn(rad); }
 JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeRefresh(JNIEnv *env, jclass cls, jfloat hz) {
     (void)env; (void)cls;
     front_android_set_refresh(hz);
@@ -335,6 +377,36 @@ JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeTouch(JNIEnv *env
     if (n) { (*env)->GetIntArrayRegion(env, ids, 0, n, id); (*env)->GetFloatArrayRegion(env, xs, 0, n, x); (*env)->GetFloatArrayRegion(env, ys, 0, n, y); }
     for (int i = 0; i < n; i++) t[i] = (dm_touch){(uint32_t)id[i], x[i], y[i]};
     dm_touch_set(t, n);
+}
+
+// 实体手柄（Java PadInput.java）→ 宿主手柄状态。与触屏的虚拟手柄分开存，游戏取手柄时按键取或、摇杆触屏优先（hle_hid.c 的 fill）。
+// Physical controller (Java PadInput.java) -> host controller state. Kept apart from the touch on-screen stick; when the game reads the
+// controller the buttons are ORed and the touch stick wins (fill in hle_hid.c).
+JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativePad(JNIEnv *env, jclass cls, jlong buttons, jint lx, jint ly, jint rx, jint ry) {
+    (void)env; (void)cls;
+    // 按下沿记一条（最多 30 条），用来确认手柄通着、键位对 | Log each press edge (at most 30) to show the controller works and the bits are right
+    static uint64_t prev;
+    static int logged;
+    if (buttons && !prev && logged < 30) {
+        LOG("手柄：按下 buttons=%#llx lx=%d ly=%d rx=%d ry=%d", (unsigned long long)buttons, lx, ly, rx, ry);
+        ++logged;
+    }
+    prev = (uint64_t)buttons;
+    dm_pad_set((uint64_t)buttons, lx, ly, rx, ry);
+}
+
+// 手柄 / 触屏布局切换（对应 iOS 的 dm_padmode_request）：导入包的覆盖层不带那套布局时是 no-op。
+// Controller / touch layout switch (iOS dm_padmode_request): a no-op when the overlay does not carry those layouts.
+JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativePadMode(JNIEnv *env, jclass cls, jint pad) {
+    (void)env; (void)cls;
+    dm_padmode_request(pad ? 1 : 0);
+}
+
+// 键帽样式（0 Switch 手柄 / 1 键盘 / 2 Xbox / 3 PlayStation），按手柄厂商报
+// Key-cap style (0 Switch pad / 1 keyboard / 2 Xbox / 3 PlayStation), reported from the controller vendor
+JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativePadGlyph(JNIEnv *env, jclass cls, jint glyph) {
+    (void)env; (void)cls;
+    dm_padmode_request_glyph(glyph);
 }
 
 // UI只入队：0失焦，1后台，2前台，3激活；激活也声明前台，合并2/3时不会漏恢复。

@@ -17,6 +17,86 @@
 #include <mach/mach.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <errno.h>
+#include <fcntl.h>
+
+// ---------- 信号安全的输出（崩溃处理第一段专用） ----------
+// 崩溃可能正好发生在 malloc / stdio / 动态链接器持锁的时候：OnePlus 13 上客体线程退出时，jemalloc 整理空闲块栈溢出（SIGSEGV 地址 = sp），
+// 崩溃处理导线程现场时 fread → malloc，等在本线程自己持着的分配器锁上；之后进程里凡要分配内存的线程都卡住（界面线程画位图），系统 5 秒后报「无响应」，
+// 而不是崩掉留下现场。所以第一段只用 write(2) 往栈上缓冲拼字：不碰 stdio、malloc、dladdr、任何锁；客体模块用 module_of（只查静态表）定位，
+// 其余地址在 Linux / 安卓上读 /proc/self/maps（open / read）给出库名 + 库内偏移
+// ---------- Signal-safe output (only for the first part of the crash handler) ----------
+// A crash may land exactly while malloc / stdio / the dynamic linker hold a lock: on a OnePlus 13 a guest thread's exit overflowed its stack inside
+// jemalloc's free-block housekeeping (SIGSEGV address = sp), then the crash handler's thread dump did fread -> malloc and waited on the allocator lock
+// this very thread held; after that every thread needing memory blocked (the UI thread drawing a bitmap) and the system reported "not responding" after
+// 5 s instead of the process dying with a crash record. So the first part only puts characters into a stack buffer and writes them with write(2): no
+// stdio, malloc, dladdr or locks; guest modules are found with module_of (a static table scan), and other addresses on Linux / Android through
+// /proc/self/maps (open / read) as library name + offset in it
+typedef struct { char b[512]; int n; } cw_t;
+static void cw_flush(cw_t *w) {
+    for (int o = 0; o < w->n; ) {
+        ssize_t k = write(2, w->b + o, (size_t)(w->n - o));
+        if (k > 0) o += (int)k;
+        else if (!(k < 0 && errno == EINTR)) break;
+    }
+    w->n = 0;
+}
+static void cw_s(cw_t *w, const char *s) { for (; *s; s++) { if (w->n == (int)sizeof w->b) cw_flush(w); w->b[w->n++] = *s; } }
+static void cw_hex(cw_t *w, uint64_t v) {
+    char t[19]; int i = 18; t[i] = 0;
+    do { t[--i] = "0123456789abcdef"[v & 15]; v >>= 4; } while (v);
+    t[--i] = 'x'; t[--i] = '0'; cw_s(w, t + i);
+}
+static void cw_dec(cw_t *w, long long v) {
+    char t[24]; int i = 23; t[i] = 0; unsigned long long u = v < 0 ? 0ull - (unsigned long long)v : (unsigned long long)v;
+    do { t[--i] = (char)('0' + u % 10); u /= 10; } while (u);
+    if (v < 0) t[--i] = '-';
+    cw_s(w, t + i);
+}
+#if !defined(__APPLE__)
+// 在 /proc/self/maps 里找含 a 的映射，写「库名+偏移」（偏移 = a − 映射起点 + 文件偏移，同 dladdr 退路给的库内偏移）；找不到返回 0
+// Find the mapping holding a in /proc/self/maps and write "library+offset" (offset = a - mapping start + file offset, the same in-library offset the
+// dladdr fallback gives); returns 0 when not found
+static uint64_t cw_hexval(const char **p) {
+    uint64_t v = 0;
+    for (;; (*p)++) {
+        char c = **p; int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+        if (d < 0) return v;
+        v = v << 4 | (uint64_t)d;
+    }
+}
+static int cw_map(cw_t *w, uint64_t a) {
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC); if (fd < 0) return 0;
+    char buf[4096], line[512]; int ln = 0, found = 0; ssize_t k;
+    while (!found && (k = read(fd, buf, sizeof buf)) > 0) {
+        for (ssize_t i = 0; i < k && !found; i++) {
+            if (buf[i] != '\n') { if (ln < (int)sizeof line - 1) line[ln++] = buf[i]; continue; }
+            line[ln] = 0; ln = 0;
+            const char *p = line; uint64_t lo = cw_hexval(&p); if (*p++ != '-') continue; uint64_t hi = cw_hexval(&p);
+            if (a < lo || a >= hi) continue;
+            while (*p == ' ') p++; while (*p && *p != ' ') p++; while (*p == ' ') p++;
+            uint64_t fo = cw_hexval(&p);
+            const char *path = line, *q = line; for (; *q; q++) if (*q == '/' || *q == '[') { path = q; break; }
+            if (path == line) continue;
+            const char *base = path; for (q = path; *q; q++) if (*q == '/') base = q + 1;
+            cw_s(w, base); cw_s(w, "+"); cw_hex(w, a - lo + fo); found = 1;
+        }
+    }
+    close(fd);
+    return found;
+}
+#endif
+// 一个地址：「tag=」后接 客体模块+偏移 / 库名+偏移 / 原值
+// One address: after "tag=", guest module+offset / library+offset / the raw value
+static void cw_addr(cw_t *w, const char *tag, uint64_t a) {
+    cw_s(w, " "); if (*tag) { cw_s(w, tag); cw_s(w, "="); }
+    module_t *m = module_of((void *)a);
+    if (m) { cw_s(w, m->name); cw_s(w, "+"); cw_hex(w, a - (uint64_t)m->base); return; }
+#if !defined(__APPLE__)
+    if (cw_map(w, a)) return;
+#endif
+    cw_hex(w, a);
+}
 
 static _Atomic uint64_t g_watch_last_ns;
 static _Atomic uint64_t g_watch_count;
@@ -132,9 +212,13 @@ void crash_off(const char *tag, uint64_t a) {   // diag.c 也用 | Also used by 
 #define off crash_off
 
     module_t *m = module_of((void *)a);
-    Dl_info di;
+    Dl_info di = {0};
     if (m) fprintf(stderr, " %s%s%s+%#llx", tag, *tag ? "=" : "", m->name, a - (uint64_t)m->base);
     else if (dladdr((void *)a, &di) && di.dli_sname) fprintf(stderr, " %s%s%s+%#lx", tag, *tag ? "=" : "", di.dli_sname, (unsigned long)(a - (uint64_t)di.dli_saddr));
+    // 没有符号的库（例如高通驱动的 libllvm-qgl.so）：打库名 + 库内偏移，不同手机之间能直接比（#153、#166）
+    // A library without symbols (Qualcomm's libllvm-qgl.so for one): print the library name and the offset in it, comparable
+    // across phones (#153, #166)
+    else if (di.dli_fname && di.dli_fbase) { const char *n = strrchr(di.dli_fname, '/'); fprintf(stderr, " %s%s%s+%#llx", tag, *tag ? "=" : "", n ? n + 1 : di.dli_fname, (unsigned long long)(a - (uint64_t)di.dli_fbase)); }
     else fprintf(stderr, " %s%s%#llx", tag, *tag ? "=" : "", a);
 }
 // np397：**栈扫描回溯**。为什么不能只靠 x29 链：sdk 的导入跳板（sdk+0x7b1474 那一段）会
@@ -404,6 +488,21 @@ static void dump_guest_stack_chain(uint64_t sp) {
 static _Atomic uint64_t g_nfault, g_fault_pc, g_fault_addr;
 void dm_fault_stats(unsigned long long *n, unsigned long long *pc, unsigned long long *addr) {
     *n = atomic_load(&g_nfault); *pc = atomic_load(&g_fault_pc); *addr = atomic_load(&g_fault_addr);
+}
+static volatile sig_atomic_t g_crash_sig;
+// np562 合并（照上游 955f274 的 #183）：第二段现场导出（符号化 + 线程 dump）要 stdio、dladdr、分配内存，
+// 可能卡在崩溃线程自己持有的分配器/stdio 锁上；系统 5 秒就判"无响应"。这里 3 秒收不了尾就直接退出，
+// 带着第一段已经落盘的现场走，好过让玩家对着"无响应"。
+// np562 merge (upstream 955f274, #183): the second part of the dump (symbols + thread dump) needs stdio, dladdr and
+// allocation, and can block on a lock the crashing thread itself holds; the system declares "not responding" at 5 s.
+// Exit after 3 s carrying the first part's record instead of hanging the app.
+static void crash_deadman(int sig) {
+    (void)sig;
+    static const char msg[] = "[dm] CRASH：现场导出 3 秒没走完（多半卡在分配器或 stdio 的锁上），直接退出\n"
+                              "[dm] CRASH: dump did not finish in 3 s (stuck on an allocator/stdio lock), exiting\n";
+    ssize_t k = write(2, msg, sizeof msg - 1); (void)k;
+    crash_note(msg);
+    _exit(128 + g_crash_sig);
 }
 static void on_crash(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = uc_;
@@ -948,6 +1047,12 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
             }
         }
     }
+    // np562 合并：从这里起是重段（stdio/dladdr/分配内存/线程 dump），3 秒看门狗看着——
+    // 卡在崩溃线程自己持有的锁上时直接退出，别把整个进程拖成"无响应"。
+    // np562 merge: from here on it is the heavy part (stdio/dladdr/allocation/thread dump), watched by the 3 s
+    // deadman -- exit instead of dragging the whole app into "not responding".
+    g_crash_sig = sig;
+    { struct sigaction da = {.sa_handler = crash_deadman}; sigemptyset(&da.sa_mask); sigaction(SIGALRM, &da, 0); alarm(3); }
     off("addr", (uint64_t)si->si_addr); off("pc", UC_PC(uc)); off("lr", UC_LR(uc));
     fprintf(stderr, " sp=%#llx\n", UC_SP(uc));
     for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%#llx%s", i, UC_X(uc, i), i % 6 == 5 ? "\n" : " ");
@@ -1183,6 +1288,7 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
     }
     dm_backtrace(UC_FP(uc));
     if (g_dump_hook) g_dump_hook();
+    alarm(0);   // np562 合并：走完了，撤掉 deadman，正常按 sig 退出 | np562 merge: done in time, disarm the deadman
     _exit(128 + sig);
 }
 // 信号备用栈是每线程的：每个客体线程起跑时都要调（栈溢出时才能在备用栈上打出现场）
