@@ -125,6 +125,31 @@ enum { PROF_FS_READ, PROF_WAIT_LOCK, PROF_WAIT_CV, PROF_WAIT_ADDR, PROF_WAIT_SYN
        PROF_GFX_PRESENT, PROF_GFX_SHADER, PROF_TACT, PROF_GFX_BCDEC, PROF_N };   // PROF_GFX_BCDEC：BC 贴图软解在调用线程上的墙钟与输出字节（马良无 BC）；PROF_TACT：TACT 块 zlib 解码（svc #0x80，宿主 libdeflate）耗时与输出字节 | PROF_TACT: time and output bytes of TACT block zlib decode (svc #0x80, host libdeflate)
 void dm_prof_add(int id, uint64_t ns, uint64_t bytes);
 void dm_prof_mark(const char *seg);
+// ── 诊断自立通道（np586）──
+// 为什么：宿主 stderr 走"管道 → hilog 转发线程"，是**全局单点**。np585 实测宿主输出在启动后 4.2 秒整条
+// 停摆、而进程还活着（铁律 16：日志通道死亡 ≠ 系统死亡）。所以判据必须有一条不经过它的出口：
+//   ① 普通文件的 write() 不会因为对端不读而阻塞（照 crash.txt 的成熟做法，fd 由 App 交来）；
+//   ② 定时器用 SIGEV_SIGNAL（进程定向）⇒ 内核挑**任意一条还能跑的线程**执行处理函数，被 futex 挡住的
+//      也会被打断 ⇒ 不依赖宿主线程（本平台不被调度）、不依赖 G、不依赖主线程。
+// Why: host stderr goes through "pipe -> hilog forwarding thread", a global single point. On np585 the host's
+// output stopped dead 4.2 s after start while the process stayed alive (rule 16: a dead log channel is not a
+// dead system). So the criteria need an exit that does not go through it:
+//   1. write() to a regular file never blocks because the peer is not reading (the proven crash.txt pattern, fd
+//      handed over by the App);
+//   2. a timer with SIGEV_SIGNAL is process-directed, so the kernel picks ANY runnable thread to run the handler
+//      (even one parked in a futex is interrupted) -> independent of host threads (not scheduled on this
+//      platform), of G, and of the main thread.
+typedef struct {
+    uint32_t h, svc, wkind; int prio, started, exited;
+    uint64_t nsvc, waddr, wseq, pt;
+} dm_thr_row;
+int dm_thr_rows(dm_thr_row *out, int max);        // hle_thread.c：无锁快照（不拿 G、不 malloc，可在信号处理里调） | lock-free snapshot (no G, no malloc, callable from a signal handler)
+int dm_thr_pt_of(uint32_t h, uint64_t *pt);       // hle_thread.c：按句柄取宿主 pthread | host pthread by handle
+uint32_t dm_g_owner(void);                        // hle_thread.c：最后拿到 G 的线程句柄（0 = 无人持有） | handle of the last thread to take G (0 = nobody)
+int dm_g_tryheld(uint32_t *self);                 // hle_thread.c：探一次"G 现在被占着吗"（1 = 被占；trylock 是权威读数） | probe "is G held right now" (1 = held; trylock is the authority)
+void dm_diag_set_fd(int fd);                      // diag.c：接上诊断文件并起定时无锁快照 | attach the diag file and start the periodic lock-free snapshot
+void dm_sample_poke(uint64_t pt);                 // diag.c：给一条线程发 SIGUSR2 取 pc（不需要 G） | signal a thread for its pc (no G needed)
+int dm_sample_last(uint32_t h, uint64_t out[5]);  // diag.c：该线程最后一次采到的 pc/lr/x19/x20/年龄(ms) | last sample for that thread: pc/lr/x19/x20/age(ms)
 uint64_t dm_prof_ribbon_ns(void);   // 第一次出现 OpenPanel MainMenuButtonRibbon 的 now_ns 时刻（0 = 尚未；需 DM_BOOTPROF=1） | The now_ns time at which OpenPanel MainMenuButtonRibbon first appeared (0 = not yet; needs DM_BOOTPROF=1)
 void *objmap_get(const void *guest); void objmap_put(const void *guest, void *host); void *objmap_del(const void *guest);
 void hle_signal_system_event(void *g);   // hle_thread.c：触发服务层 SystemEvent（任何线程） | hle_thread.c: signal a service-layer SystemEvent (any thread)

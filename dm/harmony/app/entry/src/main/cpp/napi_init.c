@@ -32,6 +32,12 @@
 extern "C"
 #endif
 void crash_set_fd(int fd);
+// np586：dm/host/diag.c 里的"诊断快照直写这个 fd"入口（不经过管道/hilog）。
+// np586: entry point in dm/host/diag.c that points the periodic snapshot at this fd (bypassing the pipe/hilog).
+#ifdef __cplusplus
+extern "C"
+#endif
+void dm_diag_set_fd(int fd);
 
 // 两层消费者的入口（见 dm/harmony/native/front_ohos_min.c 与 dm/android/vulkan_present.cpp）
 void dm_front_ohos_set_window(void *window);
@@ -66,6 +72,19 @@ static void *hilog_pump(void *arg) {
     char buf[2048];
     size_t used = 0;
     for (;;) {
+        // np586：缓冲区满时必须**先冲掉**再读。上一版这里 `read(fd, buf+used, sizeof buf-1-used)` 在
+        //   used == 2047 时读 0 字节 → read 返回 0 → 直接 break ⇒ **一条超过 2047 字节、没有换行的长行
+        //   就能把整个日志通道永久打死**（此后所有 fprintf 阻塞在管道上，持 G 的那条一阻塞就是全系统停摆）。
+        //   现在：满了就把当前这一段当作一行打出去并清空，长行只是被切成几段，通道不再会死。
+        // np586: when the buffer is full we must FLUSH before reading again. The old code called
+        //   read(fd, buf+used, sizeof buf-1-used), which asks for 0 bytes once used == 2047; read returns 0,
+        //   the loop breaks, and a single line longer than 2047 bytes without a newline kills the whole log
+        //   channel for good (every fprintf then blocks on the pipe, and one of them holds G). Now a full
+        //   buffer is flushed as a line and cleared: a long line is merely split, the channel cannot die.
+        if (used >= sizeof buf - 1) {
+            OH_LOG_Print(LOG_APP, LOG_INFO, DM_LOG_DOMAIN, "dm-host", "%{public}s", buf);
+            used = 0;
+        }
         ssize_t n = read(g_pipe_rd, buf + used, sizeof buf - 1 - used);
         if (n <= 0) break;
         used += (size_t)n;
@@ -87,6 +106,13 @@ static int stderr_to_hilog(void) {
     if (pipe(fds)) return -1;
     g_pipe_rd = fds[0];
     g_pipe_wr = fds[1];
+    // np586：管道默认只有 64 KB。宿主启动那 4 秒能打 1900 行，一旦 hilog 侧慢一点就写满 ⇒ 写入方阻塞。
+    //   提到 1 MiB 只是把"多久会撞上"往后推 16 倍；真正的出口是 diag.txt（见 dm/host/diag.c）。
+    // np586: the pipe defaults to 64 KB. The host prints 1900 lines in its first 4 s, so any hiccup on the
+    //   hilog side fills it and the writers block. 1 MiB pushes the wall out 16x; the real exit is diag.txt.
+#ifdef F_SETPIPE_SZ
+    (void)fcntl(g_pipe_wr, F_SETPIPE_SZ, 1 << 20);
+#endif
     if (dup2(g_pipe_wr, STDERR_FILENO) < 0) return -1;
     pthread_t th;
     if (pthread_create(&th, NULL, hilog_pump, NULL)) return -1;
@@ -626,6 +652,45 @@ static napi_value Start(napi_env env, napi_callback_info info) {
             OH_LOG_Print(LOG_APP, LOG_INFO, DM_LOG_DOMAIN, "dm-host", "start: 崩溃现场直写就绪 fd=%{public}d 文件=%{public}s", fd, cf);
         } else {
             OH_LOG_Print(LOG_APP, LOG_WARN, DM_LOG_DOMAIN, "dm-host", "start: crash.txt 打不开（%{public}s）", strerror(errno));
+        }
+    }
+    // np586：诊断自立通道 —— 和 crash.txt 同一个"直写文件"套路，但用于**周期性快照**。
+    //   为什么必须另开一条：宿主 stderr 是"管道 → hilog 转发线程"，np585 实测它在启动后 4.2 秒整条停摆，
+    //   而进程还活着（同 pid 的 HW_GPU_CPL / ffrt 行仍在出）。那一刻所有靠 stderr 的仪器全部失明。
+    //   ① 先把上一轮的**尾部**回灌进 hilog（最有信息量的是最后几拍）；② 清空后把 fd 交给宿主，之后
+    //   定时快照直接 write()，不经过管道、不需要 G、不依赖任何一条宿主线程。
+    // np586: the self-contained diagnostic channel -- the same "write straight to a file" pattern as crash.txt,
+    //   but for a PERIODIC snapshot. It has to exist separately: the host's stderr runs through a pipe into a
+    //   forwarding thread, and on np585 that went dead 4.2 s after start while the process stayed alive, blinding
+    //   every instrument that reports through it. (1) echo the TAIL of the previous run into hilog (the last few
+    //   ticks carry the information); (2) truncate and hand the fd over, after which the snapshot writes
+    //   directly -- no pipe, no G, no dependence on any host thread.
+    {
+        char df[1400];
+        snprintf(df, sizeof df, "%s/diag.txt", g_runtime);
+        int fd = open(df, O_RDWR | O_CREAT, 0600);
+        if (fd >= 0) {
+            off_t sz = lseek(fd, 0, SEEK_END);
+            if (sz > 0) {
+                off_t from = sz > 6144 ? sz - 6144 : 0;
+                char tail[6145];
+                ssize_t got = 0;
+                if (lseek(fd, from, SEEK_SET) == from) got = read(fd, tail, sizeof tail - 1);
+                if (got > 0) {
+                    tail[got] = 0;
+                    int lines = 0;
+                    for (char *line = tail, *nl; (nl = strchr(line, '\n')) && lines < 60; line = nl + 1, lines++) {
+                        *nl = 0;
+                        if (*line) OH_LOG_Print(LOG_APP, LOG_INFO, DM_LOG_DOMAIN, "dm-host", "上轮快照| %{public}s", line);
+                    }
+                    OH_LOG_Print(LOG_APP, LOG_INFO, DM_LOG_DOMAIN, "dm-host", "start: 上轮诊断快照回灌 %{public}d 行（文件 %{public}d 字节）", lines, (int)sz);
+                }
+            }
+            if (ftruncate(fd, 0) == 0) lseek(fd, 0, SEEK_SET);
+            dm_diag_set_fd(fd);
+            OH_LOG_Print(LOG_APP, LOG_INFO, DM_LOG_DOMAIN, "dm-host", "start: 诊断快照直写就绪 fd=%{public}d 文件=%{public}s", fd, df);
+        } else {
+            OH_LOG_Print(LOG_APP, LOG_WARN, DM_LOG_DOMAIN, "dm-host", "start: diag.txt 打不开（%{public}s）", strerror(errno));
         }
     }
     started = 1;

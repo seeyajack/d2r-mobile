@@ -9,11 +9,13 @@
 #include "dm_elysium.h"
 #include "dm_bossrush.h"
 #include <TargetConditionals.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <dirent.h>
 #include <stdatomic.h>
 #include "dm_i18n.h"
 #include <signal.h>
+#include <time.h>          // np586：诊断定时快照用 timer_create/CLOCK_MONOTONIC | np586: timer_create/CLOCK_MONOTONIC for the periodic snapshot
 #include <dlfcn.h>
 #include <sys/ucontext.h>
 #include <unistd.h>
@@ -668,6 +670,13 @@ static pthread_t g_sample_pt;
 static struct { uint64_t t, pc, lr, bt[16]; uint64_t x19, x20; int n; uint32_t h; } g_sring[SRING];   // x19/x20：停住时能看出"在操作哪个对象" | x19/x20: tells which object is being operated on when it stops
 static _Atomic unsigned g_shead;
 static _Atomic unsigned g_sig_seen;   // np580：SIGUSR2 递送计数（区分"信号没送达"与"ring/直方图没打印"）
+// np586：按句柄留"最后一次采样"。定时快照（DM_DIAG_FILE）直接读这里：不经过 ring（ring 由采样线程取走）、
+//   也不需要 G ⇒ 即使采样线程饿死、G 被攥死，pc 照样读得到。句柄是 0x1001 起的稠密编号，&63 不撞。
+// np586: keep "last sample per handle". The periodic snapshot (DM_DIAG_FILE) reads it directly: not through the
+//   ring (which the sampler drains) and without G, so the pc is still readable when the sampler starves or G is
+//   held hostage. Handles are dense from 0x1001, so &63 does not collide.
+#define SPC_SLOT 64
+static struct { uint32_t h; uint64_t t, pc, lr, x19, x20; } g_spc[SPC_SLOT];
 static void on_sample(int sig, siginfo_t *si, void *uc_) {
     (void)sig; (void)si; ucontext_t *uc = uc_;
     atomic_fetch_add(&g_sig_seen, 1);
@@ -676,6 +685,12 @@ static void on_sample(int sig, siginfo_t *si, void *uc_) {
     uint32_t thr_cur_handle(void);
     g_sring[i].h = thr_cur_handle(); g_sring[i].t = now_ns(); g_sring[i].pc = UC_PC(uc); g_sring[i].lr = UC_LR(uc);
     g_sring[i].x19 = UC_X(uc, 19); g_sring[i].x20 = UC_X(uc, 20);
+    {
+        unsigned s = g_sring[i].h & (SPC_SLOT - 1);
+        g_spc[s].t = g_sring[i].t; g_spc[s].pc = g_sring[i].pc; g_spc[s].lr = g_sring[i].lr;
+        g_spc[s].x19 = g_sring[i].x19; g_spc[s].x20 = g_sring[i].x20;
+        g_spc[s].h = g_sring[i].h;   // 句柄最后写：读到匹配的句柄时四个字段已经是同一次采样的 | handle last: a matching handle means the four fields are from the same sample
+    }
     uint64_t fp = UC_FP(uc); int n = 0;
     // 帧链用安全读：被打断的函数可能把 x29 当普通寄存器用（直接解引用曾段错误）
     // The frame chain uses safe reads: the interrupted function may be using x29 as an ordinary register (a direct dereference once segfaulted)
@@ -733,8 +748,21 @@ static void *sampler(void *p) {
         usleep(us);
         { static unsigned hb; if (++hb % 500 == 0) fprintf(stderr, "[dm] sampler 心跳 #%u g_shead=%u sig_seen=%u", hb, atomic_load(&g_shead), atomic_load(&g_sig_seen)); }
         if (g_sample_name && !strcmp(g_sample_name, "*")) {        // 全部客体线程轮一遍 | Cycle through all guest threads
-            int thr_list(pthread_t *out, int max); pthread_t all[64]; int n = thr_list(all, 64);
-            for (int k = 0; k < n; k++) { pthread_kill(all[k], SIGUSR2); usleep(200); }
+            // np586：改走 dm_thr_rows（无锁快照）。原来走 thr_list → pthread_mutex_lock(&G)，
+            //   np585 里采样线程正是死在那一步（心跳 #500 之后 #1000 再也不来），而 G 一旦被谁攥住，
+            //   诊断工具自己也跟着死——这条依赖必须切掉。
+            // np586: use dm_thr_rows (lock-free). It used to go through thr_list -> pthread_mutex_lock(&G),
+            //   which is exactly where the sampler died in np585 (heartbeat #500, never #1000); once G is held
+            //   hostage the diagnostic dies with it, so this dependency has to go.
+            dm_thr_row rows[64]; int n = dm_thr_rows(rows, 64);
+            // ⚠ 必须过滤"已启动且未退出"：CreateThread 先把它挂进 g_all、后填 pt，中间这段 pt 是 0，
+            //   pthread_kill(0) 会解引用空指针（np586 第一版就是这么把进程打死的）。
+            // Must filter on "started and not exited": CreateThread links the thread into g_all BEFORE filling in
+            //   pt, and pthread_kill(0) dereferences null (that is what killed the process in np586's first build).
+            for (int k = 0; k < n; k++) {
+                if (!rows[k].started || rows[k].exited || !rows[k].pt) continue;
+                pthread_kill((pthread_t)rows[k].pt, SIGUSR2); usleep(200);
+            }
         } else {
             if (g_sample_name) { pthread_t t; if (!thr_find_by_name(g_sample_name, &t)) continue; g_sample_pt = t; }
             pthread_kill(g_sample_pt, SIGUSR2);
@@ -761,19 +789,160 @@ static void *sampler(void *p) {
         }
     }
 }
+static int g_sig_installed;
+static void sample_install(void) {   // np586：SIGUSR2 处理器单独一个安装点（定时快照也要发信号取 pc） | np586: one install point for the SIGUSR2 handler (the periodic snapshot pokes for pcs too)
+    if (g_sig_installed) return;
+    struct sigaction sa = {.sa_sigaction = on_sample, .sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART};
+    sigaction(SIGUSR2, &sa, 0);
+    g_sig_installed = 1;
+}
 void crash_sample_self(void) {
     const char *e = getenv("DM_SAMPLE"); if (!e) return;
     g_sample_pt = pthread_self();
     const char *c = strchr(e, ':'); if (c) g_sample_name = strdup(c + 1);
-    struct sigaction sa = {.sa_sigaction = on_sample, .sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART};
-    sigaction(SIGUSR2, &sa, 0);
+    sample_install();
     pthread_t t; int rc = pthread_create(&t, NULL, sampler, (void *)(uintptr_t)(atoi(e) * 1000));
     fprintf(stderr, "[dm] sampler 启动 rc=%d 周期=%dms 模式=%s", rc, atoi(e), g_sample_name ? g_sample_name : "主线程"); pthread_detach(t);
 }
 
-// ---------- DM_INFLATE_BENCH=<样本文件>：用游戏映像里的 zlib（main 0xf3a930 inflateInit_、0xf3aa90 inflate）解同一批样本并计时 ----------
+// ---------- DM_DIAG_FILE：不经过管道/hilog 的诊断通道 + 定时无锁快照（np586）----------
+// 现场：np585 的宿主输出在启动后 4.2 秒整条停摆（1945 行之后一行都没有），而进程还活着（同 pid 的
+//   HW_GPU_CPL / ffrt 行仍在出）。那一刻三条仪器同时失效：sampler 卡在 thr_list 的 G 上；
+//   [stall] 只在**进入**等待时打一次（主线程 07.798 进去后再没重进）；16 ms 音频时钟的状态导出一次没跑过。
+//   ⇒ 判据必须有一条"不依赖管道、不依赖 G、不依赖宿主线程"的出口。
+// 做法：
+//   ① fd 由 App 交来（照 crash.txt 的成熟套路）；普通文件 write() 不会因为对端不读而阻塞；
+//   ② 定时器用 SIGEV_SIGNAL（进程定向）：内核挑**任意一条还能跑的线程**执行处理函数，被 futex 挡住的
+//      也会被打断 ⇒ "定时"不再依赖任何一条具体线程；
+//   ③ 处理函数里只做三件事：无锁快照 → 拼字符串 → write()；顺手给每条线程发 SIGUSR2 取 pc（下一轮打印）。
+// 判据：60 秒窗口里 diag.txt 持续增长，且能看到 `G=held by 0x…` 与各线程的 pc。
+// ---------- DM_DIAG_FILE: a diagnostic channel that bypasses the pipe/hilog, plus a periodic lock-free
+// snapshot (np586). On np585 the host's output stopped dead 4.2 s after start (not one line after 1945) while
+// the process stayed alive. Three instruments failed at once: the sampler was stuck on G in thr_list; [stall]
+// only prints on ENTRY (the main thread entered at 07.798 and never re-entered); and the 16 ms audio-clock
+// state dump never ran once. So the criteria need an exit that depends on neither the pipe, nor G, nor a host
+// thread. (1) the fd is handed over by the App (the proven crash.txt pattern) and write() to a regular file
+// never blocks on an unread peer; (2) the timer uses SIGEV_SIGNAL, which is process-directed, so the kernel
+// picks ANY runnable thread to run the handler -- even one parked in a futex; (3) the handler only takes a
+// lock-free snapshot, formats, writes, and pokes every thread for its pc (printed on the next round).
+static int g_diag_fd = -1;
+static _Atomic unsigned g_diag_tick;
+static char g_diag_buf[6144];
+static char *dx_s(char *p, const char *s) { while (*s) *p++ = *s++; return p; }
+static char *dx_x(char *p, uint64_t v) {
+    *p++ = '0'; *p++ = 'x'; char t[16]; int n = 0;
+    if (!v) t[n++] = '0';
+    while (v) { int d = (int)(v & 15); t[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10); v >>= 4; }
+    while (n) *p++ = t[--n];
+    return p;
+}
+static char *dx_d(char *p, uint64_t v) {
+    char t[20]; int n = 0;
+    if (!v) t[n++] = '0';
+    while (v) { t[n++] = (char)('0' + v % 10); v /= 10; }
+    while (n) *p++ = t[--n];
+    return p;
+}
+static char *dx_off(char *p, uint64_t a) {   // 打成 main+0x…：不调 fprintf/dlsym，信号处理里可用 | format as main+0x…: no fprintf/dlsym, usable in a handler
+    for (int i = 0; i < g_nmod; i++) {
+        uint64_t b = (uint64_t)(uintptr_t)g_mod[i].base;
+        if (a >= b && a < b + g_mod[i].size) { p = dx_s(p, g_mod[i].name); *p++ = '+'; return dx_x(p, a - b); }
+    }
+    return dx_x(p, a);
+}
+static const char *WKIND[] = { "none", "lock", "cond", "addr", "sync" };
+void dm_sample_poke(uint64_t pt) {
+    if (!g_sig_installed || !pt) return;
+    pthread_kill((pthread_t)pt, SIGUSR2);   // 异步信号安全；不需要 G | async-signal-safe; needs no G
+}
+int dm_sample_last(uint32_t h, uint64_t out[5]) {
+    unsigned s = h & (SPC_SLOT - 1);
+    if (!h || g_spc[s].h != h || !g_spc[s].pc) return 0;
+    out[0] = g_spc[s].pc; out[1] = g_spc[s].lr; out[2] = g_spc[s].x19; out[3] = g_spc[s].x20;
+    extern uint64_t now_ns(void);
+    uint64_t t = now_ns();
+    out[4] = t > g_spc[s].t ? (t - g_spc[s].t) / 1000000ull : 0;
+    return 1;
+}
+static void on_diag_tick(int sig, siginfo_t *si, void *uc_) {
+    (void)sig; (void)si; (void)uc_;
+    if (g_diag_fd < 0) return;
+    extern uint64_t now_ns(void);
+    static dm_thr_row rows[32];   // 静态：处理函数可能跑在只有十几 KB 的客体栈上 | static: the handler may run on a guest stack of only a dozen KB
+    int n = dm_thr_rows(rows, 32);
+    char *p = g_diag_buf;
+    p = dx_s(p, "\n=== TICK #"); p = dx_d(p, atomic_fetch_add(&g_diag_tick, 1));
+    { uint64_t t = g_t0_ns ? now_ns() - g_t0_ns : 0; p = dx_s(p, " t="); p = dx_d(p, t / 1000000ull); p = dx_s(p, "ms"); }
+    // G：trylock 是权威（真被占着才失败），owner 只是"记在谁头上"的标签 | G: trylock is authoritative; owner is only a label
+    { uint32_t me = 0; int held = dm_g_tryheld(&me);
+      p = dx_s(p, " G="); p = dx_s(p, held ? "HELD" : "free");
+      if (held) { p = dx_s(p, " by="); p = dx_x(p, dm_g_owner()); if (me && dm_g_owner() == me) p = dx_s(p, "(self:信号打在临界区)"); } }
+    p = dx_s(p, " thr="); p = dx_d(p, (uint64_t)n); p = dx_s(p, "\n");
+    for (int i = 0; i < n && (p - g_diag_buf) < (int)sizeof g_diag_buf - 160; i++) {
+        dm_thr_row *r = &rows[i];
+        p = dx_s(p, "  h="); p = dx_x(p, r->h);
+        p = dx_s(p, " svc="); p = dx_x(p, r->svc);
+        p = dx_s(p, " n="); p = dx_d(p, r->nsvc);
+        p = dx_s(p, " wait="); p = dx_s(p, WKIND[r->wkind < 5 ? r->wkind : 0]);
+        if (r->waddr) { p = dx_s(p, " addr="); p = dx_x(p, r->waddr); }
+        p = dx_s(p, " wseq="); p = dx_d(p, r->wseq);
+        p = dx_s(p, " prio="); p = dx_d(p, (uint64_t)(r->prio < 0 ? 0 : r->prio));
+        if (r->exited) p = dx_s(p, " /exit");
+        p = dx_s(p, "\n");
+    }
+    // 上一轮发出去的 SIGUSR2 落地的结果（这一轮新发的下一轮才读得到）
+    // Results of the SIGUSR2 pokes sent on the previous round (this round's pokes land next round)
+    p = dx_s(p, "  -- pc --\n");
+    for (int i = 0; i < n && (p - g_diag_buf) < (int)sizeof g_diag_buf - 150; i++) {
+        uint64_t s[5];
+        if (!dm_sample_last(rows[i].h, s)) continue;
+        p = dx_s(p, "  h="); p = dx_x(p, rows[i].h);
+        p = dx_s(p, " pc="); p = dx_off(p, s[0]);
+        p = dx_s(p, " lr="); p = dx_off(p, s[1]);
+        p = dx_s(p, " x19="); p = dx_x(p, s[2]);
+        p = dx_s(p, " x20="); p = dx_x(p, s[3]);
+        p = dx_s(p, " age="); p = dx_d(p, s[4]); p = dx_s(p, "ms\n");
+    }
+    { ssize_t w = write(g_diag_fd, g_diag_buf, (size_t)(p - g_diag_buf)); (void)w; }
+    // 同上：pt 为 0 的（刚创建、还没填 pt）绝不能碰 | same as above: never touch a row whose pt is still 0
+    for (int i = 0; i < n; i++) if (rows[i].started && !rows[i].exited && rows[i].pt) dm_sample_poke(rows[i].pt);
+}
+void dm_diag_set_fd(int fd) {
+    if (fd < 0 || g_diag_fd >= 0) return;
+    if (getenv("DM_DIAG_OFF")) { LOG("诊断快照被 DM_DIAG_OFF 关掉（fd=%d 只建文件不写）", fd); return; }   // 隔离用：怀疑定时器/快照本身有问题时一键关 | isolation switch: turn the timer/snapshot off when suspecting it
+    g_diag_fd = fd;
+    sample_install();   // 取 pc 要用 SIGUSR2 | the pc sampling needs SIGUSR2
+    // 信号选择：实时信号里挑一个**确实没人占**的（SIGUSR1/2 归采样器，SIGALRM 归 crash 的 deadman）。
+    //   为什么不写死 SIGRTMIN+2：运行库也可能用实时信号（采样剖析器之类），占了就得换一个，不能抢。
+    // Signal choice: take a real-time signal that is genuinely free (SIGUSR1/2 belong to the sampler, SIGALRM to
+    //   crash's deadman). Not hard-coded to SIGRTMIN+2 because the runtime may use real-time signals too
+    //   (sampling profilers do); if one is taken we move on instead of stealing it.
+    int sig = 0;
+    for (int k = 2; k <= 5 && !sig; k++) {
+        struct sigaction old;
+        if (sigaction(SIGRTMIN + k, NULL, &old) != 0) continue;
+        if (old.sa_handler == SIG_DFL && !(old.sa_flags & SA_SIGINFO)) sig = SIGRTMIN + k;
+    }
+    if (!sig) { LOG("【红】没有空闲的实时信号（SIGRTMIN+2..+5 都被占了），定时快照不启用"); return; }
+    struct sigaction sa = {.sa_sigaction = on_diag_tick, .sa_flags = SA_SIGINFO | SA_RESTART};
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(sig, &sa, 0) != 0) { LOG("【红】诊断定时器装不上信号 %d：%s", sig, strerror(errno)); return; }
+    const char *e = getenv("DM_DIAG_TICK_MS");
+    int ms = e ? atoi(e) : 3000; if (ms < 200) ms = 200;
+    struct sigevent sev; memset(&sev, 0, sizeof sev);
+    sev.sigev_notify = SIGEV_SIGNAL; sev.sigev_signo = sig;
+    timer_t tid;
+    if (timer_create(CLOCK_MONOTONIC, &sev, &tid) != 0) { LOG("【红】诊断定时器创建失败：%s", strerror(errno)); return; }
+    struct itimerspec its;
+    its.it_value.tv_sec = 1; its.it_value.tv_nsec = 0;          // 首拍 1 秒：先证明通道活着 | first tick at 1 s: prove the channel is alive
+    its.it_interval.tv_sec = ms / 1000; its.it_interval.tv_nsec = (long)(ms % 1000) * 1000000L;
+    if (timer_settime(tid, 0, &its, NULL) != 0) { LOG("【红】诊断定时器启动失败：%s", strerror(errno)); return; }
+    LOG("诊断通道：直写文件 fd=%d，定时快照 %dms（首拍 1s，进程定向信号 %d）", fd, ms, sig);
+}
+
 // 样本格式同 scratchpad infl/bench.c：{CKey16, 原始长, 块数, [模式, 压缩长, 解压长, 数据]...}；逐文件核 MD5 == CKey。
 // 只在客体线程初始化之后、SDK 初始化之前调（zlib 不依赖 SDK：z_stream 的 zalloc / zfree 填宿主函数）。
+// ---------- DM_INFLATE_BENCH=<样本文件>：用游戏映像里的 zlib（main 0xf3a930 inflateInit_、0xf3aa90 inflate）解同一批样本并计时 ----------
 // ---------- DM_INFLATE_BENCH=<sample file>: decompress the same batch of samples with the zlib in the game image (main 0xf3a930 inflateInit_, 0xf3aa90 inflate) and time it ----------
 // Sample format same as scratchpad infl/bench.c: {CKey16, raw length, block count, [mode, compressed length, decompressed length, data]...}; verify MD5 == CKey file by file.
 // Called only after guest thread initialization and before SDK initialization (zlib does not depend on the SDK: z_stream's zalloc / zfree are filled with host functions).
