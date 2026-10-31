@@ -451,7 +451,15 @@ struct Index {
             //   17% CPU). Now decide waiting vs spinning: DM_SAMPLE=2 (sample the main thread's pc every 2 ms) +
             //   DM_HIST=1 (aggregate in-process, print the top 8 every 5 s). DM_IMPORTS is off: one line per call eats
             //   the whole log budget. TLS is already ruled out (slot=4 always returns a valid pointer).
-            let envs = 'DM_NVN_LOG=1 DM_FS=1 DM_WATCH_STALL=8 DM_NVN_API_MAJOR=53 DM_DIAG_TICK=1 DM_SHADER_DUMP=1 DM_DRAW_TRACE=8 DM_CV_PROBE=1';
+            // np587：崩点 main+0x1c810e8 的岔路口。0x1c80ee0 按"TLS 键"查每线程上下文表：
+            //   命中 → 0x1c81068；未命中 → 0x1c80fc0（新建）。随后 bl 0x1c7faa0 把源对象拷进局部结构，
+            //   但 **+0x58 只在布局 A（0x1c7fb38）里写**，布局 B（0x1c7fbb4）不写 ⇒ 崩点读的
+            //   [x29-0x80] 就是那个字段。四个计数点足以判"查表命中吗 / 走了哪个布局"。
+            // np587: the fork at the crash site. 0x1c80ee0 looks up the per-thread context table by a TLS key:
+            //   hit -> 0x1c81068; miss -> 0x1c80fc0 (create). Then bl 0x1c7faa0 copies the source into the local
+            //   struct, but +0x58 is written ONLY in layout A (0x1c7fb38); layout B (0x1c7fbb4) leaves it.
+            //   Four counters answer "did the table hit / which layout".
+            let envs = 'DM_NVN_LOG=1 DM_FS=1 DM_WATCH_STALL=8 DM_NVN_API_MAJOR=53 DM_DIAG_TICK=1 DM_SHADER_DUMP=1 DM_DRAW_TRACE=8 DM_CV_PROBE=1 DM_PROBE=main:1c81068@c,main:1c80fc0@c,main:1c7fb38@c,main:1c7fbb4@c';
             // romfs 双路（d1 瘦包）：
             //   A. HAP 里带 romfs/（fat 包，首次装机用）→ 照旧**每次点都重新解出**。
             //      ⚠ 不能用 pathExists 判"解没解过"：本机 fs.listFileSync 对不存在的路径也不抛
