@@ -620,7 +620,12 @@ NVN(nvnTextureCompare, NVNboolean, const NVNtexture *a, const NVNtexture *b) {
 NVN_NOPROTO(nvnTextureGetRawStorageClass, int, const NVNtexture *t) { (void)t; return 1; }
 #define VW(v) ((view_t *)(v))
 NVN(nvnTextureViewSetDefaults, void, NVNtextureView *v) { memset(v, 0, sizeof(view_t)); }
-NVN(nvnTextureViewSetLevels, void, NVNtextureView *v, int base, int n) { VW(v)->set_levels = 1; VW(v)->base_level = base; VW(v)->nlevels = n; }
+NVN(nvnTextureViewSetLevels, void, NVNtextureView *v, int base, int n) {
+    VW(v)->set_levels = 1; VW(v)->base_level = base; VW(v)->nlevels = n;
+    // np597：取证用 —— 看游戏到底会不会传 n=0。只打前 12 次带 n<=0 的，正常调用不吵。
+    // np597: evidence only -- does the game ever pass n=0? Log the first 12 calls with n<=0; normal calls stay quiet.
+    if (n <= 0) { static int k; if (k < 12) { ++k; extern void xbg_logf(const char *, ...); xbg_logf("nvnTextureViewSetLevels base=%d n=%d（第 %d 次）", base, n, k); } }
+}
 NVN(nvnTextureViewSetLayers, void, NVNtextureView *v, int min, int n) { VW(v)->set_layers = 1; VW(v)->min_layer = min; VW(v)->nlayers = n; }
 NVN(nvnTextureViewSetFormat, void, NVNtextureView *v, NVNformat f) { VW(v)->set_format = 1; VW(v)->format = f; }
 NVN(nvnTextureViewSetTarget, void, NVNtextureView *v, NVNtextureTarget t) { VW(v)->set_target = 1; VW(v)->target = t; }

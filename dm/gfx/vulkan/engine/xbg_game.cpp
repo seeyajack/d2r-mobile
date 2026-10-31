@@ -3282,7 +3282,18 @@ bool create_pass(Pass &p,Commands &c,int clear_color=-1,bool clear_depth=false,b
     for(unsigned i=0;i<9;i++)if(targets[i]){
         const tex_t &t=*targets[i];const view_t *v=selected[i];
         need(t.magic==MAGIC('T','E','X',0) && t.serial,"Invalid NVN render attachment");
-        extents[i]={1,t.d.width,t.d.height,t.d.levels,t.L.layers,v&&v->set_levels?uint32_t(v->base_level):0,v&&v->set_levels?uint32_t(v->nlevels):t.d.levels,
+        // np597：实测会拿到 levelCount==0（全量内容后第一次撞上：depth 附件 index=8，mip=0/0，64x64）。
+        //   NVN 里"0 层"不合法，而游戏在真机上不会传它 ⇒ 要么我们的 view 副本过期（SetLevels 发生在
+        //   SetRenderTargets 之后），要么 0 表示"从 base 到最后一层"。按后者兜底并打一次日志，
+        //   不要让整个 pass 直接 FATAL —— 否则一个附件就把后面的渲染全挡住。
+        // np597: levelCount==0 does happen (first hit with the full romfs: depth attachment index=8,
+        //   mip=0/0, 64x64). "0 levels" is invalid in NVN and the game does not pass it on real hardware,
+        //   so either our view copy is stale (SetLevels after SetRenderTargets) or 0 means "from base to the
+        //   last level". Fall back to the latter and log once instead of FATALing the whole pass.
+        uint32_t bl=v&&v->set_levels?uint32_t(v->base_level):0u;
+        uint32_t nl=v&&v->set_levels?uint32_t(v->nlevels):uint32_t(t.d.levels);
+        if(!nl){static int once;if(!once++)xbg_logf("NVN 附件 %u levelCount=0（base=%u levels=%u）⇒ 按“从 base 到最后一层”处理",i,bl,uint32_t(t.d.levels));nl=t.d.levels>bl?uint32_t(t.d.levels)-bl:1u;}
+        extents[i]={1,t.d.width,t.d.height,t.d.levels,t.L.layers,bl,nl,
             v&&v->set_layers?uint32_t(v->min_layer):0,v&&v->set_layers?uint32_t(v->nlayers):t.L.layers,uint32_t(std::max(1,t.d.samples))};
         trace=(trace^t.serial^uint64_t(i)) * 1099511628211ull;trace^=hash_memory(&extents[i],sizeof(extents[i]));
         trace^=uint64_t(v&&v->set_format?v->format:t.d.format)<<32;
