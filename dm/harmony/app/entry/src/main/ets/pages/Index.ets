@@ -459,7 +459,7 @@ struct Index {
             //   hit -> 0x1c81068; miss -> 0x1c80fc0 (create). Then bl 0x1c7faa0 copies the source into the local
             //   struct, but +0x58 is written ONLY in layout A (0x1c7fb38); layout B (0x1c7fbb4) leaves it.
             //   Four counters answer "did the table hit / which layout".
-            let envs = 'DM_NVN_LOG=1 DM_FS=1 DM_WATCH_STALL=8 DM_NVN_API_MAJOR=53 DM_DIAG_TICK=1 DM_SHADER_DUMP=1 DM_DRAW_TRACE=8 DM_CV_PROBE=1 DM_PROBE=main:1c81068@c,main:1c80fc0@c,main:1c7fb38@c,main:1c7fbb4@c';
+            let envs = 'DM_NVN_LOG=1 DM_FS=1 DM_WATCH_STALL=8 DM_NVN_API_MAJOR=53 DM_DIAG_TICK=1 DM_SHADER_DUMP=1 DM_DRAW_TRACE=8 DM_CV_PROBE=1 DM_DOCS_PROBE=1';
             // romfs 双路（d1 瘦包）：
             //   A. HAP 里带 romfs/（fat 包，首次装机用）→ 照旧**每次点都重新解出**。
             //      ⚠ 不能用 pathExists 判"解没解过"：本机 fs.listFileSync 对不存在的路径也不抛

@@ -693,6 +693,35 @@ static napi_value Start(napi_env env, napi_callback_info info) {
             OH_LOG_Print(LOG_APP, LOG_WARN, DM_LOG_DOMAIN, "dm-host", "start: diag.txt 打不开（%{public}s）", strerror(errno));
         }
     }
+    // np591：**内容通道探针** —— App 的进程到底能不能直接读公共目录？
+    //   为什么先探这一下：14 GB 全量 romfs 只能放公共目录（HAP 塞不下、hdc 写不进沙箱）。
+    //   如果原生侧**能直接 opendir/open** 公共目录，那"内容通道"这道门几乎不用改代码：
+    //   用户把 romfs 放进 Docs，App 把 DM_ROMFS 指过去就行。
+    //   如果不能（SELinux / 权限），才需要 SAF 选目录 + 拷进沙箱那一套（工作量大一个量级）。
+    //   ⇒ 一个探针决定走哪条路，比先写 SAF 便宜得多。
+    // np591: the content-channel probe -- can the App process read a public directory directly?
+    //   The 14 GB full romfs can only live in a public directory (it does not fit in the HAP and hdc cannot
+    //   write the sandbox). If native code can opendir/open a public directory, the content gate costs almost
+    //   nothing: the user drops romfs into Docs and DM_ROMFS points there. If not (SELinux / permission), we
+    //   need SAF plus a copy into the sandbox (an order of magnitude more work). One probe decides.
+    if (getenv("DM_DOCS_PROBE")) {
+        const char *dirs[] = { "/storage/media/100/local/files/Docs",
+                               "/storage/media/100/local/files/Documents",
+                               "/storage/Users/currentUser/Documents" };
+        for (int i = 0; i < 3; i++) {
+            DIR *d = opendir(dirs[i]);
+            int n = 0;
+            if (d) { struct dirent *e; while ((e = readdir(d)) && n < 100000) n++; closedir(d); }
+            OH_LOG_Print(LOG_APP, LOG_INFO, DM_LOG_DOMAIN, "dm-host", "probe: opendir(%{public}s) = %{public}s 条目=%{public}d",
+                         dirs[i], d ? "OK" : strerror(errno), n);
+        }
+        int fd = open("/storage/media/100/local/files/Docs/dmprobe.txt", O_RDONLY);
+        char pb[40] = {0};
+        ssize_t rd = -1;
+        if (fd >= 0) { rd = read(fd, pb, sizeof pb - 1); close(fd); }
+        OH_LOG_Print(LOG_APP, LOG_INFO, DM_LOG_DOMAIN, "dm-host", "probe: open(Docs/dmprobe.txt) = %{public}s 读到=%{public}d 内容=[%{public}s]",
+                     fd >= 0 ? "OK" : strerror(errno), (int)rd, pb);
+    }
     started = 1;
     pthread_t th;
     if (pthread_create(&th, NULL, host_thread, NULL)) {
