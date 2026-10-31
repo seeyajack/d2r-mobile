@@ -11,6 +11,7 @@
 #include <sys/ucontext.h>
 #include <sys/uio.h>   // np348b: process_vm_readv 安全读客体内存
 #include <unistd.h>
+#include <sys/syscall.h>   // np544：SYS_gettid —— 崩溃现场要能说出是哪个线程 | np544: which thread crashed
 #include <sys/mman.h>
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
@@ -42,6 +43,21 @@ static void (*g_wait_dump)(void);
 static int g_crash_fd = -1;
 void crash_set_fd(int fd) { g_crash_fd = fd; }
 static void crash_note(const char *s) { if (g_crash_fd >= 0 && s) { ssize_t w = write(g_crash_fd, s, strlen(s)); (void)w; } }
+
+// np544：崩溃现场再补三个读数——线程名、线程号、以及 sp 底下还有没有映射过的页。
+// 为什么：np543 修完后新崩点是 `addr = sp + 0x110`、`sp` 比客体主线程栈区起点低 3.1 MB，
+// 看着像"栈被用穿"，但当轮既不知道崩在哪个线程，也不知道 sp 底下还剩多少可用栈页。
+// np544: three more readings at the crash site -- thread name, tid, and whether any mapped page remains
+// just below sp. np543's new crash had addr = sp + 0x110 with sp 3.1 MB below the guest main stack
+// region, which looks like stack exhaustion, but the thread was unknown.
+static int cpage_mapped(uintptr_t a) {
+    void *p = (void *)(a & ~(uintptr_t)0xfff); unsigned char v = 0;
+    return mincore(p, 0x1000, &v) == 0;
+}
+static long cmapped_below(uintptr_t sp) {   // 向下最多探 1 MB：返回最近的可映射页距离，-1 = 1 MB 内全空 | nearest mapped page below sp within 1 MB, -1 = hole
+    for (long d = 0; d <= (1 << 20); d += 0x1000) if (cpage_mapped(sp - (uintptr_t)d)) return d;
+    return -1;
+}
 
 static uint64_t watch_now_ns(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -398,19 +414,31 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
         // np539：第一件事就是直写一行（不经过 stdio / 管道 / hilog），保证现场一定落地。
         // np539: the very first action is a direct write of one line (no stdio, no pipe, no hilog).
         {
-            char line[384];
+            char line[512];
             // np540：顺手把 nvn 回放的"最后一条命令"带上（图形引擎导出，没有图形单测时就是 -1）。
             // np540: also carry the last NVN replay command (exported by the graphics engine; -1 in a graphics-only build).
             extern volatile unsigned dm_last_cmd_op __attribute__((weak));
             extern volatile unsigned dm_last_cmd_size __attribute__((weak));
             unsigned lastop = (&dm_last_cmd_op) ? dm_last_cmd_op : 0xffffffffu;
             unsigned lastsz = (&dm_last_cmd_size) ? dm_last_cmd_size : 0;
+            // ★ 第一行必须**只做最小工作**：np545 实测，把 pthread_getname_np 之类放进第一行会
+            //   让处理器自己在里面崩掉，于是连 pc 都留不下来（那轮 crash.txt 是空的）。
+            //   所以先落最小现场，附加读数一律排在后面，各自失败都不影响前面已经写下去的内容。
+            // The first line must do the minimum: on device, adding pthread_getname_np here killed the
+            // handler itself so even pc was lost (that run left crash.txt empty). Write the minimum first,
+            // then append extra readings, each of which can fail without losing what is already on disk.
             int n = snprintf(line, sizeof line, "FAULT sig=%d pc=%s lr=%s addr=%#llx sp=%#llx fp=%#llx lastop=%u/%u\n",
                              sig, fmt_off((uint64_t)UC_PC(uc)), fmt_off((uint64_t)UC_LR(uc)),
                              (unsigned long long)(uintptr_t)(si ? si->si_addr : 0),
                              (unsigned long long)UC_SP(uc), (unsigned long long)UC_FP(uc),
                              lastop, lastsz);
             if (n > 0) crash_note(line);
+            // 附加：sp 附近还有没有映射过的页（判断"栈被用穿"）。mincore 是纯系统调用，安全。
+            {
+                uintptr_t csp = (uintptr_t)UC_SP(uc);
+                int n2 = snprintf(line, sizeof line, "FAULT2 spmap=%d below=%ld\n", cpage_mapped(csp), cmapped_below(csp));
+                if (n2 > 0) crash_note(line);
+            }
             // np539：再补一条 fp 链——libc 内部崩时 lr 可能是残留值（np539 那轮的 lr 落在一条没有 bl 的指令上），
             // 只靠 pc/lr 分不清"谁传进来的坏指针"。每帧都用 process_vm_readv 读，读崩了就停，不会再制造第二次崩溃。
             // np539: also dump the frame-pointer chain. Inside libc the lr can be stale (np539's lr landed on an
