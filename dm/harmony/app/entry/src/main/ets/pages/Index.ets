@@ -238,76 +238,6 @@ struct Index {
 
   private writeFails: number = 0;   // np345：本轮解出的写入失败总数（extractRaw 里累加）
 
-  // np592：**内容通道** —— 用 SAF 让用户选一个目录，把整棵树拷进 <filesDir>/romfs。
-  //
-  // 为什么必须"选目录 + 拷"：
-  //   · 全量 romfs 是 41,052 个文件 / 14 GB，HAP 塞不下（现在只带了 26 个文件 / 80 MB）；
-  //   · App 进程**读不到**公共目录 —— np591 实测 opendir(/storage/media/.../Docs) = ENOENT
-  //     （挂载点都不在 App 的命名空间里）、/storage/Users/currentUser/Documents = EACCES；
-  //   · SAF 只给 URI，原生 open() 打不开 URI ⇒ 折中：ArkTS 负责"遍历 + open 拿 fd"，
-  //     真正的拷贝交给原生 copyFdToFile（1 MB 缓冲，不经过 ArrayBuffer 桥）。
-  //
-  // 目录**不写死**：用户选哪儿都行（下载目录、文档、外置卡…），SAF 会把那一棵树的读权限授给本应用。
-  // np592: the content channel -- let the user pick a directory through SAF and copy the whole tree into
-  // <filesDir>/romfs. The full romfs is 41,052 files / 14 GB (the HAP ships 26 files / 80 MB), the App cannot
-  // see the public directories at all (np591: ENOENT / EACCES), and SAF only hands out a URI that native
-  // open() cannot use. So ArkTS walks the tree and opens each file for an fd, and the copy runs in native
-  // copyFdToFile (1 MB buffer, never through the ArrayBuffer bridge). The directory is NOT hard-coded: the
-  // user picks any folder and SAF grants this app read access to that tree.
-  private async copyContentDir(ctx: common.UIAbilityContext): Promise<void> {
-    const dest = ctx.filesDir + '/romfs';
-    let uris: string[] = [];
-    try {
-      const p = new picker.DocumentViewPicker(ctx);
-      const opt = new picker.DocumentSelectOptions();
-      opt.selectMode = picker.DocumentSelectMode.FOLDER;
-      opt.maxSelectNumber = 1;
-      uris = await p.select(opt);
-    } catch (e) {
-      this.status = '选择目录失败：' + (e as Error).message;
-      return;
-    }
-    if (uris.length === 0) { this.status = '没有选目录（取消）'; return; }
-    const root = uris[0];
-    trace(ctx, '内容通道：选了 ' + root + ' → ' + dest);
-    let files = 0, bytes = 0, fails = 0;
-    this.status = '开始拷贝…';
-    // 递归：目录就下钻，文件就 open 拿 fd 交原生拷。同步 API，逐文件推进（数量大，异步会把栈压垮）。
-    // Recursive: descend into directories, open each file for an fd and let native copy it. Synchronous and
-    // file-by-file, because 41k awaits would pile up.
-    const walk = (dir: string, rel: string): void => {
-      let names: string[] = [];
-      try { names = fs.listFileSync(dir); } catch (e) { fails++; return; }
-      for (const nm of names) {
-        const src = dir + '/' + nm;
-        const r = rel.length === 0 ? nm : rel + '/' + nm;
-        let isDir = false;
-        try { isDir = fs.statSync(src).isDirectory(); } catch (e) { fails++; continue; }
-        if (isDir) { walk(src, r); continue; }
-        let fd = -1;
-        try {
-          fd = fs.openSync(src, fs.OpenMode.READ_ONLY).fd;
-          const w: number = dms2.copyFdToFile(fd, dest + '/' + r);
-          if (w < 0) { fails++; if (fails <= 10) trace(ctx, '拷贝失败(' + w + ')：' + r); }
-          else { files++; bytes += w; }
-        } catch (e) {
-          fails++;
-          if (fails <= 10) trace(ctx, '打开失败：' + r + ' → ' + (e as Error).message);
-        } finally {
-          if (fd >= 0) { try { fs.closeSync(fd); } catch (e) { } }
-        }
-        if (files % 500 === 0 && files > 0) {
-          this.status = '拷贝中：' + files + ' 个文件 / ' + Math.round(bytes / 1048576) + ' MB';
-        }
-      }
-    };
-    walk(root, '');
-    const have: number = dms2.dirFileCount(dest);
-    this.status = '拷贝完成：' + files + ' 个文件 / ' + Math.round(bytes / 1048576) + ' MB'
-      + '，失败 ' + fails + '；沙箱 romfs 现有 ' + have + ' 个文件';
-    trace(ctx, '内容通道：拷完 files=' + files + ' bytes=' + bytes + ' fails=' + fails + ' 沙箱=' + have);
-  }
-
   // 一出现就 probe：起 guest 崩了之后重启 app，UI 树上直接就能读到 host.log 尾部
   onPageShow(): void {
     try {
@@ -343,17 +273,12 @@ struct Index {
           }
         })
 
-      // np592：内容通道。点它 → 系统文件选择器（选**目录**）→ 把整棵树拷进 <filesDir>/romfs。
-      // 目录不写死：选哪儿都行，SAF 会把那一棵树的读权限授给本应用。
-      // 拷完再点「起 guest」，DM_ROMFS 就指向沙箱里这份（原生侧零改动）。
-      // np592: content channel. Tap -> the system picker (pick a DIRECTORY) -> the whole tree is copied into
-      // <filesDir>/romfs. The path is not hard-coded; SAF grants this app read access to whatever tree you pick.
-      // Then tap "start guest" as usual: DM_ROMFS already points at that sandbox copy (no native change).
-      // np593：推荐入口。先在电脑上 `tar -cf romfs160.tar -C <romfs160> .`，把这一个文件拷进手机，
-      // 再点这里选它 —— 41,052 个小文件逐个拷要 30–140 分钟，一个大文件只受带宽限制。
-      // np593: the recommended entry. On the PC run `tar -cf romfs160.tar -C <romfs160> .`, copy that ONE file
-      // to the phone, then pick it here -- 41k small files over MTP take 30-140 min, one big file is
-      // bandwidth-bound only.
+      // np593：内容通道（唯一入口）。先在电脑上 `tar -cf romfs160.tar -C <romfs160> .`，
+      // 把这**一个**文件拷进手机，再点这里选它 —— 41,052 个小文件走 USB/MTP 是逐文件握手
+      // （30–140 分钟），一个大文件只受带宽限制（USB3 约 5–15 分钟）。
+      // np593: the content channel (the only entry). On the PC run
+      // `tar -cf romfs160.tar -C <romfs160> .`, copy that ONE file to the phone, then pick it here --
+      // 41k small files over MTP shake hands per file (30-140 min), one big file is bandwidth-bound only.
       Button('选内容包 .tar → 解开到沙箱（推荐）')
         .width('100%')
         .backgroundColor('#4a3a6b')
@@ -364,19 +289,6 @@ struct Index {
             await this.unpackTar(ctx);
           } catch (e) {
             this.status = '解包入口抛异常：' + e;
-          }
-        })
-
-      Button('选内容目录 → 拷进沙箱（14GB 全量 romfs 用这个）')
-        .width('100%')
-        .backgroundColor('#2e3d5c')
-        .fontColor('#ffffff')
-        .onClick(async () => {
-          try {
-            const ctx = getContext(this) as common.UIAbilityContext;
-            await this.copyContentDir(ctx);
-          } catch (e) {
-            this.status = '内容通道抛异常：' + e;
           }
         })
 

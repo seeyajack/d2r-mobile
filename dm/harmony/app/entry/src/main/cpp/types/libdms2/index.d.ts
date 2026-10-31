@@ -19,9 +19,6 @@ export const makeDir: (path: string) => number;        // 0 成功 / 1 已存在
 export const logLine: (line: string) => void;
 export const writeFile: (path: string, data: ArrayBuffer) => number;
 export const writeFileGz: (path: string, gzData: ArrayBuffer) => number;
-// np592：把已打开的源 fd 拷到 destPath（原生 1 MB 缓冲循环）。成功=字节数，失败=-errno。
-//        内容通道用：ArkTS 只负责 SAF 选目录 + open 拿 fd，重 I/O 在原生。
-export const copyFdToFile: (srcFd: number, destPath: string) => number;
 // np593：解开一个 tar（ustar / GNU 长名 / pax 都认）到 destDir。返回解出的文件个数，失败 -errno。
 //        内容通道的第二入口：41,052 个小文件用 USB/MTP 逐个拷要 30–140 分钟，打包成一个 tar 只受带宽限制。
 export const untarTo: (srcFd: number, destDir: string) => number;
