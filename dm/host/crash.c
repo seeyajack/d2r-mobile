@@ -27,6 +27,22 @@ static unsigned g_watch_stall;
 static void (*g_dump_hook)(void);
 static void (*g_wait_dump)(void);
 
+// ---------- np539：崩溃现场**直写**（绕开 stderr 管道） ----------
+// 为什么必须直写：鸿蒙侧把宿主 stderr 接进一根管道，再由一个转发线程逐行 OH_LOG_Print（napi_init.c 的
+// stderr_to_hilog）。可信号 11 一到，系统会**冻结其它线程**（hilog 里那行 `FREEZE_signo_11`），转发线程不再
+// 被调度 ⇒ on_crash 里所有 fprintf(stderr) 全烂在管道里，日志上只剩系统的 DFX 块、看不到我们的 pc/lr。
+// np538 真机就是这个现象：崩溃线程 nvn-translate，`FAULT` 一行都没有。
+// 做法：平台层启动时把一个沙箱内文件的 fd 交进来，on_crash 第一件事就是 write() 这一行（write 是
+// async-signal-safe 的）；应用下次启动时把这个文件回灌进 hilog。
+// np539: write the crash state straight to a file descriptor. On HarmonyOS the host's stderr goes through a pipe
+// into a forwarding thread; a SIGSEGV freezes the other threads (the `FREEZE_signo_11` line), so that thread never
+// runs and every fprintf(stderr) in on_crash is lost -- np538's device log had no FAULT line at all. The platform
+// layer hands in an fd for a file inside the app sandbox, and on_crash writes one line to it first; the app echoes
+// that file into hilog on the next launch.
+static int g_crash_fd = -1;
+void crash_set_fd(int fd) { g_crash_fd = fd; }
+static void crash_note(const char *s) { if (g_crash_fd >= 0 && s) { ssize_t w = write(g_crash_fd, s, strlen(s)); (void)w; } }
+
 static uint64_t watch_now_ns(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
@@ -379,6 +395,41 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
         atomic_fetch_add(&g_nfault, 1);
         atomic_store(&g_fault_pc, (uint64_t)UC_PC(uc));
         atomic_store(&g_fault_addr, (uint64_t)(uintptr_t)(si ? si->si_addr : 0));
+        // np539：第一件事就是直写一行（不经过 stdio / 管道 / hilog），保证现场一定落地。
+        // np539: the very first action is a direct write of one line (no stdio, no pipe, no hilog).
+        {
+            char line[384];
+            // np540：顺手把 nvn 回放的"最后一条命令"带上（图形引擎导出，没有图形单测时就是 -1）。
+            // np540: also carry the last NVN replay command (exported by the graphics engine; -1 in a graphics-only build).
+            extern volatile unsigned dm_last_cmd_op __attribute__((weak));
+            extern volatile unsigned dm_last_cmd_size __attribute__((weak));
+            unsigned lastop = (&dm_last_cmd_op) ? dm_last_cmd_op : 0xffffffffu;
+            unsigned lastsz = (&dm_last_cmd_size) ? dm_last_cmd_size : 0;
+            int n = snprintf(line, sizeof line, "FAULT sig=%d pc=%s lr=%s addr=%#llx sp=%#llx fp=%#llx lastop=%u/%u\n",
+                             sig, fmt_off((uint64_t)UC_PC(uc)), fmt_off((uint64_t)UC_LR(uc)),
+                             (unsigned long long)(uintptr_t)(si ? si->si_addr : 0),
+                             (unsigned long long)UC_SP(uc), (unsigned long long)UC_FP(uc),
+                             lastop, lastsz);
+            if (n > 0) crash_note(line);
+            // np539：再补一条 fp 链——libc 内部崩时 lr 可能是残留值（np539 那轮的 lr 落在一条没有 bl 的指令上），
+            // 只靠 pc/lr 分不清"谁传进来的坏指针"。每帧都用 process_vm_readv 读，读崩了就停，不会再制造第二次崩溃。
+            // np539: also dump the frame-pointer chain. Inside libc the lr can be stale (np539's lr landed on an
+            // instruction that has no bl), so pc/lr alone cannot say who passed the bad pointer. Each frame is read
+            // with process_vm_readv; a bad read just stops the walk instead of crashing a second time.
+            {
+                uint64_t fp = (uint64_t)UC_FP(uc);
+                for (int i = 0; i < 16 && fp; i++) {
+                    uint64_t pair[2] = { 0, 0 };
+                    struct iovec li = { pair, 16 }, ri = { (void *)(uintptr_t)fp, 16 };
+                    if (process_vm_readv(getpid(), &li, 1, &ri, 1, 0) != 16) break;
+                    int n2 = snprintf(line, sizeof line, "FRAME %d ret=%s fp=%#llx\n",
+                                      i, fmt_off(pair[1]), (unsigned long long)pair[0]);
+                    if (n2 > 0) crash_note(line);
+                    if (pair[0] <= fp) break;
+                    fp = pair[0];
+                }
+            }
+        }
     }
     if (sig == SIGTRAP) {
         if (null_guard_trap(uc)) return;
@@ -1145,6 +1196,15 @@ void crash_install(void) {
         pthread_detach(th);
     }
     sigaction(SIGSEGV, &sa, 0); sigaction(SIGBUS, &sa, 0); sigaction(SIGILL, &sa, 0); sigaction(SIGTRAP, &sa, 0);
+    // np539：把安装结果打出来。np538 的现象是"崩了却一行现场都没有"，第一个要排除的假设就是
+    // "sigaction 静默失败、我们的处理器根本没进链"（系统 sigchain 日志里只出现两个系统处理器）。
+    // np538's symptom was a crash with no site line at all; the first hypothesis to rule out is that sigaction
+    // silently failed and our handler never entered the chain (the system sigchain log showed only two handlers).
+    {
+        struct sigaction chk; int rc1 = sigaction(SIGSEGV, 0, &chk);
+        fprintf(stderr, "[dm] crash 安装 SIGSEGV rc=%d 当前处理器=%p fd=%d\n",
+                rc1, (void *)chk.sa_sigaction, g_crash_fd);
+    }
 }
 
 // ---- np386：断言钩子 --------------------------------------------------------------
