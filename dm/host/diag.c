@@ -764,7 +764,8 @@ void crash_sample_self(void) {
     const char *c = strchr(e, ':'); if (c) g_sample_name = strdup(c + 1);
     struct sigaction sa = {.sa_sigaction = on_sample, .sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART};
     sigaction(SIGUSR2, &sa, 0);
-    pthread_t t; pthread_create(&t, NULL, sampler, (void *)(uintptr_t)(atoi(e) * 1000)); pthread_detach(t);
+    pthread_t t; int rc = pthread_create(&t, NULL, sampler, (void *)(uintptr_t)(atoi(e) * 1000));
+    fprintf(stderr, "[dm] sampler 启动 rc=%d 周期=%dms 模式=%s", rc, atoi(e), g_sample_name ? g_sample_name : "主线程"); pthread_detach(t);
 }
 
 // ---------- DM_INFLATE_BENCH=<样本文件>：用游戏映像里的 zlib（main 0xf3a930 inflateInit_、0xf3aa90 inflate）解同一批样本并计时 ----------
