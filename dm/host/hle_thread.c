@@ -338,7 +338,7 @@ static inline int cas32(uint64_t a, uint32_t *exp, uint32_t v) { return __atomic
 //   at .so load time the env is not set yet (napi sets it just before starting the host).
 static int g_cv_probe = -1, g_cv_sig;
 // np566：handoff 交接对象打点的计数（复用 cv_enabled() 的开关，DM_CV_PROBE 也打开它）
-static unsigned g_nhandoff;
+static unsigned g_nhandoff, g_nunlk;
 // np560：取号式限流（0x1c 与 0x1d 各自计数）。
 //   上一版只在结果行自增、交接行不自增 ⇒ 交接行无限打，np560 一轮 35,876 行，把日志预算与判读全冲垮。
 //   env 也必须惰性读：.so 加载时 envs 还没设（napi 起宿主前才设）。
@@ -849,7 +849,21 @@ int svc_thread(int num, uint64_t *regs) {
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }
-    case 0x1B: pthread_mutex_lock(&G); lock_handoff(regs[0]); pthread_mutex_unlock(&G); regs[0] = 0; return 1;
+    case 0x1B: {  // ArbitrateUnlock(x0 地址)。np568：0x100d 死锁前在此反复放/拿锁 A（n=2122），
+        //   打点拿**游戏侧 lr**（signal/unlock 的发起点），定位它在游戏代码里的位置。
+        // np568: ArbitrateUnlock(x0 address). 0x100d spins here releasing/re-taking lock A -- log the
+        //   guest-side lr to locate the game-code site.
+        uint64_t uaddr = regs[0];
+        pthread_mutex_lock(&G);
+        if (cv_enabled() && g_nunlk < 40 && uaddr >= dm_guest_heap_lo()) {
+            ++g_nunlk;
+            LOG("[unlk] h=%#x addr=%#llx lr=%#llx", cur()->handle, (unsigned long long)uaddr,
+                (unsigned long long)regs[30]);
+        }
+        lock_handoff(uaddr);
+        pthread_mutex_unlock(&G);
+        regs[0] = 0; return 1;
+    }
     case 0x1C: {  // WaitProcessWideKeyAtomic(x0 锁地址, x1 条件键, w2 标签, x3 超时) | WaitProcessWideKeyAtomic(x0 lock address, x1 condition key, w2 tag, x3 timeout)
         thr_t *t = cur(); uint64_t addr = regs[0], key = regs[1];
         pthread_mutex_lock(&G);
