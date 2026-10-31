@@ -916,7 +916,7 @@ int svc_thread(int num, uint64_t *regs) {
             for (i = 0; i < g_cvh_n; i++) if (g_cv_hist[i].key == key) break;
             if (i == g_cvh_n && g_cvh_n < 32) { g_cv_hist[g_cvh_n].key = key; g_cv_hist[g_cvh_n].n = 0; g_cv_hist[g_cvh_n].h = 0; g_cvh_n++; }
             if (i < g_cvh_n) { g_cv_hist[i].n++; g_cv_hist[i].h = cur()->handle; }
-        } }
+        }
         pthread_mutex_unlock(&G);
         regs[0] = 0; return 1;
     }
