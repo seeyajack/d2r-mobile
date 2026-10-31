@@ -1095,8 +1095,20 @@ int svc_thread(int num, uint64_t *regs) {
                 {
                     uint64_t real = 0; vm_size_t got = 0;
                     if (!vm_read_overwrite(mach_task_self(), (vm_address_t)((uint64_t)regs + 0x320 + 8),
-                                           sizeof real, (vm_address_t)&real, &got) && got == sizeof real)
+                                           sizeof real, (vm_address_t)&real, &got) && got == sizeof real) {
                         crash_off("from", real);
+                        // np589：再往上一层。`sdk+0x8bfd8` 是个自由函数 TryWaitEvent(handle, autoClear)，
+                        //   句柄是**它的调用者**给的；跳板把该函数的 x29 存在 [跳板 sp]，
+                        //   而它的帧里 [x29]=调用者 fp、[x29+8]=返回地址 ⇒ 一行就能拿到"谁递了 4"。
+                        // np589: one frame higher. `sdk+0x8bfd8` is a free function TryWaitEvent(handle, autoClear)
+                        //   and the handle comes from ITS caller; the trampoline saved that function's x29 at
+                        //   [trampoline sp], and its frame holds [x29]=caller fp, [x29+8]=return address.
+                        uint64_t fp = 0, up = 0;
+                        if (!vm_read_overwrite(mach_task_self(), (vm_address_t)((uint64_t)regs + 0x320),
+                                               sizeof fp, (vm_address_t)&fp, &got) && got == sizeof fp && fp > 0x100000000ull &&
+                            !vm_read_overwrite(mach_task_self(), (vm_address_t)(fp + 8), sizeof up, (vm_address_t)&up, &got) && got == sizeof up)
+                            crash_off("up", up);
+                    }
                 }
                 // np588：把 x19 与它前后 32 字节打出来。理由：SDK 侧 `svcResetSignal(handle)` 的句柄
                 //   通常就是从某个结构体字段 `ldr w0,[x19,#off]` 读的，x19 往往正是那个结构体（LightEvent /
