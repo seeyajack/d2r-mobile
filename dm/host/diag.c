@@ -667,7 +667,7 @@ static pthread_t g_sample_pt;
 #define SRING 1024
 static struct { uint64_t t, pc, lr, bt[16]; uint64_t x19, x20; int n; uint32_t h; } g_sring[SRING];   // x19/x20：停住时能看出"在操作哪个对象" | x19/x20: tells which object is being operated on when it stops
 static _Atomic unsigned g_shead;
-static unsigned g_sig_seen;   // np580：SIGUSR2 递送计数（区分"信号没送达"与"ring/直方图没打印"）
+static _Atomic unsigned g_sig_seen;   // np580：SIGUSR2 递送计数（区分"信号没送达"与"ring/直方图没打印"）
 static void on_sample(int sig, siginfo_t *si, void *uc_) {
     (void)sig; (void)si; ucontext_t *uc = uc_;
     atomic_fetch_add(&g_sig_seen, 1);
