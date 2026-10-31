@@ -387,9 +387,17 @@ static void lock_handoff(uint64_t addr) {
 // Make t take the lock at addr: if free, it gets it directly and is woken, otherwise set the waiters bit and turn into a lock wait (holding G)
 static void lock_acquire_for(thr_t *t, uint64_t addr, uint32_t tag) {
     uint32_t v = ld32(addr);
+    // np584：**退让上限**。v==0 分支若与用户态 CAS 赛跑连输（用户态线程瞬间又拿走），
+    //   这里会持 G 无限自旋 → sampler 等 G 冻结（心跳 #500 后无 #1000 的观测）→ 全局假死。
+    //   64 次失败后放弃接管：把 t 留在 kind=1 等下一次 0x1b 交接（那时锁字必非 0，走 break 分支）。
+    // np584: yield cap. If the v==0 branch keeps losing the race to user-mode CAS, this spins holding G
+    //   forever (the heartbeat freeze). After 64 failures, give up: leave t as a kind=1 lock waiter for the
+    //   next 0x1b hand-off (the word will be non-zero then, taking the break path).
+    int spins = 0;
     for (;;) {
-        if (v == 0) { if (cas32(addr, &v, tag)) { wake(t, 0); return; } continue; }
+        if (v == 0) { if (cas32(addr, &v, tag)) { wake(t, 0); return; } if (++spins > 64) break; continue; }
         if (cas32(addr, &v, v | WAITERS_BIT)) break;
+        if (++spins > 64) break;
     }
     t->wkind = 1; t->waddr = addr; t->wtag = tag;      // 仍在 g_wait 里，改为锁等待 | Still in g_wait, changed to a lock wait
     t->wseq = ++g_wseq;                                  // 内核把它新插进锁持有者的等待队列：同优先级排在已有锁等待者之后 | The kernel inserts it anew into the lock owner's wait queue: at equal priority it goes after the existing lock waiters
