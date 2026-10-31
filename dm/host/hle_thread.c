@@ -568,6 +568,12 @@ int svc_thread(int num, uint64_t *regs) {
     }
     switch (num) {
     case 0x08: {  // CreateThread(→w1 句柄; x1 入口, x2 参数, x3 栈顶, w4 优先级, w5 核) | CreateThread(→w1 handle; x1 entry, x2 argument, x3 stack top, w4 priority, w5 core)
+        {   // np549：客体栈区整片提交（只改权限位，页按需分配）。不提交的话，栈顶贴着栈区起点的
+            //   那个线程往下一长就踩到 PROT_NONE ⇒ si_code=2 的 SIGSEGV。
+            // np549: commit the whole guest stack region (permission bits only; pages stay demand-allocated).
+            //   Without it, the thread whose stack top sits at the bottom of the region faults with si_code=2.
+            void dm_guest_commit_stack(void); dm_guest_commit_stack();
+        }
         thr_t *t = calloc(1, sizeof *t);
         pthread_cond_init(&t->cv, NULL);
         t->entry = regs[1]; t->arg = regs[2]; t->stack_top = regs[3] & ~0xFull;

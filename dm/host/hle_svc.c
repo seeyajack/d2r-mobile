@@ -37,6 +37,29 @@ static uint8_t *g_stack; static size_t g_stack_cap;
 void dm_guest_address_space_init(void);
 uint8_t *dm_guest_stack_region(size_t *cap) { if (cap) *cap = g_stack_cap; return g_stack; }
 void dm_guest_set_main_stack(void *lo, size_t size) { g_main_stack_lo = lo; g_main_stack_size = size; }
+// np549 ★ 把客体栈区整片提交为可读写。
+// 为什么：客体地址空间是一整块 `mmap(PROT_NONE)` 预留，栈区在 `g_as+0x30000000`（256 MB），
+// 而客体线程的栈顶由游戏给（CreateThread 的 x3），落到这段预留里。真机实测：
+// 线程 #1 的栈顶 `0x5e4f64bfe0` 距栈区起点只有 0x3FE0（16 KB），它往下一长就踩到**没提交**的页，
+// 而 `si_code=2`（ACCERR，页在但没权限）不是 MAPERR —— 正是"PROT_NONE 预留没提交"的特征。
+// `mprotect` 只改权限位，页仍然按需分配 ⇒ 256 MB 不占实际内存；也因此比"给每个线程算一段"更简单、
+// 更接近真机（真机上整块 RAM 都可读写，栈溢出是悄悄踩坏别的东西，而不是当场缺页）。
+// np549: commit the whole guest stack region read/write. The guest address space is one PROT_NONE
+// reservation and the stack region is the 256 MB at g_as+0x30000000; guest thread stacks land there with
+// the top supplied by the game. On device thread #1's top sat 0x3FE0 (16 KB) above the region start, and
+// the first growth touched an uncommitted page -- si_code=2 (ACCERR, page present but not permitted), the
+// signature of "PROT_NONE reservation, never committed". mprotect only changes permission bits and pages
+// stay demand-allocated, so the 256 MB costs nothing until used; it is also closer to the hardware, where
+// the whole RAM is read/write and a stack overflow silently corrupts instead of faulting.
+static void mem_init(void);   // np549：下面 dm_guest_commit_stack 要先用到它 | used by dm_guest_commit_stack below
+void dm_guest_commit_stack(void) {
+    mem_init();
+    if (!g_stack || !g_stack_cap) return;
+    static int done; if (done) return; done = 1;
+    int rc = mprotect(g_stack, g_stack_cap, PROT_READ | PROT_WRITE);
+    if (rc) LOG("【红】提交客体栈区失败 errno=%d（%s）", errno, strerror(errno));
+    else LOG("客体栈区已提交可读写：%p +%zu MiB", (void *)g_stack, g_stack_cap >> 20);
+}
 void *dm_guest_main_stack(size_t *size) { if (size) *size = g_main_stack_size; return g_main_stack_lo; }
 
 
