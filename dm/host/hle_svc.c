@@ -23,6 +23,11 @@
 static size_t g_reserve;           // 实际预留大小（逐档降级后成功的值） | Actual reserved size (the value that succeeded after stepping down)
 static uint8_t *g_as;              // ASLR 区基址 = 整块 | ASLR region base = the whole block
 static uint8_t *g_heap; static size_t g_heap_cur, g_heap_cap; static int g_heap_rejects;
+// np568：heap 起点访问器——hle_thread 的 [cv]/[cvh] 打点用它区分"main 模块内的初始化空转"
+//   与"游戏运行期的工作队列锁"（前者把 60 条配额吃光，np566 教训）。
+// np568: heap-base accessor -- the [cv]/[cvh] logging in hle_thread uses it to tell "init-time churn
+//   inside the main module" (which ate the whole 60-slot quota, np566) from "run-time work-queue locks".
+uint64_t dm_guest_heap_lo(void) { return (uint64_t)(uintptr_t)g_heap; }
 // 地址段整个落在客体堆当前已开放（可读写）的范围内：这种读不用陷内核核对，直接 memcpy（diag.c tk_rd 等每拍读客体内存的地方用）
 // The address range lies entirely within the currently opened (readable and writable) part of the guest heap: such reads need no kernel trap to check, memcpy directly (used where guest memory is read every tick, such as diag.c tk_rd)
 int dm_guest_heap_readable(uint64_t a, size_t n) { uint64_t b = (uint64_t)(uintptr_t)g_heap; size_t cur = g_heap_cur; return g_heap && a >= b && n <= cur && a - b <= cur - n; }

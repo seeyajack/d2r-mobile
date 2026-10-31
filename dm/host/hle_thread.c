@@ -901,18 +901,22 @@ int svc_thread(int num, uint64_t *regs) {
         for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // 按内核顺序；转为锁等待或被唤醒后不再是 kind 2 | In kernel order; once turned into a lock wait or woken it is no longer kind 2
         int left = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
         if (!left) st32(key, 0);
-        if (cv_take(&g_cv_sig, 60)) { ++g_cv_sig;
+        // np568：只记 **heap 区**的 key。SDK 初始化期对 main 模块内条件变量的空转（0x5e13ee2xxx，
+        //   0x2F0 步长的内部表）与死锁无关，却把 60 条配额吃光（np566 教训）。
+        // np568: log only heap-area keys. Init-time churn on main-module CVs ate the whole quota.
+        extern uint64_t dm_guest_heap_lo(void);
+        if (key >= dm_guest_heap_lo() && cv_take(&g_cv_sig, 60)) { ++g_cv_sig;
             LOG("[cv] 0x1d h=%#x key=%#llx cnt=%d 唤醒=%d 仍有等待者=%d", cur()->handle, (unsigned long long)key, cnt, n, left); }
         // np567：0x1d 的 key 直方图（去重记账，随 [stall] 打出）——回答"这个条件变量
         //   整个生命周期里被 signal 过几次、被谁"。卡死判据：0x100d 等的 key=0x…a518 计数为 0。
         // np567: per-key histogram of 0x1d (dedup bookkeeping, dumped with [stall]) -- it answers "how many times
         //   was this condition signalled, by whom". Stall criterion: the key 0x100d waits on has a count of 0.
-        {
+        if (key >= dm_guest_heap_lo()) {
             int i;
             for (i = 0; i < g_cvh_n; i++) if (g_cv_hist[i].key == key) break;
             if (i == g_cvh_n && g_cvh_n < 32) { g_cv_hist[g_cvh_n].key = key; g_cv_hist[g_cvh_n].n = 0; g_cv_hist[g_cvh_n].h = 0; g_cvh_n++; }
             if (i < g_cvh_n) { g_cv_hist[i].n++; g_cv_hist[i].h = cur()->handle; }
-        }
+        } }
         pthread_mutex_unlock(&G);
         regs[0] = 0; return 1;
     }
