@@ -1,1 +1,11 @@
-{ "name": "entry", "version": "1.0.0", "description": "H1 probe", "dependencies": { "libdm.so": "file:./src/main/cpp/types/libdm" } }
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "Please describe the basic information.",
+  "main": "",
+  "author": "",
+  "license": "",
+  "types": "./src/main/cpp/types/libdms2/index.d.ts",
+  "dependencies": {}
+}
+

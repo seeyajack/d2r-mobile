@@ -1,15 +1,18 @@
-# 含本机签名配置（加密口令与证书路径），不入库；模板见 build-profile.template.json5
-# Holds local signing configs (encrypted passwords, certificate paths); never committed — see build-profile.template.json5
-/build-profile.json5
-/build/
-/entry/build/
-/entry/.cxx/
-/oh_modules/
-/entry/oh_modules/
-/.hvigor/
-/.idea/
+/node_modules
+/oh_modules
 /local.properties
-.clang-tidy
-.clangd
-/entry/src/main/cpp/local.cmake
-/entry/src/debugpack/resources/resfile/dm/
+/.idea
+**/build
+/.hvigor
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+/.appanalyzer
+/.cache/.hvigor/
+**/.idea/
+entry/src/main/resources/rawfile/romfs/
+entry/src/main/resources/rawfile/out/
+entry/src/main/resources/rawfile/shaders/
+entry/src/main/resources/rawfile/shaders_extra/

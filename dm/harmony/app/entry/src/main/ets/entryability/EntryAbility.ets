@@ -1,37 +1,63 @@
-// 应用入口：横屏全屏、游戏前台常亮；窗口状态转成原生生命周期事件（0 失焦 1 后台 2 前台 3 激活，同安卓）。
-// App entry: landscape full screen, screen kept on while the game is in front; window states become native lifecycle events
-// (0 unfocused, 1 background, 2 foreground, 3 active, as on Android).
-import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
-import { window } from '@kit.ArkUI';
+/*
+ * Copyright (c) 2026 Huawei Device Co., Ltd.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { AbilityConstant, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import dm from 'libdm.so';
-import { refreshForms } from '../entryformability/EntryFormAbility';
+import { window } from '@kit.ArkUI';
+
+const DOMAIN = 0x0000;
 
 export default class EntryAbility extends UIAbility {
-  // 退到后台时刷新桌面卡片（存档此时已写完）| Refresh the home-screen cards when going to the background (the saves are written by then)
-  onBackground(): void { refreshForms(this.context.filesDir); }
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
-    AppStorage.setOrCreate('filesDir', this.context.filesDir);
-    AppStorage.setOrCreate('lang', this.context.config.language ?? 'zh');
+    try {
+      this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
+    } catch (err) {
+      hilog.error(DOMAIN, 'testTag', 'Failed to set colorMode. Cause: %{public}s', JSON.stringify(err));
+    }
+    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
   }
+
+  onDestroy(): void {
+    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onDestroy');
+  }
+
   onWindowStageCreate(windowStage: window.WindowStage): void {
-    windowStage.getMainWindow().then((win: window.Window) => {
-      win.setWindowLayoutFullScreen(true);
-      win.setWindowSystemBarEnable([]);
-      win.setPreferredOrientation(window.Orientation.AUTO_ROTATION_LANDSCAPE);
-      win.setWindowKeepScreenOn(true);
-      const avoid = win.getWindowAvoidArea(window.AvoidAreaType.TYPE_CUTOUT);
-      AppStorage.setOrCreate('safeLeftPx', avoid.leftRect.width);
-      AppStorage.setOrCreate('safeRightPx', avoid.rightRect.width);
-      AppStorage.setOrCreate('safeBottomPx', avoid.bottomRect.height);
-    }).catch((e: Error) => hilog.warn(0, 'dm', 'window setup: %{public}s', e.message));
-    windowStage.on('windowStageEvent', (ev: window.WindowStageEventType) => {
-      const map = new Map<window.WindowStageEventType, number>([
-        [window.WindowStageEventType.SHOWN, 2], [window.WindowStageEventType.ACTIVE, 3],
-        [window.WindowStageEventType.INACTIVE, 0], [window.WindowStageEventType.HIDDEN, 1]]);
-      const v = map.get(ev);
-      if (v !== undefined) { dm.focus(v); }
+    // Main window is created, set main page for this ability
+    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onWindowStageCreate');
+
+    windowStage.loadContent('pages/Index', (err) => {
+      if (err.code) {
+        hilog.error(DOMAIN, 'testTag', 'Failed to load the content. Cause: %{public}s', JSON.stringify(err));
+        return;
+      }
+      hilog.info(DOMAIN, 'testTag', 'Succeeded in loading the content.');
     });
-    windowStage.loadContent('pages/Index');
+  }
+
+  onWindowStageDestroy(): void {
+    // Main window is destroyed, release UI related resources
+    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onWindowStageDestroy');
+  }
+
+  onForeground(): void {
+    // Ability has brought to foreground
+    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onForeground');
+  }
+
+  onBackground(): void {
+    // Ability has back to background
+    hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onBackground');
   }
 }

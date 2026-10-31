@@ -1,5 +1,3 @@
 {
-  "allowToBackupRestore": true,
-  "includes": ["data/storage/el2/base/haps/entry/files/save/"],
-  "excludes": []
+  "allowToBackupRestore": true
 }
