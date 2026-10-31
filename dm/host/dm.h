@@ -88,6 +88,11 @@ void dm_guest_set_main_stack(void *lo, size_t size);
 // 门分派：改写后的 svc / 计时器读经公共入口进来，ret_addr = 该门块返回点，regs 指向保存的 x0..x30
 // Gate dispatch: rewritten svc / timer reads come in through the common entry, ret_addr = the return point of that gate block, regs points to the saved x0..x30
 uint64_t gate_dispatch(uint64_t ret_addr, uint64_t *regs);
+// np588：最近一次门调用的真实返回点（每线程）。regs[30] 只到导入跳板，跳板改写 x29 断了帧链；
+// 这个槽是"谁调的这条 svc"的唯一来源。
+// np588: the real return point of the latest gate call (per thread). regs[30] only reaches the import
+// trampoline, which rewrites x29 and breaks the frame chain; this slot is the only source for "who called it".
+extern __thread uint64_t g_gate_ret;
 // 观测门（改写器 OBS 表；编号与 patch_nso.py 一致）：只读回调，挂上即在门命中时调用
 // Observation gates (rewriter OBS table; numbering matches patch_nso.py): read-only callbacks, called on a gate hit once attached
 enum { OBS_UIMSG = 1, OBS_TICK = 2, OBS_C2S = 3, OBS_C2S_SYS = 4, OBS_SETLANG = 5, OBS_TARGET_RANK = 7, OBS_UI_PROJECT = 8, OBS_FREEZE_WORLD = 10, OBS_FREEZE_CLIENT = 11, OBS_FREEZE_ANIM = 12, OBS_FREEZE_RENDER = 13, OBS_TEXTBOX = 14, OBS_EVENT_MSG = 15, OBS_LEVEL_WARP = 16, OBS_QUEST_KILL = 17, OBS_NOTICE_INPUT = 18, OBS_ERR_SMOOTH = 19, OBS_MODEL_YAW = 20, OBS_TOOLTIP = 21, OBS_PRESET_SPAWN = 22, OBS_MAX = 23 };   // 6 = iOS 绑定读取（dm_touch_game_bridge.c） | 6 = iOS binding read (dm_touch_game_bridge.c)

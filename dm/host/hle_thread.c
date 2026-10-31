@@ -365,6 +365,7 @@ static int g_cv_probe = -1, g_cv_sig;
 // np566：handoff 交接对象打点的计数（复用 cv_enabled() 的开关，DM_CV_PROBE 也打开它）
 static unsigned g_nhandoff, g_nunlk;
 extern uint64_t dm_guest_heap_lo(void);   // hle_svc.c：heap 起点（np568）
+void crash_off(const char *tag, uint64_t a);   // crash.c：把地址打成 模块名+偏移（np588：句柄无效行要打 lr） | crash.c: format an address as module+offset
 // np560：取号式限流（0x1c 与 0x1d 各自计数）。
 //   上一版只在结果行自增、交接行不自增 ⇒ 交接行无限打，np560 一轮 35,876 行，把日志预算与判读全冲垮。
 //   env 也必须惰性读：.so 加载时 envs 还没设（napi 起宿主前才设）。
@@ -1061,13 +1062,59 @@ int svc_thread(int num, uint64_t *regs) {
         uint32_t h = (uint32_t)regs[0];
         event_t *e = num == 0x11 ? h_peek(h, O_EVENT_W) : num == 0x17 ? h_peek(h, O_EVENT_R)
                    : (h_peek(h, O_EVENT_W) ? h_peek(h, O_EVENT_W) : h_peek(h, O_EVENT_R));
-        int64_t r = 0;
+        int64_t r = 0; uint32_t badh = 0;
         if (!e) { r = (num == 0x17 && h_peek(h, O_THREAD)) ? R_BAD_STATE : R_BAD_HANDLE;
-                  if (r == R_BAD_HANDLE) LOG("事件 SVC %#x 句柄无效 %#x", num, h); }
+                  if (r == R_BAD_HANDLE) badh = h; }
         else if (num == 0x11) { e->signaled = 1; wake_sync_waiters(); }
         else if (num == 0x17 && !e->signaled) r = R_BAD_STATE;
         else e->signaled = 0;
         GUNLOCK();
+        // np588：句柄无效是**热路径**（np587 实测数百次），所以三件事一起改：
+        //   ① 限流（头 8 次 + 每 1000 次一条）——原来每次失败一行，把日志预算吃光；
+        //   ② 补 **lr**：要回答"谁在拿 4 号句柄调 ResetSignal"，只有 lr 能指回 SDK 的那个函数；
+        //   ③ 挪到 G **之外**打（铁律 16：LOG 不进持锁区，crash_off 还会走 dladdr，更重）。
+        // np588: an invalid handle here is a HOT path (hundreds of times in np587), so three things at once:
+        //   1. throttle (first 8, then every 1000th) -- one line per failure ate the log budget;
+        //   2. add lr -- only lr can point back to the SDK function that resets handle 4;
+        //   3. print OUTSIDE G (rule 16: no LOG inside a critical section; crash_off even goes through dladdr).
+        if (badh) {
+            static unsigned n; unsigned k = ++n;
+            if (k <= 8 || k % 1000 == 0) {
+                fprintf(stderr, "[dm] 事件 SVC %#x 句柄无效 %#x（第 %u 次）h=%#x x0..x3=%#llx/%#llx/%#llx/%#llx",
+                        num, badh, k, cur() ? cur()->handle : 0,
+                        (unsigned long long)regs[0], (unsigned long long)regs[1],
+                        (unsigned long long)regs[2], (unsigned long long)regs[3]);
+                crash_off("lr", (uint64_t)regs[30]);
+                crash_off("caller", g_gate_ret);   // np588：真实调用点（lr 只到导入跳板） | the real call site (lr only reaches the trampoline)
+                // np588：再往上挖一层。导入跳板的形状是 `stp x29,x30,[sp,#-0x10]!` … `blr x30`
+                //   ⇒ **真实返回地址就压在 [跳板 sp + 8]**；而门是 `sub sp,sp,#800; mov x1,sp`，
+                //   所以跳板 sp = regs + 0x320。这条路径能拿到"谁 bl 了这个跳板"。
+                // np588: one level deeper. The import trampoline is `stp x29,x30,[sp,#-0x10]!` ... `blr x30`,
+                //   so the REAL return address sits at [trampoline sp + 8]; the gate does `sub sp,sp,#800;
+                //   mov x1,sp`, hence trampoline sp = regs + 0x320. This recovers "who bl'd the trampoline".
+                {
+                    uint64_t real = 0; vm_size_t got = 0;
+                    if (!vm_read_overwrite(mach_task_self(), (vm_address_t)((uint64_t)regs + 0x320 + 8),
+                                           sizeof real, (vm_address_t)&real, &got) && got == sizeof real)
+                        crash_off("from", real);
+                }
+                // np588：把 x19 与它前后 32 字节打出来。理由：SDK 侧 `svcResetSignal(handle)` 的句柄
+                //   通常就是从某个结构体字段 `ldr w0,[x19,#off]` 读的，x19 往往正是那个结构体（LightEvent /
+                //   SystemEvent 对象）。看到它就能直接判"是字段没被写、还是写进了别的偏移"。
+                // np588: print x19 and 32 bytes around it. On the SDK side `svcResetSignal(handle)` normally loads
+                //   the handle from a struct field (`ldr w0,[x19,#off]`), and x19 is usually that struct (the
+                //   LightEvent / SystemEvent object). Seeing it tells "field never written" from "written elsewhere".
+                {
+                    uint64_t o19 = (uint64_t)regs[19]; uint32_t w[8]; vm_size_t got = 0;
+                    fprintf(stderr, " x19=%#llx", (unsigned long long)o19);
+                    if (o19 > 0x100000000ull && !vm_read_overwrite(mach_task_self(), o19, sizeof w, (vm_address_t)w, &got) && got == sizeof w) {
+                        fprintf(stderr, " [x19]=");
+                        for (int q = 0; q < 8; q++) fprintf(stderr, "%s%08x", q ? " " : "", w[q]);
+                    }
+                }
+                fputc('\n', stderr);
+            }
+        }
         regs[0] = (uint64_t)r; return 1;
     }
     case 0x18: {  // WaitSynchronization(→w1 下标; x1 句柄数组, w2 个数, x3 超时) | WaitSynchronization(→w1 index; x1 handle array, w2 count, x3 timeout)

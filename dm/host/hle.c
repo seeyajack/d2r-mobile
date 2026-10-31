@@ -89,7 +89,18 @@ void gate_register(uint64_t ret_abs, const char *kind, int arg, uint64_t orig) {
 
 uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr);   // hle_svc.c
 
+// np588：最近一次门调用的**真实返回点**（每线程一份）。regs[30] 只到导入跳板，跳板改写 x29 断了帧链。
+// np588: the real return point of the latest gate call (per thread). regs[30] only reaches the import
+//   trampoline, which rewrites x29 and breaks the frame chain.
+__thread uint64_t g_gate_ret;
 uint64_t gate_dispatch(uint64_t ret_addr, uint64_t *regs) {
+    // np588：把"这条门是被谁调的"记进每线程槽。为什么需要：regs[30] 是**导入跳板**里的返回点
+    //   （sdk+0x7b1xxx 那一段），跳板会改写 x29、帧链在那一层就断了 ⇒ 想知道"谁在调 svc 0x17"
+    //   只能靠门块自己的 ret_addr（= svc 后面那条指令的地址，就是调用者的返回点）。
+    // np588: remember "who called this gate" in a per-thread slot. regs[30] is the return point INSIDE the
+    //   import trampoline (the sdk+0x7b1xxx block), which rewrites x29 and breaks the frame chain there, so the
+    //   only way to learn who called svc 0x17 is the gate's own ret_addr (= the instruction after the svc).
+    g_gate_ret = ret_addr;
     for (unsigned i = gate_h(ret_addr);; i = (i + 1) & ((1u << GATE_BITS) - 1)) {
         const gate_t *g = &g_gate[i];
         if (g->ret == ret_addr) switch (g->kind) {
