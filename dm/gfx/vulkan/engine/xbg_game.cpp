@@ -12,6 +12,21 @@ extern "C" int xbg_completion_wait_selftest(char *report,size_t bytes);
 #include "xbg_provenance.h"
 #include "xbg_pipeline_key.h"
 #include "xbg_vulkan.h"
+
+// np597：`set_levels=1 且 nlevels=0` 的视图在真机上会出现（实测 depth 附件 mip=0/0），而
+//   `nvnTextureViewSetLevels(n<=0)` 一次都没被调到 ⇒ 这个 0 不是游戏传进来的，是别的路径写进来的。
+//   NVN 里 0 层不合法；按"从 base 到最后一层"解释，并只打一次日志（不要每个 pass 都吵）。
+//   文件作用域：`view()` 与帧缓冲规划在两处不同的类里，必须共用同一个解释。
+// np597: a view with set_levels=1 and nlevels=0 does occur on device (depth attachment mip=0/0), and
+//   nvnTextureViewSetLevels(n<=0) is never called, so the 0 is written by some other path. "0 levels" is
+//   invalid in NVN; interpret it as "from base to the last level" and log once. File scope on purpose: view()
+//   and the framebuffer plan live in two different classes and must share one interpretation.
+static inline uint32_t xbg_view_nlevels(const view_t *v,uint32_t levels){
+    uint32_t n=v&&v->set_levels?uint32_t(v->nlevels):levels;
+    if(!n){uint32_t b=v&&v->set_levels?uint32_t(v->base_level):0u;n=levels>b?levels-b:1u;
+        static int once;if(!once++)xbg_logf("NVN view nlevels=0（base=%u levels=%u）⇒ 按“从 base 到最后一层”=%u 处理",b,levels,n);}
+    return n;
+}
 #include "xbg_depth.h"
 #include "xbg_sampler.h"
 #include "xbg_framebuffer.h"
@@ -1387,7 +1402,7 @@ struct Image {
         return format(v->format);
     }
     VkImageView view(const view_t *v,bool attachment=false,bool storage=false){
-        uint32_t base=v&&v->set_levels?v->base_level:0,n=v&&v->set_levels?v->nlevels:levels;
+        uint32_t base=v&&v->set_levels?v->base_level:0,n=xbg_view_nlevels(v,levels);
         uint32_t layer=v&&v->set_layers?v->min_layer:0,ls=v&&v->set_layers?v->nlayers:layers;
         need(base<levels && n && n<=levels-base && layer<layers && ls && ls<=layers-layer,"Invalid texture view range");
         if(attachment){need(ls==1,"Layered rendering not implemented");n=1;}
@@ -2203,6 +2218,10 @@ static void dump_missing_shader(const std::string &key,const void *control,uint6
 //   让流程能继续跑到 present，好回答"着色器之外还剩几道门"。画面必然是错的。
 // np529: drop the rest of this frame's commands when a shader bundle is missing (diagnostics only).
 static bool g_shader_skip_abort=false;
+// np598：DM_SHADER_SKIP 是否开着（只读一次）。draw() 要用它决定"没有顶点着色器"是丢这一条还是报错。
+// np598: whether DM_SHADER_SKIP is on (read once). draw() uses it to decide whether a missing vertex shader
+//   means "drop this draw" or a hard error.
+static bool shader_skip_on(){static int v=-1;if(v<0){const char *e=getenv("DM_SHADER_SKIP");v=(e&&*e=='1')?1:0;}return v!=0;}
 static Shader *placeholder_shader(const std::string &key,unsigned stage){
     const uint32_t *w=nullptr;size_t n=0;
     switch(stage){
@@ -3291,8 +3310,7 @@ bool create_pass(Pass &p,Commands &c,int clear_color=-1,bool clear_depth=false,b
         //   so either our view copy is stale (SetLevels after SetRenderTargets) or 0 means "from base to the
         //   last level". Fall back to the latter and log once instead of FATALing the whole pass.
         uint32_t bl=v&&v->set_levels?uint32_t(v->base_level):0u;
-        uint32_t nl=v&&v->set_levels?uint32_t(v->nlevels):uint32_t(t.d.levels);
-        if(!nl){static int once;if(!once++)xbg_logf("NVN 附件 %u levelCount=0（base=%u levels=%u）⇒ 按“从 base 到最后一层”处理",i,bl,uint32_t(t.d.levels));nl=t.d.levels>bl?uint32_t(t.d.levels)-bl:1u;}
+        uint32_t nl=xbg_view_nlevels(v,uint32_t(t.d.levels));
         extents[i]={1,t.d.width,t.d.height,t.d.levels,t.L.layers,bl,nl,
             v&&v->set_layers?uint32_t(v->min_layer):0,v&&v->set_layers?uint32_t(v->nlayers):t.L.layers,uint32_t(std::max(1,t.d.samples))};
         trace=(trace^t.serial^uint64_t(i)) * 1099511628211ull;trace^=hash_memory(&extents[i],sizeof(extents[i]));
@@ -3504,6 +3522,12 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     VkShaderModule modules[5]{};for(unsigned i=0;i<5;i++)if(state.shader[i])modules[i]=state.shader[i]->module;
     uint32_t active_colors=0;for(int i=0;i<state.rt.n;i++)if(state.rt.color[i])active_colors|=1u<<i;
     static std::vector<VkPipelineShaderStageCreateInfo> stages;stages.assign(5,VkPipelineShaderStageCreateInfo{});uint32_t stage_count=0;   // draw(): graphics thread only, not re-entrant
+    // np598：缺包跳过之后，下一帧标志已重置、但游戏没重新绑程序 ⇒ 这里会拿到空 VS（实测第 480 帧）。
+    //   skip 模式的画面本来就是错的，这一条 draw 丢掉即可，不该把进程打死。
+    // np598: after a skipped bundle the per-frame flag resets, yet the game does not re-bind the program, so a
+    //   null vertex shader shows up here (seen at frame 480). In skip mode the picture is already wrong; drop
+    //   this draw instead of killing the process.
+    if(!modules[0] && shader_skip_on()){static int n;if(n++<4)xbg_logf("【诊断】draw 没有顶点着色器（缺包跳过所致）⇒ 丢掉这一条（第 %d 次）",n);return;}
     int stage_result=xbg_graphics_stages(modules,state.rt.depth!=nullptr,active_colors,state.mask.mask,state.ms.a2c,stages.data(),&stage_count);
     dtrace("2 stages");
     if(stage_result)xbg_fatalf("Invalid graphics stage/depth-only state: %d",stage_result);stages.resize(stage_count);need(count>=0 && first>=0,"Negative draw range");if(!count || (indexed && indexed->instances==0))return;provenance_draw();
