@@ -19,6 +19,7 @@
 // Every implementation gets a compile-time signature check against the prototypes in nvn_protos.h (NVNboolean parameters are received as uint32_t, only the low 8 bits are looked at).
 // Environment switches: DM_NVN_FRAMES=N prints the call table per frame for the first N frames (default 3); DM_NVN_TSV=path writes the per-frame call table and timing to a TSV (DM_NVN_TSV_CALLS=0 writes timing only); DM_SLOWFRAME=1 writes only the per-frame breakdown of dropped frames to the log; DM_NVN_LOG=1 logs object creation.
 #include "../../host/hle.h"
+#include <sys/mman.h>   // np542：mincore —— 判"游戏给的这个地址到底有没有映射" | np542: mincore, to tell whether a game-supplied address is mapped at all
 #include "nvn_protos.h"
 #include "nvn_pool_flags_registry.h"
 #include "nvn_count.h"
@@ -305,6 +306,21 @@ NVN(nvnDeviceFinalizeCommandHandle, void, NVNdevice *d, NVNcommandHandle h) { (v
 // ---------- Memory pools ----------
 NVN(nvnMemoryPoolBuilderSetDefaults, void, NVNmemoryPoolBuilder *b) { memset(b, 0, sizeof(pool_builder_t)); }
 NVN(nvnMemoryPoolBuilderSetDevice, void, NVNmemoryPoolBuilder *b, NVNdevice *d) { ((pool_builder_t *)b)->dev = d; }
+// ---------- np542：地址来源取证 ----------
+// 为什么：np542 崩在 `OP_UPDATE_UB`，目标 `0xbd41066d98`，而同帧绑定的 UBO 在 `0xbd43402888`
+// （`mincore` 证明两处都没映射）。客体的地址空间是一整块 `mmap(PROT_NONE)` 预留（`host/hle_svc.c` 的
+// `g_as`，堆在 `g_as+1GB`），所以 `0xbd4…` **根本不在客体地址空间里** —— 一定是某个返回值或结构字段带出来的。
+// 这一组打点把"谁给了这个地址"逐环打出来（每个入口只打前几条，不占日志预算）。
+// np542: where do addresses come from? The firmware's guest address space is one reserved PROT_NONE block
+// (g_as in host/hle_svc.c, heap at g_as+1GB), so 0xbd4... lies outside it -- some return value or struct field
+// must be carrying it. These probes print each link of that chain (a few lines per entry only).
+static int g_ap_pool_set, g_ap_pool_init, g_ap_pool_get, g_ap_pool_map, g_ap_buf_set, g_ap_buf_init, g_ap_buf_get, g_ap_bind, g_ap_upd;
+#define AP_LOG(k, lim, ...) do { if ((k) < (lim)) { ++(k); LOG("[nvn] " __VA_ARGS__); } } while (0)
+static int nvn_page_mapped(uint64_t a) {
+    void *pg = (void *)(uintptr_t)(a & ~0xfffull); unsigned char v = 0;
+    return mincore(pg, 0x1000, &v) == 0;
+}
+
 NVN(nvnMemoryPoolBuilderSetStorage, void, NVNmemoryPoolBuilder *b, void *m, size_t n) { ((pool_builder_t *)b)->mem = m; ((pool_builder_t *)b)->size = n; }
 NVN(nvnMemoryPoolBuilderSetFlags, void, NVNmemoryPoolBuilder *b, int f) { ((pool_builder_t *)b)->flags = f; }
 // 池标志表：图形后端可查询一段客体内存所在池的标志（Vulkan 引擎据 CPU_NO_ACCESS 省掉被更新的 GPU 结果覆盖的存储写回）。
@@ -339,6 +355,7 @@ pool_t *dm_last_physical_pool(void) { return g_last_physical; }
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size;
+    AP_LOG(g_ap_pool_init, 12, "PoolInit #%d obj=%p mem=%p size=%#zx flags=%#x caller=%p", g_ap_pool_init, (void *)p, o->mem, o->size, o->flags, __builtin_return_address(0));
     if (o->mem) { mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); pool_flags_add(p,o->mem, o->size, o->flags); g_last_physical = o; }
     if (!o->mem && !(o->flags & 0x200)) LOG("【红】MemoryPoolInitialize 非虚拟池没有存储 flags=%#x size=%#llx", o->flags, o->size);
     OLOG("MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, o->size, o->flags);
@@ -369,7 +386,10 @@ NVN(nvnMemoryPoolMapVirtual, NVNboolean, NVNmemoryPool *p, int nreq, const NVNma
     }
     return 1;
 }
-NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { return (NVNbufferAddress)((const pool_t *)p)->mem; }
+NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) {
+    AP_LOG(g_ap_pool_get, 8, "PoolGetBufAddr obj=%p -> %p caller=%p", (const void *)p, ((const pool_t *)p)->mem, __builtin_return_address(0));
+    return (NVNbufferAddress)((const pool_t *)p)->mem;
+}
 // np308：MemoryPoolMap 在 BotW 里有 266 个静态调用点，之前落到通用空实现 ⇒ 返回 NULL，
 // 调用方拿到 NULL 基址后自己算偏移，写进去就崩（和 this=0 同一类）。
 // 语义：返回一段**CPU 可访问**的池存储指针。我们的池本来就是宿主内存（pool_t.mem），
@@ -377,7 +397,10 @@ NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { r
 // np308: MemoryPoolMap has 266 static call sites in BotW and used to hit the generic stub (NULL), so callers
 // computed offsets off a NULL base. Semantics: return a CPU-accessible pointer to the pool storage; our pools
 // ARE host memory (pool_t.mem), so it is just `mem` -- the same thing GetBufferAddress already returns.
-NVN(nvnMemoryPoolMap, void *, const NVNmemoryPool *p) { return (void *)((const pool_t *)p)->mem; }
+NVN(nvnMemoryPoolMap, void *, const NVNmemoryPool *p) {
+    AP_LOG(g_ap_pool_map, 8, "PoolMap obj=%p -> %p caller=%p", (const void *)p, ((const pool_t *)p)->mem, __builtin_return_address(0));
+    return (void *)((const pool_t *)p)->mem;
+}
 NVN(nvnMemoryPoolGetFlags, NVNmemoryPoolFlags, const NVNmemoryPool *p) { return (NVNmemoryPoolFlags)((const pool_t *)p)->flags; }
 
 // ---------- 描述符池 ----------
@@ -1092,6 +1115,9 @@ NVN(nvnCommandBufferCopyBufferToBuffer, void, NVNcommandBuffer *c, NVNbufferAddr
 // uniform update: the data is copied into command memory at record time (NVN semantics: the caller may modify the original data after recording) and written into the buffer at submit
 NVN(nvnCommandBufferUpdateUniformBuffer, void, NVNcommandBuffer *c, NVNbufferAddress buf, size_t bufsz, ptrdiff_t off, size_t n, const void *data) {
     (void)bufsz;
+    AP_LOG(g_ap_upd, 8, "RecUpdUBO buf=%#llx off=%#zx n=%#zx dst=%#llx mapped=%d caller=%p",
+           (unsigned long long)buf, (size_t)off, n, (unsigned long long)(buf + off),
+           nvn_page_mapped((uint64_t)(buf + off)), __builtin_return_address(0));
     uint32_t sz = (uint32_t)(24 + n);
     uint8_t *p = cmd_alloc(CB(c), sz); put_hdr(p, OP_UPDATE_UB, (sz + 7) & ~7u);
     uint64_t dst = buf + off, nn = n; memcpy(p + 8, &dst, 8); memcpy(p + 16, &nn, 8); memcpy(p + 24, data, n);
@@ -1187,6 +1213,10 @@ NVN(nvnCommandBufferBindVertexBuffer, void, NVNcommandBuffer *c, int i, NVNbuffe
     h_nvnCommandBufferBindVertexBuffers(c, i, 1, &r);
 }
 NVN(nvnCommandBufferBindUniformBuffer, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNbufferAddress a, size_t n) {
+    // np542：录制侧就把"谁给了这个地址"记下来——回放侧只知道地址，不知道来源。
+    // np542: record who handed this address over; the replay side only sees the address, not its origin.
+    AP_LOG(g_ap_bind, 8, "RecBindUBO st=%d idx=%d addr=%#llx size=%#zx mapped=%d caller=%p",
+           (int)st, i, (unsigned long long)a, n, nvn_page_mapped((uint64_t)a), __builtin_return_address(0));
     *REC(c, OP_BIND_UBO, p_bind_buf) = (p_bind_buf){st, i, a, n};
 }
 NVN(nvnCommandBufferBindUniformBuffers, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNbufferRange *rg) {
@@ -2093,7 +2123,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
 //
 // 语义（NVN v2）：buffer 自己不持有内存，它只是"内存池里的一段窗口"：
 //   nvnBufferBuilderSetStorage(builder, pool, offset, size) → nvnBufferInitialize(buffer, builder)
-//   nvnBufferGetAddress(buffer, off) = pool->mem + builderOffset + off
+//   nvnBufferGetAddress(buffer) = pool->mem + builderOffset（np543：官方原型只有一个参数）
 // 与既有约定一致：NVNbufferAddress 就是宿主内存指针（nvnMemoryPoolGetBufferAddress 也这么答）。
 //
 // 为什么用**宿主侧边表**而不是写进游戏给的 NVNbuffer：那是游戏分配的不透明结构，
@@ -2118,10 +2148,14 @@ NVN_NOPROTO(nvnBufferBuilderSetDefaults, void, void *b) { memset(b, 0, sizeof(bu
 NVN_NOPROTO(nvnBufferBuilderSetDevice, void, void *b, void *d) { ((buf_builder_t *)b)->dev = d; }
 NVN_NOPROTO(nvnBufferBuilderSetStorage, void, void *b, const void *pool, ptrdiff_t off, size_t n) {
     buf_builder_t *bb = (buf_builder_t *)b; bb->pool = (void *)pool; bb->off = off; bb->size = n;
+    AP_LOG(g_ap_buf_set, 12, "BufSetStorage buf=%p pool=%p pool_mem=%p off=%#zx size=%#zx caller=%p",
+           b, pool, pool ? (void *)((const pool_t *)pool)->mem : NULL, (size_t)off, n, __builtin_return_address(0));
 }
 NVN_NOPROTO(nvnBufferInitialize, int, void *b, const void *bd) {
     const buf_builder_t *bb = (const buf_builder_t *)bd;
     void *mem = bb->pool ? (void *)((const pool_t *)bb->pool)->mem : NULL;
+    AP_LOG(g_ap_buf_init, 12, "BufInit buf=%p pool_mem=%p off=%#zx size=%#zx caller=%p",
+           b, mem, (size_t)bb->off, (size_t)bb->size, __builtin_return_address(0));
     int i = buf_find(b);
     if (i < 0 && g_nbuf < BUF_MAX) { i = g_nbuf++; g_buf[i].obj = b; }
     else if (i < 0) { static int warned; if (!warned) { warned = 1; LOG("【红】缓冲区边表已满（%d），后续 nvnBufferMap 只能给暂存区", BUF_MAX); } }
@@ -2129,15 +2163,30 @@ NVN_NOPROTO(nvnBufferInitialize, int, void *b, const void *bd) {
     return 1;                                    // NVN_TRUE
 }
 NVN_NOPROTO(nvnBufferFinalize, void, void *b) { int i = buf_find(b); if (i >= 0) g_buf[i].obj = NULL; }
-NVN_NOPROTO(nvnBufferGetAddress, uint64_t, const void *b, ptrdiff_t off) {
+// np543 ★ 这是 np537–np542 那串崩溃的**真因**：签名多了一个参数。
+//   官方原型（nvn_protos.h:120）是 `NVNbufferAddress nvnBufferGetAddress(const NVNbuffer*)` —— **只有一个参数**。
+//   我们原来写成 `(buffer, ptrdiff_t off)`，把 x1 当偏移加进地址；而游戏调它时**根本不设 x1**
+//   ⇒ x1 是寄存器残值（实测是客体代码段里的一个地址 0x5e13053f70）⇒ 返回的"缓冲区地址"直接飞到
+//   `mem + base + 0x5e13053f70` ≈ `0xbc6d/0xbd40…` 这种没有映射的地址，CPU 一侧一写就 SEGV。
+//   这就是为什么游戏绑定的 UBO 在 0xbd43402888、更新目标是 0xbd41066d98、纹理源是 0xbd42261d98 ——
+//   同一个坏偏移，到处漏。
+// np543: the real cause of the np537-np542 crashes: one parameter too many. The official prototype is
+//   `NVNbufferAddress nvnBufferGetAddress(const NVNbuffer*)` -- a single argument. We took x1 as an offset and added
+//   it; the game never sets x1 when calling it, so x1 is register garbage (measured: a code address 0x5e13053f70),
+//   and the "buffer address" came back as mem + base + 0x5e13053f70 -- an unmapped 0xbc6d/0xbd40... address that
+//   SEGVs on the first CPU write. That is why the bound UBO sat at 0xbd43402888, the update target at 0xbd41066d98 and
+//   a texture source at 0xbd42261d98: the same bad offset leaking everywhere.
+NVN_NOPROTO(nvnBufferGetAddress, uint64_t, const void *b) {
     int i = buf_find(b);
     uint8_t *m = (i >= 0) ? (uint8_t *)g_buf[i].mem : NULL;
     ptrdiff_t base = (i >= 0) ? g_buf[i].off : 0;
-    if (!m) {                                    // 空缓冲区/没走 builder：给暂存区，别把 0 当地址
+    if (!m) {
         if (!g_buf_warned) { g_buf_warned = 1; LOG("【黄】nvnBufferGetAddress 拿到空缓冲区（b=%p）⇒ 暂存区兜底", b); }
         m = g_buf_scratch;
     }
-    return (uint64_t)(uintptr_t)(m + base + off);
+    AP_LOG(g_ap_buf_get, 12, "BufGetAddr buf=%p -> %p (mem=%p base=%#zx) caller=%p",
+           b, (void *)(uintptr_t)(m + base), (void *)m, (size_t)base, __builtin_return_address(0));
+    return (uint64_t)(uintptr_t)(m + base);
 }
 NVN_NOPROTO(nvnBufferGetSize, size_t, const void *b) { int i = buf_find(b); return i >= 0 ? g_buf[i].size : 0; }
 NVN_NOPROTO(nvnBufferGetMemoryPool, void *, const void *b) { (void)b; return NULL; }
