@@ -112,6 +112,35 @@ int dm_thread_self_info(uint64_t *entry, uint64_t *arg, uint64_t *stack_top, uin
 // **arg into x0** before jumping to entry, and every CreateThread entry is sdk+0x8b2d8 (the SDK thread
 // trampoline) -- the real per-thread function lives inside the ThreadType struct at x0. The observed
 // "constructor sees this = arg = 0" only holds if the trampoline takes that constructor as the entry.
+// np555 ★ 现场导出节拍：每 5 秒把各客体线程"最后一条 svc + 正在等谁"打一遍。
+//   为什么要有：卡死时没有崩溃、没有信号，事后什么也看不到；而"谁在等谁"恰恰是唯一能推进的读数。
+//   调用方是 16 ms 的假音频时钟线程（该线程在本平台一定被调度，见 se_tick 里的注释）。
+// np555: the state-dump tick -- every 5 s print each guest thread's last svc and what it waits on. A stall leaves no
+//   crash and no signal, so nothing is visible afterwards; "who waits for whom" is the only reading that moves us.
+//   Called from the 16 ms fake audio clock thread, which is definitely scheduled on this platform.
+void dm_thread_state_dump(const char *why) {
+    // np555：**不拿 G**。上一版持 G 打印，结果一行都没出来 —— 恰恰说明某个线程攥着 G 不放，
+    //   这本身就是"全卡住"的直接解释（客体线程全在等 G，谁也进不去）。诊断函数必须能在
+    //   "锁已经被谁攥死"的情况下继续工作，所以这里只做无锁快照（字段是普通整数，撕裂读可以接受）。
+    //   kind=1（锁等待）时顺手把锁字里的**持有者句柄**解出来：tag = 持有者 | 0x40000000(有等待者)。
+    // np555: do NOT take G. The previous version held G and printed nothing -- which itself says some thread is
+    //   sitting on G, the direct explanation for "everything is stuck" (all guest threads wait for G). A diagnostic
+    //   must keep working while the lock is held hostage, so this is a lock-free snapshot (plain int fields; a torn
+    //   read is acceptable). For kind=1 (lock wait) it also decodes the owner handle from the lock word:
+    //   tag = owner | 0x40000000 (has waiters).
+    int n = 0;
+    for (thr_t *t = g_all; t && n < 24; t = t->all, ++n) {
+        int k = t->wkind;
+        const char *kn = (const char *[]){ "none", "lock", "cond", "addr", "sync" }[(k >= 0 && k < 5) ? k : 0];
+        uint64_t own = 0;
+        if (k == 1 && t->waddr) { uint32_t tag = 0; memcpy(&tag, (const void *)(uintptr_t)t->waddr, 4); own = tag & ~0x40000000u; }
+        fprintf(stderr, "[dm] THR h=%#x st=%s%s svc=%#x n=%llu wait=%s addr=%#llx owner=%#llx lastlr=%#llx\n",
+                t->handle, t->started ? "run" : "idle", t->exited ? "/exit" : "",
+                t->last_svc, (unsigned long long)t->nsvc, kn,
+                (unsigned long long)t->waddr, (unsigned long long)own, (unsigned long long)t->last_lr);
+    }
+    if (!n) fprintf(stderr, "[dm] THR （还没有客体线程）%s\n", why);
+}
 void dm_thread_dump_all(void) {
     static char buf[0x300];
     for (thr_t *t = g_all; t; t = t->all) {
@@ -192,6 +221,48 @@ static int spin_phase_on(void) {
 }
 static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
+    // np555 ★ "等了不回来"这件事必须留下证据：卡死时最后一行 WAIT-IN 就是它在等谁。
+    //   只记**无限/超长等待**（ns<0 或 >1 秒），每线程每种对象最多记一次，全进程上限 400 行，
+    //   所以正常跑起来几乎不产生噪声，一旦卡住却一定有一行（np554 的现场就是"最后一命令 op=19 之后没了"）。
+    // np555: a wait that never returns must leave evidence -- on a stall the last WAIT-IN line names the object.
+    //   Only infinite/long waits (ns<0 or >1 s) are logged, once per thread and object kind, 400 lines per process,
+    //   so normal runs stay quiet but a stall always has its line (np554 ended right after command op=19).
+    if (ns < 0 || ns > 1000000000ll) {
+        static int n; static struct { uint32_t h; int k; uint64_t a; } seen[64]; static int nseen;
+        int dup = 0;
+        for (int i = 0; i < nseen; i++) if (seen[i].h == t->handle && seen[i].k == kind && seen[i].a == t->waddr) { dup = 1; break; }
+        if (!dup && nseen < 64) seen[nseen++] = (typeof(seen[0])){t->handle, kind, t->waddr};
+        if (!dup && n < 400) { ++n;
+            LOG("[wait-in] h=%#x kind=%d addr=%#llx key=%#llx ns=%lld", t->handle, kind,
+                (unsigned long long)t->waddr, (unsigned long long)t->wkey, (long long)ns); }
+        // np557：主线程一旦开始**无限等锁**，立刻把全线程状态打一遍（此刻正持 G，读数一致）。
+        //   为什么要在这个时刻打：np556 里连 16 ms 的音频时钟线程都停了 ⇒ 说明有线程攥着 G 不放，
+        //   于是"每 5 秒打一次"的节拍根本没机会跑。改成由**等待者**在登记时打，就一定打得出。
+        // np557: the moment the main thread starts an infinite lock wait, dump every thread once (we hold G here, so the
+        //   snapshot is consistent). Why here: in np556 even the 16 ms audio clock thread stopped, which means some
+        //   thread is sitting on G, so a "print every 5 s" tick never gets to run. Printing from the waiter always works.
+        if (t->handle == 0x1001 && kind == 1 && ns < 0) {
+            // np558：**每 3 秒一次**，不是只打一次。只打一次会撞在正常运行期（主线程每帧都会进无限等锁），
+            //   拿到的是"某一帧的普通状态"；卡死要看的恰恰是**同一幅图重复不变**。
+            //   ⇒ 判据：日志末尾连续几次 [stall] 的 owner/wait 完全一样 = 真死锁。
+            // np558: every 3 s, not once. A single dump lands during normal running (the main thread enters an
+            //   infinite lock wait every frame) and shows an ordinary frame; a stall is recognised by the same picture
+            //   repeating. Criterion: identical owner/wait in the last several [stall] blocks = a real deadlock.
+            static uint64_t next; extern uint64_t now_ns(void);
+            if (now_ns() >= next) {
+                next = now_ns() + 3000000000ull;
+                for (thr_t *q = g_all; q; q = q->all) {
+                    int kq = q->wkind; const char *kn = (const char *[]){ "none", "lock", "cond", "addr", "sync" }[(kq >= 0 && kq < 5) ? kq : 0];
+                    uint64_t own = 0;
+                    if (kq == 1 && q->waddr) { uint32_t tag = 0; memcpy(&tag, (const void *)(uintptr_t)q->waddr, 4); own = tag & ~0x40000000u; }
+                    LOG("[stall] h=%#x st=%s%s svc=%#x n=%llu wait=%s addr=%#llx owner=%#llx lr=%#llx",
+                        q->handle, q->started ? "run" : "idle", q->exited ? "/exit" : "",
+                        q->last_svc, (unsigned long long)q->nsvc, kn,
+                        (unsigned long long)q->waddr, (unsigned long long)own, (unsigned long long)q->last_lr);
+                }
+            }
+        }
+    }
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     struct timespec dl;
     int det_wait = ns > 0 && dm_detclock_enabled();
@@ -978,8 +1049,23 @@ void hle_bind_system_event(void *ev, int autoclear) {      // 必须在客体线
 // harmless. DM_SE_TICK=0 disables it.
 static void *se_tick(void *a) {
     (void)a;
+    unsigned tick = 0;
     for (;;) {
         usleep(16000);
+        // np555 ★ 借这个"一定会被调度"的线程做**现场导出节拍**：每 313 拍（≈5 秒）打一次各客体线程状态。
+        //   为什么要借它：本平台 `pthread_create` 出来的宿主线程体常常不被调度（diag.c 的采样器就是这样，
+        //   np555 开 DM_SAMPLE/DM_HIST 一条都没输出），而这个线程每 16 ms 醒一次、实测一定跑。
+        //   卡死时（np554：最后一条命令 op=19 之后没有下文）这五行就是唯一能回答"谁在等谁"的读数。
+        //   只在 DM_STATE_TICK=1 时打，避免常态刷屏。
+        // np555: use this thread -- which is definitely scheduled -- as a state-dump tick: every 313 ticks (~5 s) print
+        //   the state of every guest thread. Host threads spawned with pthread_create are often never scheduled on this
+        //   platform (that is why diag.c's sampler printed nothing in np555 with DM_SAMPLE/DM_HIST), while this one wakes
+        //   every 16 ms and does run. During a stall (np554: nothing after command op=19) these lines are the only reading
+        //   that answers "who waits for whom". Only under DM_STATE_TICK=1, so normal runs stay quiet.
+        if ((++tick % 313) == 0 && getenv("DM_STATE_TICK")) {
+            extern void dm_thread_state_dump(const char *why);
+            dm_thread_state_dump("tick");
+        }
         void *evs[64]; int n = 0;
         pthread_mutex_lock(&g_se_lock);
         for (int i = 0; i < g_nse && n < 64; i++) evs[n++] = g_se[i].ev;
