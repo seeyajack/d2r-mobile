@@ -368,11 +368,25 @@ static void *untar_worker(void *p) {
         if (allzero) break;                                  // 归档尾部两个全零块
         char tf = hdr[156];
         long long size = 0;
-        for (int i = 124; i < 136 && hdr[i] >= '0' && hdr[i] <= '7'; i++) size = size * 8 + (hdr[i] - '0');
-        {   // 名字：ustar 的 prefix 字段优先拼上
+        if (hdr[124] & 0x80) {
+            // GNU base-256：>8 GB 的文件长度用二进制编码（最高位置 1）。romfs 现在没有这么大的，
+            // 但换个载荷就可能撞上——按约定解出来，别把长度读成 0。
+            // GNU base-256: files >8 GB encode the length in binary (top bit set). romfs has none today, but
+            // another payload could; decode it instead of reading the size as 0.
+            for (int i = 125; i < 136; i++) size = (size << 8) | (unsigned char)hdr[i];
+        } else {
+            for (int i = 124; i < 136 && hdr[i] >= '0' && hdr[i] <= '7'; i++) size = size * 8 + (hdr[i] - '0');
+        }
+        {   // 名字：**只有 POSIX ustar** 才有 prefix 字段（偏移 345）。
+            //   GNU 格式（magic "ustar  \0"）在 345 放的是 atime —— 拿它当 prefix 会把垃圾拼进路径。
+            //   判据：POSIX 的 magic+version 是 "ustar\0" + "00"，即 hdr[262]==0；GNU 是空格。
+            // Name: only POSIX ustar has the prefix field at 345. GNU format (magic "ustar  \0") stores atime
+            //   there, and using it as a prefix would splice garbage into every path. POSIX has "ustar\0"+"00",
+            //   i.e. hdr[262]==0; GNU has a space.
             char nm[101];
             memcpy(nm, hdr, 100); nm[100] = 0;
-            if (!memcmp(hdr + 257, "ustar", 5) && hdr[345]) {
+            int posix_ustar = !memcmp(hdr + 257, "ustar", 5) && hdr[262] == 0;
+            if (posix_ustar && hdr[345]) {
                 char pre[156];
                 memcpy(pre, hdr + 345, 155); pre[155] = 0;
                 snprintf(name, sizeof name, "%s/%s", pre, nm);
