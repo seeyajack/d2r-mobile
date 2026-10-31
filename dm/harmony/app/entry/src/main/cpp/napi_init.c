@@ -318,6 +318,56 @@ static napi_value WriteFile(napi_env env, napi_callback_info info) {
     return v;
 }
 
+// np592：内容通道 —— 把**已经打开的源 fd** 拷到目标路径，重 I/O 留在原生。
+//   为什么不是"ArkTS 读成 ArrayBuffer 再 writeFile"：14 GB 走 N-API 的缓冲桥又慢又撑内存
+//   （Bootup.pack 就 18 MB，romfs 里还有更大的），而 SAF 只给 URI、原生开不了 URI
+//   ⇒ 折中：ArkTS 只负责遍历目录 + `fs.openSync(uri)` 拿 fd，拷贝整段在 C 里跑。
+//   返回：成功 = 拷贝的字节数（double，避免 >2 GB 溢出）；失败 = -errno。
+// np592: the content channel -- copy an already-open source fd to a destination path, with the heavy I/O
+//   kept native. Not "read into an ArrayBuffer and call writeFile": 14 GB through the N-API buffer bridge is
+//   slow and memory-hungry (Bootup.pack alone is 18 MB, and romfs has bigger), and SAF only hands out a URI
+//   that native cannot open. So ArkTS walks the tree and opens the URI for an fd; the copy itself runs in C.
+//   Returns: bytes copied as a double (no >2 GB overflow); on failure -errno.
+static napi_value CopyFdToFile(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2];
+    if (napi_get_cb_info(env, info, &argc, argv, NULL, NULL) != napi_ok || argc < 2) {
+        napi_throw_error(env, NULL, "copyFdToFile 需要 2 个参数：srcFd, destPath");
+        return NULL;
+    }
+    int32_t src = -1;
+    napi_get_value_int32(env, argv[0], &src);
+    char path[1300];
+    size_t n = 0;
+    napi_get_value_string_utf8(env, argv[1], path, sizeof path, &n);
+    napi_value out = NULL;
+    if (src < 0 || !path[0]) { napi_create_double(env, -EBADF, &out); return out; }
+    // 父目录先建出来（fopen/mkdir 都不建目录；ArkTS 建的目录原生看不见，同 np345）
+    { char dir[1300]; snprintf(dir, sizeof dir, "%s", path);
+      char *slash = strrchr(dir, '/');
+      if (slash && slash != dir) { *slash = 0; mkdirs(dir); } }
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) { napi_create_double(env, -errno, &out); return out; }
+    static char *buf;
+    if (!buf) buf = (char *)malloc(1u << 20);
+    long long total = 0;
+    for (;;) {
+        ssize_t r = read(src, buf, 1u << 20);
+        if (r < 0) { int e = errno; close(fd); napi_create_double(env, -e, &out); return out; }
+        if (r == 0) break;
+        ssize_t off = 0;
+        while (off < r) {
+            ssize_t w = write(fd, buf + off, (size_t)(r - off));
+            if (w <= 0) { int e = errno; close(fd); napi_create_double(env, -e, &out); return out; }
+            off += w;
+        }
+        total += r;
+    }
+    close(fd);
+    napi_create_double(env, (double)total, &out);
+    return out;
+}
+
 // readLog(path)：读宿主日志尾部（起 guest 崩了之后，重启 app 时由 ArkTS 调它回看）。
 // 单独一个接口而不是靠 probe()：probe() 只在**本进程**调过 start() 时才知道日志路径，
 // 而崩溃后是新进程，路径得由 ArkTS 重新给。
@@ -760,6 +810,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         { "logLine", NULL, LogLine, NULL, NULL, NULL, napi_default, NULL },
         { "writeFile", NULL, WriteFile, NULL, NULL, NULL, napi_default, NULL },
         { "writeFileGz", NULL, WriteFileGz, NULL, NULL, NULL, napi_default, NULL },
+        { "copyFdToFile", NULL, CopyFdToFile, NULL, NULL, NULL, napi_default, NULL },
     };
     napi_define_properties(env, exports, sizeof desc / sizeof desc[0], desc);
     return exports;
