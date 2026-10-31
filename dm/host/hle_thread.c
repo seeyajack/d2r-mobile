@@ -339,6 +339,7 @@ static inline int cas32(uint64_t a, uint32_t *exp, uint32_t v) { return __atomic
 static int g_cv_probe = -1, g_cv_sig;
 // np566：handoff 交接对象打点的计数（复用 cv_enabled() 的开关，DM_CV_PROBE 也打开它）
 static unsigned g_nhandoff, g_nunlk;
+extern uint64_t dm_guest_heap_lo(void);   // hle_svc.c：heap 起点（np568）
 // np560：取号式限流（0x1c 与 0x1d 各自计数）。
 //   上一版只在结果行自增、交接行不自增 ⇒ 交接行无限打，np560 一轮 35,876 行，把日志预算与判读全冲垮。
 //   env 也必须惰性读：.so 加载时 envs 还没设（napi 起宿主前才设）。
@@ -918,7 +919,6 @@ int svc_thread(int num, uint64_t *regs) {
         // np568：只记 **heap 区**的 key。SDK 初始化期对 main 模块内条件变量的空转（0x5e13ee2xxx，
         //   0x2F0 步长的内部表）与死锁无关，却把 60 条配额吃光（np566 教训）。
         // np568: log only heap-area keys. Init-time churn on main-module CVs ate the whole quota.
-        extern uint64_t dm_guest_heap_lo(void);
         if (key >= dm_guest_heap_lo() && cv_take(&g_cv_sig, 60)) { ++g_cv_sig;
             LOG("[cv] 0x1d h=%#x key=%#llx cnt=%d 唤醒=%d 仍有等待者=%d", cur()->handle, (unsigned long long)key, cnt, n, left); }
         // np567：0x1d 的 key 直方图（去重记账，随 [stall] 打出）——回答"这个条件变量
