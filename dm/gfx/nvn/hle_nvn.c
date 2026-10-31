@@ -738,14 +738,34 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
 // np449: `nvnProgramSetShadersExt` is a later NVN addition missing from our header. Copy with the
 // SetShaders layout ({data, control} = 0x10 per entry) and dump the first entry once so the log tells
 // us whether the real stride is 0x10 or something else (e.g. 0x18 with an explicit stage field).
+// np550 ★ 真因（照上游 nxnative `hle_nvn.c:2316` 定谳）：`nvnProgramSetShadersExt`（NVN 55）里
+// **每个阶段是 0x18 字节** = `NVNshaderData{data, control}` + 一个 8 字节扩展字段，而不是 0x10。
+// 我们原来按 0x10 步长整块 memcpy ⇒ **从第 1 个阶段起全部错位**：读到的 data 是上一个阶段的扩展字段
+// （通常是 0）、control 是下一个阶段的一半，于是算出一个"文件里根本没有"的键。
+// 这解释了 np525–np547 那一长串"运行时变体"：`4e3520ec…`（stage 0 正常）、`65f095b5…`、
+// `222ca40d…`（`data=0 own=0 n704=0x1ff400`，控制段甚至以代码魔数开头）——**不是 agl 运行时编译，
+// 是我们把阶段数组读歧了**。
+// np550: the real cause (settled by upstream nxnative hle_nvn.c:2316): in nvnProgramSetShadersExt (NVN 55)
+// **each stage is 0x18 bytes** -- NVNshaderData{data, control} plus an 8-byte extension field -- not 0x10.
+// Copying with stride 0x10 misaligned every stage from the second one on: "data" was the previous stage's
+// extension field (usually 0) and "control" was half of the next stage, which yields a key that exists in no
+// file. That is the whole np525-np547 "runtime variant" story: not agl compiling at run time, but us
+// misreading the stage array.
+typedef struct { NVNbufferAddress data; const void *control; uint64_t ext; } shader_data_ext_t;
 NVN_NOPROTO(nvnProgramSetShadersExt, NVNboolean, NVNprogram *p, int n, const void *sd) {
     prog_t *o = (prog_t *)p;
+    const shader_data_ext_t *e = (const shader_data_ext_t *)sd;
     static int once;
     if (!once++) { const uint64_t *w = (const uint64_t *)sd;
-        OLOG("ProgramSetShadersExt 首次 n=%d 首项 %#llx %#llx %#llx %#llx", n, w[0], w[1], w[2], w[3]); }
+        OLOG("ProgramSetShadersExt 首次 n=%d 首项 %#llx %#llx %#llx %#llx（步长 0x18）", n, w[0], w[1], w[2], w[3]); }
     if (n < 0 || n > 6) { LOG("【红】ProgramSetShadersExt 阶段数 %d", n); return 0; }
     snap_drop(&o->snap, o->serial, offsetof(prog_t, serial)); mtl_prog_release(o);
-    o->nstage = n; memcpy(o->sd, sd, (size_t)n * sizeof(NVNshaderData)); o->serial = nvn_new_serial();
+    o->nstage = n;
+    for (int i = 0; i < n; i++) {
+        o->sd[i].data = e[i].data; o->sd[i].control = e[i].control;
+        if (e[i].ext) ONCE_LOG("ProgramSetShadersExt 阶段 %d 的扩展字段非 0（%#llx）：宿主不用它", i, (unsigned long long)e[i].ext);
+    }
+    o->serial = nvn_new_serial();
     return 1;
 }
 
