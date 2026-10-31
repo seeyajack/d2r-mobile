@@ -55,6 +55,9 @@ file(GLOB HOST_ASM ${H}/*.S)
 # NVN 的 HLE 层（hle_nvn.c 提供 nvn_new_serial / dm_nvn_frame_count / front_display_refresh /
 # dm_gfx_suspend 等，宿主要用）；nvn_dirty.c 是脏区跟踪；nvn_names.c 是生成的名字表
 file(GLOB NVN_HLE_SRC ${ROOT}/dm/gfx/nvn/*.c)
+# ⚠ gfx/nvn/nvn_vk.c 是 OHOS 回放层（依赖 dm/ohos 的 dm_log.h/vk_ctx_ohos.h）；上屏走
+#   dm/gfx/vulkan/nvn_vk.c（下面显式列出）。glob 会误收它 ⇒ 排除（2026-10-31 收编工程壳后踩到）。
+list(REMOVE_ITEM NVN_HLE_SRC ${ROOT}/dm/gfx/nvn/nvn_vk.c)
 # gfx 根下的 HLE 层（hle_vi.c = nn::vi 显示层、hle_nv.c = nv:: 驱动胶水层）。
 # ⚠ 这两份原在 fork 里、工作副本没拷过来，导致 nn::vi 无实现 ⇒ 客体 vi 初始化时 SDK panic
 #   （np242 真机：六个模块构造器全跑完后 Break reason=0，回溯落在 main+0x9fc4bc 的图形初始化）。
