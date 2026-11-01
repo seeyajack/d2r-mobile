@@ -16,6 +16,13 @@ typedef struct xbg_sampler_limits {
     // np602: VK_EXT_custom_border_color is genuinely usable (extension enabled on the device and
     // customBorderColors supported). When false, a noncanonical border still fails with -7, never approximated.
     VkBool32 custom_border_color;
+    // np604：**用户显式选择**的近似（0 = 不近似，仍报 -7）。设备没有 custom_border_color 时，
+    // 只有调用方明确给了替代色才走这里——这不是"默认降级"，是"明知会画错但先把路打通"的开关。
+    // 1 = 透明黑 / 2 = 不透明黑 / 3 = 不透明白
+    // np604: an approximation the **caller explicitly asked for** (0 = none, still -7). Only used when the device
+    // lacks custom_border_color and the caller named a substitute -- not a default downgrade, but a switch for
+    // "this will draw wrong, keep going anyway". 1 = transparent black, 2 = opaque black, 3 = opaque white.
+    uint32_t border_approx;
 } xbg_sampler_limits;
 /* Pure conversion of actual NVN state. No Vulkan call. Unknown legacy clamp
  * modes and noncanonical borders fail instead of being approximated.

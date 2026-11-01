@@ -51,6 +51,13 @@ extern "C" int xbg_sampler_from_nvn(const xbg_nvn_sampler_desc *p,const xbg_samp
             s.borderColor=limits->integer_border?VK_BORDER_COLOR_INT_CUSTOM_EXT:VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
             if(custom_rgba)for(int k=0;k<4;k++)custom_rgba[k]=b[k];
         }
+        // np604：设备没有自定义边框色能力时，只有调用方**显式**指定了替代色才近似，否则照旧 -7。
+        // 这不是默认行为：默认仍然是"停下并说清原因"。
+        // np604: without the capability, approximate only when the caller explicitly named a substitute; the
+        // default stays "stop and say why".
+        else if(limits->border_approx==1)s.borderColor=limits->integer_border?VK_BORDER_COLOR_INT_TRANSPARENT_BLACK:VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+        else if(limits->border_approx==2)s.borderColor=limits->integer_border?VK_BORDER_COLOR_INT_OPAQUE_BLACK:VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+        else if(limits->border_approx==3)s.borderColor=limits->integer_border?VK_BORDER_COLOR_INT_OPAQUE_WHITE:VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
         else return -7;
     }
     *out=s;return 0;
