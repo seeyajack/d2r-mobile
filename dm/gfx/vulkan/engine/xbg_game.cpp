@@ -4095,7 +4095,30 @@ void dispatch(const p_dispatch &p){preflight_cpu_reads();CPU_SCOPE(Dispatch);++c
     // dispatch FATALs instead. Rule 9: turning on a degradation mode means finishing every consumer -- draws were
     // done (drop the draw without a VS), compute was missed.
     if(!state.shader[5] && shader_skip_on()){static int n;if(n++<4)xbg_logf("【诊断】dispatch 没有计算着色器（缺包跳过所致）⇒ 丢掉这一条（第 %d 次）",n);return;}
-    need(state.shader[5],"Dispatch has no genuine compute shader");need(p.x>=0 && p.y>=0 && p.z>=0,"Negative compute dispatch");if(!p.x||!p.y||!p.z)return;if(pipeguard::skipped(pipeguard::compute_key(state.shader[5]->key)))return;need(uint32_t(p.x)<=properties.limits.maxComputeWorkGroupCount[0] && uint32_t(p.y)<=properties.limits.maxComputeWorkGroupCount[1] && uint32_t(p.z)<=properties.limits.maxComputeWorkGroupCount[2],"Compute dispatch exceeds device limit");Commands c;Descriptors &d=acquire_descriptors();descriptors(d,c,true);VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};ci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;ci.stage.module=state.shader[5]->module;ci.stage.pName="main";ci.layout=d.pipeline_layout;PipelineLease pipeline;{CPU_SCOPE(Pipeline);XbgPipelineKey key;bool cacheable=xbg_compute_pipeline_key(key,ci,d.entry->definition.view());pipeline_lookup(pipeline,key,cacheable,nullptr,&ci);}if(!pipeline.pipeline){c.finish();return;}vkCmdBindPipeline(c.command,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline.pipeline);vkCmdBindDescriptorSets(c.command,VK_PIPELINE_BIND_POINT_COMPUTE,d.pipeline_layout,0,1,&d.set,uint32_t(d.dynamic_offsets.size()),d.dynamic_offsets.data());int prof_dispatch=pass_prof_compute_begin(c.command,p);vkCmdDispatch(c.command,p.x,p.y,p.z);pass_prof_complete(c.command,prof_dispatch);bright::after_dispatch(c);VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_HOST_READ_BIT;vkCmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&b,0,nullptr,0,nullptr);c.finish();++perf.dispatches;d.defer_writeback();++stats.dispatches;}
+    need(state.shader[5],"Dispatch has no genuine compute shader");need(p.x>=0 && p.y>=0 && p.z>=0,"Negative compute dispatch");if(!p.x||!p.y||!p.z)return;
+    // np630b：对照实验 ②——按 shader 键禁用 compute（DM_SKIP_COMPUTE=<16hex>，逗号分隔可多个）。
+    // 用途：np629b 的读数（被拒提交 dispatch 恒在）指向 compute→图形依赖或该 compute 本身；
+    // 跳过它跑一轮，device lost 消失 = 嫌疑定谳。画面会缺色调映射（变灰/变暗），只用于对照。
+    // np630b: experiment 2 -- skip specific compute shaders by key (DM_SKIP_COMPUTE=<16hex>[,…]).
+    // If the device loss disappears with the compute skipped, the suspicion is confirmed; the picture loses
+    // tone mapping (dimmer/grayer) -- diagnostics only.
+    {static std::vector<std::string> skip_keys;static bool inited=false;
+     if(!inited){inited=true;if(const char *e=getenv("DM_SKIP_COMPUTE")){const char *p2=e;while(*p2){const char *q=strchr(p2,',');size_t len=q?q-p2:strlen(p2);if(len==16)skip_keys.push_back(std::string(p2,len));p2=q?q+1:p2+len;}}
+         if(!skip_keys.empty()){std::string k;for(auto &x:skip_keys)k+=" "+x;xbg_logf("【对照】compute 禁用清单:%s",k.c_str());}}
+     if(!skip_keys.empty())for(auto &k:skip_keys)if(k==state.shader[5]->key){static int n;if(n++<4)xbg_logf("【对照】跳过 compute %s（DM_SKIP_COMPUTE）",k.c_str());return;}}
+    if(pipeguard::skipped(pipeguard::compute_key(state.shader[5]->key)))return;need(uint32_t(p.x)<=properties.limits.maxComputeWorkGroupCount[0] && uint32_t(p.y)<=properties.limits.maxComputeWorkGroupCount[1] && uint32_t(p.z)<=properties.limits.maxComputeWorkGroupCount[2],"Compute dispatch exceeds device limit");Commands c;Descriptors &d=acquire_descriptors();descriptors(d,c,true);VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};ci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;ci.stage.module=state.shader[5]->module;ci.stage.pName="main";ci.layout=d.pipeline_layout;PipelineLease pipeline;{CPU_SCOPE(Pipeline);XbgPipelineKey key;bool cacheable=xbg_compute_pipeline_key(key,ci,d.entry->definition.view());pipeline_lookup(pipeline,key,cacheable,nullptr,&ci);}if(!pipeline.pipeline){c.finish();return;}vkCmdBindPipeline(c.command,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline.pipeline);vkCmdBindDescriptorSets(c.command,VK_PIPELINE_BIND_POINT_COMPUTE,d.pipeline_layout,0,1,&d.set,uint32_t(d.dynamic_offsets.size()),d.dynamic_offsets.data());int prof_dispatch=pass_prof_compute_begin(c.command,p);vkCmdDispatch(c.command,p.x,p.y,p.z);pass_prof_complete(c.command,prof_dispatch);bright::after_dispatch(c);
+    // np630：dispatch 后屏障对照实验。默认（窄）：COMPUTE_SHADER_WRITE → HOST_READ，只够 host 读回；
+    // DM_BARRIER_FULL=1（对照）：ALL_COMMANDS × 全内存读写 —— 把"compute 写 → 后续图形读"这条依赖
+    // 也盖住。NVN 层游戏假定 dispatch 结果立即可用（它的同步在 NVN 语义里），我们原来只给了窄屏障；
+    // np629b 的读数（被拒提交 dispatch 恒在）指向这里。判据：开着跑，device lost 消失 = 定谳。
+    {static int full_barrier_env=-1;if(full_barrier_env<0){const char *e=getenv("DM_BARRIER_FULL");full_barrier_env=(e&&*e=='1')?1:0;}
+     VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+     VkPipelineStageFlags src=VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,dst=VK_PIPELINE_STAGE_HOST_BIT;
+     if(full_barrier_env){b.srcAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;src=dst=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+         static int n;if(n++<3)xbg_logf("【对照】dispatch 后全内存屏障已启用（DM_BARRIER_FULL=1）");}
+     else{b.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_HOST_READ_BIT;}
+     vkCmdPipelineBarrier(c.command,src,dst,0,1,&b,0,nullptr,0,nullptr);}
+    c.finish();++perf.dispatches;d.defer_writeback();++stats.dispatches;}
 
 struct MaskedClear {
     VkShaderModule vs{},fs{};VkPipelineLayout layout{};VkPipeline pipeline{};
