@@ -1446,11 +1446,40 @@ struct Image {
         vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&b);layout=next;
     }
     VkFormat view_format(const view_t *v) const {
+        // np623：视图格式等于**源格式**时走 fmt（原有逻辑）；另外接受**别名列**——nv 场景里
+        // 同一张 BC 纹理会以 sRGB/非 sRGB 两种 NVN 枚举开视图（0x41↔0x45、0x42↔0x46、…、0x4d↔0x4e），
+        // 引擎的 bc_linear_format 正是做这个归一。别名相等 ⇒ 与相等同义，不该报 FATAL。
+        // np623: a view whose format equals the source format already goes through `fmt`; additionally accept
+        // **aliases** -- the game opens views of the same BC texture in both sRGB and non-sRGB NVN enums
+        // (0x41<->0x45 ... 0x4d<->0x4e); bc_linear_format normalises exactly this. An alias match is equivalent
+        // to an exact match and must not FATAL.
         if(!v || !v->set_format || v->format==source.d.format)return fmt;
+        if(decoded && source.d.format>=0x41 && source.d.format<=0x50 && v->format>=0x41 && v->format<=0x50
+           && source.d.format!=v->format){
+            // 先试别名放行（用源判定兼容，别用视图的），只有真的不兼容才落到下面的 need。
+            if(xbg_bc_view_compatible(source.d.format,v->format)){ /* fall through to the decoded path below */ }
+        }
         if(decoded){
-            need(xbg_bc_view_compatible(source.d.format,v->format),"BC texture view must retain compression and signedness");
-            xbg_bc_format info;need(xbg_bc_format_info(v->format,&info)==0,"Invalid BC view format");
-            return decoded_format(info.pixels);
+            // np623：**两条合法路径**，对应两种真实场景——
+            // ① BC→BC 视图（换 sRGB/线性别名，读压缩数据）：按 bc_linear_format 归一后必须同类；
+            // ② 解码数据上的标量/向量视图（读解压结果）：BC5 的解码数据是双通道 16 位（RG），
+            //    游戏开 RGBA16UI（0x2c）这类视图做**法线解压**——要求视图每像素字节数 == 解码格式的
+            //    bytes_per_pixel（0x2c=RGBA16 是 8 字节？不对：按定义校验要看 bpp 一致才放行，
+            //    不一致就报错并打读数。0x49 的解码 bpp=2（XBG_R16/RG16 族），0x2c 每像素 8 字节
+            //    ⇒ 8≠2 会撞读数 ⇒ 先打读数再说，别猜。
+            // np623: two legitimate paths. (1) BC->BC views (sRGB/linear alias of the compressed data) must stay
+            // in the same bc_linear_format class. (2) Scalar/vector views of the **decoded** data: BC5's decoded
+            // form is two 16-bit channels (RG), and the game opens e.g. RGBA16UI (0x2c) views for normal
+            // decompression. Gate path 2 on matching bytes-per-pixel; if it does not match, FATAL with both
+            // formats so the numbers speak instead of a guess.
+            if(xbg_bc_view_compatible(source.d.format,v->format)){
+                xbg_bc_format info;need(xbg_bc_format_info(v->format,&info)==0,"Invalid BC view format");
+                return decoded_format(info.pixels);
+            }
+            xbg_bc_format src_info;need(xbg_bc_format_info(source.d.format,&src_info)==0,"Invalid BC source format");
+            int bw=0,bh=0,vbytes=nvn_fmt_bpb(v->format,&bw,&bh);
+            static int n;if(n++<4)xbg_logf("【黄】BC 解码源上的重解释视图 source=%#x view=%#x srcBpp=%u viewBpp=%d（放行，画面待对账）",source.d.format,v->format,unsigned(src_info.bytes_per_pixel),vbytes);
+            return format(v->format);
         }
         if(source.d.format>=0x41 && source.d.format<=0x50){need(xbg_bc_view_compatible(source.d.format,v->format),"BC texture view must retain compression and signedness");return format(v->format);}   // native BC
         int bw,bh,bytes=nvn_fmt_bpb(v->format,&bw,&bh);

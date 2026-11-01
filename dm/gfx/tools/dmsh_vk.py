@@ -203,6 +203,17 @@ def export(key, stage, c1, spv, res):
             vid, tid, sc = by_bind[vbind(t['binding'])]
             img = image_desc(types, tid)
             slot, samp, ty = decode_tex(t['cbuf_slot'], t['handle'], kind == 'image')
+            if slot is None and t['handle'] >> 20 == 0:
+                # np622：**运行时 dump 的句柄**没有 c2 表可解（cbuf_slot=-1），但引擎侧 handle 低 20 位
+                # 就是贴图池里的对象 id（xbg_game.cpp 的 `int id=int(handle&0xfffff)`）——运行时绑定
+                # 按 id 从池里取，不走 c2 偏移。合成包直接把 id 当槽号（纹理槽 / 图像槽同一个池）。
+                # 离线静态包不受影响：它们的 cbuf_slot>=0，仍走 decode_tex。
+                # np622: handles from a runtime dump have no c[2] table to decode (cbuf_slot=-1), but on the engine
+                # side the low 20 bits of a handle ARE the object id in the texture pool (xbg_game.cpp
+                # `int id=int(handle&0xfffff)`) -- runtime binding fetches by id, not by c2 offset. Synthetic
+                # packages use that id as the slot (texture and image share one pool). Offline bundles keep
+                # decode_tex: their cbuf_slot >= 0.
+                slot, samp, ty = t['handle'] & 0xfffff, None, t['handle'] >> 28
             if slot is None: raise ValueError(f'{kind} 槽解不出：{t}')
             if kind == 'texture':
                 typ = 'uniform_texel_buffer' if img['dim'] == 5 else 'combined_image_sampler'
