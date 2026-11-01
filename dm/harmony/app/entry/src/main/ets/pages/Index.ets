@@ -560,7 +560,7 @@ struct Index {
             // np618/np620: this round only exists to capture dumps, so the noise sources are off (DM_NVN_LOG's
             // "unimplemented call" spam, DM_DRAW_TRACE's per-draw lines) -- the log budget is fixed, spend it on
             // ctlhex/datahex. The code dump now uses the real ncode (np619, capped at 32 KB).
-            let envs = 'DM_NVN_LOG=1 DM_FS=1 DM_WATCH_STALL=30 DM_NVN_API_MAJOR=53 DM_DIAG_TICK=1 DM_SHADER_SKIP=1 DM_DRAW_TRACE=8 DM_CV_PROBE=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000 DM_SKIP_COMPUTE=78e80cf67d011b87';
+            let envs = 'DM_NVN_LOG=1 DM_FS=1 DM_WATCH_STALL=30 DM_NVN_API_MAJOR=53 DM_DIAG_TICK=1 DM_SHADER_SKIP=1 DM_DRAW_TRACE=8 DM_CV_PROBE=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000';
             // romfs 双路（d1 瘦包）：
             //   A. HAP 里带 romfs/（fat 包，首次装机用）→ 照旧**每次点都重新解出**。
             //      ⚠ 不能用 pathExists 判"解没解过"：本机 fs.listFileSync 对不存在的路径也不抛

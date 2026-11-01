@@ -191,6 +191,7 @@ std::map<VkBuffer,BufRef> buf_slot_refs;
 // intermediate segments are submitted immediately with their own fences (no waiting), the last segment
 // carries the slot's fence -- GPU sees many small submissions, CPU semantics unchanged. Cut points are
 // render-pass boundaries. Which segment the driver rejects: the digest ring's last successful segment.
+static bool retry_submit_enabled(){static int v=-1;if(v<0){const char *e=getenv("DM_RETRY_SUBMIT");v=(e&&*e=='0')?0:1;}return v!=0;}   // np631：默认开
 static int split_draws_env(){static int v=-1;if(v<0){const char *e=getenv("DM_SPLIT_DRAWS");v=e?atoi(e):0;if(v<0)v=0;
     xbg_logf("二分 DM_SPLIT_DRAWS=%d（0=off）",v);}   // np629: log once -- verifies the env chain end to end
   return v;}
@@ -1030,6 +1031,20 @@ void submit_slots(bool wait){
          }
          cur_digest.serial=slot_serial;digest_ring[digest_at++&15u]=cur_digest;cur_digest=SubDigest{};
          VkResult sr=vkQueueSubmit(cfg.queue,1,&si,s.fence);
+         // np631：**冷路径首提交重试**。vkQueueSubmit -4 时等 3ms 重试一次（默认开，DM_RETRY_SUBMIT=0 关）。
+         // 依据：① 驱动自带恢复（系统日志 "Gpu is reset when queue submit. Recover queue error now."）；
+         //       ② np630run3 的模式：挂点总在"新类型工作第一次提交"处 ⇒ 冷路径首次分配失败最像，
+         //          恢复后重试即过。判据：重试成功且游戏推进越过原挂点 = 证实；重试也失败 = 原路 FATAL。
+         if(sr!=VK_SUCCESS && retry_submit_enabled()){
+            // np631b：指数退避多次重试（3→10→30→100ms，最多 6 次）。首跑读数：3ms 一次能过一次
+            // （serial=14968）但第二次不够（serial=14974）——驱动恢复时间不固定，退避到 100ms 兜住。
+            static int rn=0;if(rn++<6)xbg_logf("【重试】vkQueueSubmit %d，开始指数退避（serial=%llu）",int(sr),(unsigned long long)slot_serial);
+            for(int attempt=0;attempt<6 && sr!=VK_SUCCESS;++attempt){
+                usleep(3000u<<attempt);   // 3ms,6ms,12ms,24ms,48ms,96ms —— 指数退避，6 次累计约 189ms
+                sr=vkQueueSubmit(cfg.queue,1,&si,s.fence);
+                static int ok=0;if(sr==VK_SUCCESS && ok++<6)xbg_logf("【重试】第 %d 次尝试成功（%ums）",attempt+1,3u<<attempt);
+            }
+         }
          if(sr!=VK_SUCCESS){
             // np610：设备丢失时把最近 16 次提交的形状打出来（见 SubDigest 的注释）
             // np610: on a lost device dump the shape of the last 16 submissions (see the SubDigest comment)
