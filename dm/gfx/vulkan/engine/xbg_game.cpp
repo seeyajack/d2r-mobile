@@ -183,6 +183,7 @@ SubDigest digest_ring[16];unsigned digest_at=0;SubDigest cur_digest;
 // load-independent -- exactly this kind of race. Assertion only logs when the evidence appears; behavior unchanged.
 struct BufRef{std::vector<const void*> slots;};   // const Slot* 以 void* 存，避免 Slot 定义在前置位置
 std::map<VkBuffer,BufRef> buf_slot_refs;
+std::map<VkImageView,BufRef> img_slot_refs;   // np628：图像描述符同款登记（键 = VkImageView，一个图像可有多个视图）
 // np603：每个 (阶段,槽) 的绑定次数（见 OP_BIND_UBO 处理处）。只用于"空槽"这条 FATAL 的定性。
 // np603: bind counters per (stage, slot); only used to classify the "empty slot" fatal.
 uint64_t bind_hits[6][16];
@@ -861,7 +862,10 @@ void retire_slot(Slot &s){
     for(auto &f:s.framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);s.framebuffers.clear();
     for(auto &v:s.texel_views)vkDestroyBufferView(cfg.device,v.second,nullptr);s.texel_views.clear();
     uint64_t c3=timing_clock();s.retire.run();
-    {const void *me=&s;for(auto it=buf_slot_refs.begin();it!=buf_slot_refs.end();){auto &v=it->second.slots;v.erase(std::remove(v.begin(),v.end(),me),v.end());if(v.empty())it=buf_slot_refs.erase(it);else ++it;}}   // np627
+    {const void *me=&s;
+     for(auto it=buf_slot_refs.begin();it!=buf_slot_refs.end();){auto &v=it->second.slots;v.erase(std::remove(v.begin(),v.end(),me),v.end());if(v.empty())it=buf_slot_refs.erase(it);else ++it;}   // np627
+     for(auto it=img_slot_refs.begin();it!=img_slot_refs.end();){auto &v=it->second.slots;v.erase(std::remove(v.begin(),v.end(),me),v.end());if(v.empty())it=img_slot_refs.erase(it);else ++it;}   // np628
+    }
     release_descriptors(s);uint64_t c4=timing_clock();
     perf.arena_peak=std::max<uint64_t>(perf.arena_peak,s.stream.peak+s.readback.peak);s.stream.peak=s.readback.peak=0;
     s.stream.reset();s.readback.reset();
@@ -3440,7 +3444,12 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                             live!=images.end() && live->second.get()==it->second.im){Image *im=&get_image(it->second.tex,true);
                             prepare_read(*im,commands.command);if(desc_memo_recording)desc_memo_images.push_back({it->second.tex,im,it->second.record,it->second.revision});
                             VkDescriptorImageInfo ii{};ii.imageView=it->second.view;ii.sampler=b.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER?it->second.sampler:VK_NULL_HANDLE;ii.imageLayout=VK_IMAGE_LAYOUT_GENERAL;
-                            image_infos.push_back(ii);write.pImageInfo=&image_infos.back();img_fast=true;++img_cache_hits;}
+                            image_infos.push_back(ii);write.pImageInfo=&image_infos.back();img_fast=true;++img_cache_hits;
+                            {BufRef &r=img_slot_refs[it->second.view];const void *cur=&recording_slot();
+                             for(const void *old_slot:r.slots)if(old_slot!=cur){bool alive=false;for(const Slot &sl:slots)if(&sl==old_slot){alive=sl.pending||sl.recording;break;}
+                                 if(!alive){static int n;if(n++<8)xbg_logf("【红】跨槽引用悬空 VkImageView=%p（快路径）登记槽=%p 当前槽=%p serial=%llu",(void*)it->second.view,old_slot,cur,(unsigned long long)slot_serial);}}
+                             if(r.slots.empty()||r.slots.back()!=cur){r.slots.push_back(cur);if(r.slots.size()>4)r.slots.erase(r.slots.begin());}}
+                        }
                         else if(it!=img_cache.end())img_cache.erase(it);
                     }
                 }
@@ -3475,6 +3484,11 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                             if((b.flags&2) && !(listed && cfg.enabled_core.shaderStorageImageReadWithoutFormat))xbg_fatalf("Image format %d lacks formatless-read support without VK_KHR_format_feature_flags2 (shader=%s listedWithStorageImage=%d shaderStorageImageReadWithoutFormat=%u)",int(viewed),shader.key.c_str(),int(listed),unsigned(cfg.enabled_core.shaderStorageImageReadWithoutFormat));}im.gpu_written=true,provenance_write(im,__LINE__);im.last_write=++write_seq;}
                     image_infos.push_back(ii);write.pImageInfo=&image_infos.back();
                     if(img_cacheable){img_cache.emplace(ikey,ImgEntry{&texture,&im,ii.imageView,ii.sampler,record,record->revision});++img_cache_misses;}
+                    {BufRef &r=img_slot_refs[ii.imageView];const void *cur=&recording_slot();
+                     for(const void *old_slot:r.slots)if(old_slot!=cur){bool alive=false;for(const Slot &sl:slots)if(&sl==old_slot){alive=sl.pending||sl.recording;break;}
+                         if(!alive){static int n;if(n++<8)xbg_logf("【红】跨槽引用悬空 VkImageView=%p（慢路径）登记槽=%p 当前槽=%p serial=%llu",(void*)ii.imageView,old_slot,cur,(unsigned long long)slot_serial);}
+                     }
+                     if(r.slots.empty()||r.slots.back()!=cur){r.slots.push_back(cur);if(r.slots.size()>4)r.slots.erase(r.slots.begin());}}
                 }
                 }
             }
