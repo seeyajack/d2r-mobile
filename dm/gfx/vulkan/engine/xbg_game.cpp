@@ -1405,11 +1405,14 @@ void capability_report(){
         VK_API_VERSION_MAJOR(properties.apiVersion),VK_API_VERSION_MINOR(properties.apiVersion),VK_API_VERSION_PATCH(properties.apiVersion),properties.driverVersion);
     xbg_logf("NVN caps features drawParameters=%u storageReadWithoutFormat=%u storageWriteWithoutFormat=%u storageExtendedFormats=%u gatherExtended=%u "
         "tessellation=%u geometry=%u occlusionQueryPrecise=%u depthBounds=%u depthClamp=%u fillModeNonSolid=%u bc=%u astcLdr=%u etc2=%u "
-        "anisotropy=%u logicOp=%u dualSrcBlend=%u independentBlend=%u clipDistance=%u cullDistance=%u float64=%u int64=%u int16=%u",
+        "anisotropy=%u logicOp=%u dualSrcBlend=%u independentBlend=%u clipDistance=%u cullDistance=%u float64=%u int64=%u int16=%u "
+        "robustBufferAccess=%u",
         unsigned(cfg.enabled_shader_draw_parameters),f.shaderStorageImageReadWithoutFormat,f.shaderStorageImageWriteWithoutFormat,f.shaderStorageImageExtendedFormats,
         f.shaderImageGatherExtended,f.tessellationShader,f.geometryShader,f.occlusionQueryPrecise,f.depthBounds,f.depthClamp,f.fillModeNonSolid,
         f.textureCompressionBC,f.textureCompressionASTC_LDR,f.textureCompressionETC2,f.samplerAnisotropy,f.logicOp,f.dualSrcBlend,f.independentBlend,
-        f.shaderClipDistance,f.shaderCullDistance,f.shaderFloat64,f.shaderInt64,f.shaderInt16);
+        f.shaderClipDistance,f.shaderCullDistance,f.shaderFloat64,f.shaderInt64,f.shaderInt16,
+        // np615：把 robustBufferAccess 的实际启用状态打进 caps（引擎注释里"越界读靠它"是个前提，值得留读数）
+        unsigned(f.robustBufferAccess));
     xbg_logf("NVN caps subgroup size=%u stages=%#x ops=%#x quadAllStages=%u",subgroup.subgroupSize,subgroup.supportedStages,subgroup.supportedOperations,subgroup.quadOperationsInAllStages);
     xbg_logf("NVN caps limits ubRange=%u sbRange=%u ubDyn=%u sbDyn=%u ubAlign=%llu sbAlign=%llu texelAlign=%llu stageSamplers=%u stageSampled=%u "
         "stageStorageImages=%u stageUB=%u stageSB=%u boundSets=%u colorAttachments=%u sharedMemory=%u workgroupInvocations=%u viewports=%u maxAnisotropy=%g",
@@ -3715,7 +3718,16 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     if(!modules[0] && shader_skip_on()){static int n;if(n++<4)xbg_logf("【诊断】draw 没有顶点着色器（缺包跳过所致）⇒ 丢掉这一条（第 %d 次）",n);return;}
     int stage_result=xbg_graphics_stages(modules,state.rt.depth!=nullptr,active_colors,state.mask.mask,state.ms.a2c,stages.data(),&stage_count);
     dtrace("2 stages");
-    if(stage_result)xbg_fatalf("Invalid graphics stage/depth-only state: %d",stage_result);stages.resize(stage_count);need(count>=0 && first>=0,"Negative draw range");if(!count || (indexed && indexed->instances==0))return;provenance_draw();
+    // np614：**np598 np608 的同一类漏洞**——降级模式只改了"缺 VS"这一支，缺 PS/GS 等任何必需阶段
+    // 仍然走 FATAL。skip 模式下画面本来就是错的，缺哪个阶段都只该丢掉这一条 draw。
+    // （判据：`xbg_graphics_stages` 的 result 非 0 就说明阶段不全；这里按 skip 模式统一兜。）
+    // np614: the same class as np598/np608 -- the degradation only covered a missing vertex shader, while a
+    // missing fragment/geometry stage still went to FATAL. In skip mode the picture is already wrong, so any
+    // missing required stage should just drop this draw.
+    if(stage_result){
+        if(shader_skip_on()){static int n;if(n++<4)xbg_logf("【诊断】draw 的图形阶段不完整（result=%d，缺包跳过所致）⇒ 丢掉这一条（第 %d 次）",stage_result,n);return;}
+        xbg_fatalf("Invalid graphics stage/depth-only state: %d",stage_result);
+    }stages.resize(stage_count);need(count>=0 && first>=0,"Negative draw range");if(!count || (indexed && indexed->instances==0))return;provenance_draw();
     const int orig_count=count;std::vector<uint32_t> quad_indices;p_draw_idx quad_indexed{};
     if(prim==7 && !indexed){
         need(instances<=INT32_MAX && first_instance<=INT32_MAX,"Quad instance range exceeds backend limits");
