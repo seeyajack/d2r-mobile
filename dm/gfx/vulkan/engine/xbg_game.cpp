@@ -2291,12 +2291,22 @@ static void dump_missing_shader(const std::string &key,const void *control,uint6
     }
     // np527：代码段在 NVNshaderData.data 里（不是控制块里）。抓 0x2000 字节，离线拿它的所有前缀哈希
     // 与 17,308 个包记录里的代码哈希求交：命中就同时得到"代码起点对不对"和"代码长度规则"。
+    // np619：**按真实代码长度 dump**。原来固定读 0x2000 字节，但 ncode 取自 control+0x704，
+    //   实测最大到 0x3b00（15 KB）⇒ 大着色器永远dump不全，离线被判"代码长度不足"而丢掉。
+    //   键是 sha256(control[0:nctl] ‖ code[0:ncode])，代码少一个字节，包名就对不上。
+    //   上限取 0x8000（32 KB，够所有实测值），并且只在 ncode 合法时才读。
+    // np619: dump the real code length. It used to read a fixed 0x2000 bytes, but ncode (control+0x704) reaches
+    //   0x3b00 (15 KB) on device, so large shaders were always truncated and dropped offline. The key is
+    //   sha256(control[0:nctl] || code[0:ncode]) -- one byte short and the bundle name will not match.
+    //   Cap at 0x8000 (32 KB, above every measured value) and only read when ncode is valid.
     if(code && (code>>32)==(reinterpret_cast<uint64_t>(control)>>32)){
+        uint32_t ncode=0;memcpy(&ncode,p+0x704,4);
+        size_t want=(ncode>0 && ncode<0x8000)?ncode:0x2000;
         const uint8_t *c=reinterpret_cast<const uint8_t *>(uintptr_t(code));
-        xbg_logf("datahex %s %p head=%02x%02x%02x%02x",key.c_str(),reinterpret_cast<void*>(uintptr_t(code)),c[0],c[1],c[2],c[3]);
-        for(size_t off=0;off<0x2000;off+=0x180){
+        xbg_logf("datahex %s %p head=%02x%02x%02x%02x ncode=%u",key.c_str(),reinterpret_cast<void*>(uintptr_t(code)),c[0],c[1],c[2],c[3],ncode);
+        for(size_t off=0;off<want;off+=0x180){
             char line[1024];int n=snprintf(line,sizeof line,"datahex %s +%03zx ",key.c_str(),off);
-            for(size_t i=0;i<0x180 && off+i<0x2000;i++)n+=snprintf(line+n,sizeof line-n,"%02x",c[off+i]);
+            for(size_t i=0;i<0x180 && off+i<want;i++)n+=snprintf(line+n,sizeof line-n,"%02x",c[off+i]);
             xbg_logf("%s",line);
         }
     }
