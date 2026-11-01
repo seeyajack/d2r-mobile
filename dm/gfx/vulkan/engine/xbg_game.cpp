@@ -165,6 +165,14 @@ VkBool32 sampler_mirror_clamp_enabled=VK_FALSE;
 // RGBA while Vulkan's fixed colours are only black/white/transparent, so anything else (the 1.6.0 payload uses
 // mid grey 0.5,0.5,0.5) needs this extension.
 VkBool32 custom_border_color_enabled=VK_FALSE, custom_border_without_format=VK_FALSE;
+// np610：**每次提交的极小摘要**（环形 16 份）。GPU device lost 只会告诉我们"这条队列提交被判死"，
+// 不会说是哪一帧、哪一帧里有没有 volume 切片当附件。所以每次提交记下 pass 数 / 含 volume 附件的 pass 数 /
+// draw / dispatch 数，一旦 vkQueueSubmit 非成功就把最近 16 份打出来 —— 这能把"是不是 np599 新开的那条路"变成读数。
+// np610: a tiny per-submission digest kept in a 16-entry ring. A device loss only says "this queue submit was
+// rejected", never which frame, nor whether that frame had a volume slice as a render target. Keeping pass counts,
+// volume-attachment pass counts, draws and dispatches per submit turns "is it the np599 path?" into a reading.
+struct SubDigest{uint64_t serial=0;uint32_t passes=0,volpasses=0,draws=0,dispatches=0,volatt=0;};
+SubDigest digest_ring[16];unsigned digest_at=0;SubDigest cur_digest;
 // np603：每个 (阶段,槽) 的绑定次数（见 OP_BIND_UBO 处理处）。只用于"空槽"这条 FATAL 的定性。
 // np603: bind counters per (stage, slot); only used to classify the "empty slot" fatal.
 uint64_t bind_hits[6][16];
@@ -936,7 +944,18 @@ void submit_slots(bool wait){
             vkCmdPipelineBarrier(s.pro,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&after,0,nullptr,0,nullptr);
             VK(vkEndCommandBuffer(s.pro));cbs[0]=s.pro;cbs[1]=s.cmd;ncb=2;s.pro_ops.clear();}
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};si.commandBufferCount=ncb;si.pCommandBuffers=cbs;
-        {CPU_SCOPE(Submit);VK(vkQueueSubmit(cfg.queue,1,&si,s.fence));}++submit_by[sync_site];poolreset::queue(s);
+        {CPU_SCOPE(Submit);
+         cur_digest.serial=slot_serial;digest_ring[digest_at++&15u]=cur_digest;cur_digest=SubDigest{};
+         VkResult sr=vkQueueSubmit(cfg.queue,1,&si,s.fence);
+         if(sr!=VK_SUCCESS){
+            // np610：设备丢失时把最近 16 次提交的形状打出来（见 SubDigest 的注释）
+            // np610: on a lost device dump the shape of the last 16 submissions (see the SubDigest comment)
+            xbg_logf("【红】vkQueueSubmit %d：最近 16 次提交摘要（volPass>0 表示那一帧有 volume 切片当渲染目标）",int(sr));
+            for(unsigned k=0;k<16;k++){const SubDigest &d=digest_ring[(digest_at+k)&15u];if(!d.serial)continue;
+                xbg_logf("  提交 serial=%llu passes=%u volPass=%u volAtt=%u draws=%u dispatch=%u",
+                    (unsigned long long)d.serial,d.passes,d.volpasses,d.volatt,d.draws,d.dispatches);}
+            xbg_fatalf("vkQueueSubmit(cfg.queue,1,&si,s.fence) failed: %d",int(sr));}
+        }++submit_by[sync_site];poolreset::queue(s);
         s.recording=false;s.pending=true;s.covers=submitted;s.hud_frame=hud::frame.load(std::memory_order_relaxed);slot_index^=1;++perf.submits;snapshot_reset();++slot_serial;
         pending_events.insert(pending_events.end(),recording_events.begin(),recording_events.end());recording_events.clear();
     }
@@ -3441,8 +3460,10 @@ bool create_pass(Pass &p,Commands &c,int clear_color=-1,bool clear_depth=false,b
     for(int i=0;i<state.rt.n;i++)if(state.rt.color[i] && (!clear_only || clear_color==i)){targets[i]=state.rt.color[i];selected[i]=state.rt.has_cview[i]?&state.rt.cview[i]:nullptr;}
     if(state.rt.depth && (!clear_only || clear_depth)){targets[8]=state.rt.depth;selected[8]=state.rt.has_dview?&state.rt.dview:nullptr;}
     uint64_t trace=clear_only?1:0;
+    ++cur_digest.passes;bool vol_attach=false;
     for(unsigned i=0;i<9;i++)if(targets[i]){
         const tex_t &t=*targets[i];const view_t *v=selected[i];
+        if(t.d.target==2){++cur_digest.volatt;vol_attach=true;}   // np610：volume 切片当附件（np599 的能力）| np610: volume slice as an attachment
         need(t.magic==MAGIC('T','E','X',0) && t.serial,"Invalid NVN render attachment");
         // np597：实测会拿到 levelCount==0（全量内容后第一次撞上：depth 附件 index=8，mip=0/0，64x64）。
         //   NVN 里"0 层"不合法，而游戏在真机上不会传它 ⇒ 要么我们的 view 副本过期（SetLevels 发生在
@@ -3463,6 +3484,7 @@ bool create_pass(Pass &p,Commands &c,int clear_color=-1,bool clear_depth=false,b
         trace=(trace^t.serial^uint64_t(i)) * 1099511628211ull;trace^=hash_memory(&extents[i],sizeof(extents[i]));
         trace^=uint64_t(v&&v->set_format?v->format:t.d.format)<<32;
     }
+    if(vol_attach)++cur_digest.volpasses;   // np610
     xbg_framebuffer_extent plan{};uint32_t bad=UINT32_MAX;int result=xbg_framebuffer_plan(extents.data(),extents.size(),properties.limits.maxFramebufferWidth,properties.limits.maxFramebufferHeight,&plan,&bad);
     if(result || (trace_attachments && trace!=last_attachment_trace)){
         xbg_logf("NVN framebuffer mode=%s result=%d viewport=%g,%g:%gx%g depthRange=%g/%g scissor=%d,%d:%ux%u selected=%ux%u samples=%u",clear_color>=0?"clear-color":clear_depth?"clear-depth-stencil":"draw",result,state.viewport.x,state.viewport.y,state.viewport.width,state.viewport.height,state.viewport.minDepth,state.viewport.maxDepth,state.scissor.offset.x,state.scissor.offset.y,state.scissor.extent.width,state.scissor.extent.height,plan.width,plan.height,plan.samples);
@@ -3663,7 +3685,7 @@ void dispatch_op_trace(unsigned op, unsigned size, unsigned depth) {
 // to the budget or a log wrap, this cannot. extern "C" 是为了让 dm/host/crash.c 能直接按名字取到。
 extern "C" { volatile unsigned dm_last_cmd_op = 0xffffffffu; volatile unsigned dm_last_cmd_size = 0; }
 void dispatch_set_last(unsigned op, unsigned size) { dm_last_cmd_op = op; dm_last_cmd_size = size; }
-void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instances=1,uint32_t first_instance=0){preflight_cpu_reads();CPU_SCOPE(Draw);DrawRoot draw_timing_root(&cpu_scope);provenance_draw();
+void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instances=1,uint32_t first_instance=0){preflight_cpu_reads();CPU_SCOPE(Draw);++cur_digest.draws;DrawRoot draw_timing_root(&cpu_scope);provenance_draw();
     need(state.rt.n>=0 && state.rt.n<=8,"Invalid draw color target count");
     dtrace("1 enter");
     VkShaderModule modules[5]{};for(unsigned i=0;i<5;i++)if(state.shader[i])modules[i]=state.shader[i]->module;
@@ -3882,7 +3904,7 @@ void after_dispatch(Commands &c){
     ++applied;
 }
 }
-void dispatch(const p_dispatch &p){preflight_cpu_reads();CPU_SCOPE(Dispatch);provenance_log("DISPATCH shader=%s",state.shader[5]?state.shader[5]->key.c_str():"null");
+void dispatch(const p_dispatch &p){preflight_cpu_reads();CPU_SCOPE(Dispatch);++cur_digest.dispatches;provenance_log("DISPATCH shader=%s",state.shader[5]?state.shader[5]->key.c_str():"null");
     // np608：**和 draw 的 np598 是同一条**。缺包跳过之后 `g_shader_skip_abort` 每帧重置，而绑定的程序
     // 还留着、下一帧游戏没重绑 ⇒ 这里 state.shader[5] 仍为空，于是 dispatch 以另一种方式 FATAL。
     // 铁律 9：开一个降级模式就要把消费侧**所有**分支改完——draw 改过了（丢无 VS 的 draw），dispatch 这里漏了。
