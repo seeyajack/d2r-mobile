@@ -545,7 +545,16 @@ struct Index {
             // the guest thread (big-I/O rule) -- which looked like "frozen at 77.7 s + watchdog dump + exit".
             // DM_SHADER_SKIP already enumerates the keys; turn the dump on only when a specific one must be
             // translated from the live capture.
-            let envs = 'DM_NVN_LOG=1 DM_FS=1 DM_WATCH_STALL=8 DM_NVN_API_MAJOR=53 DM_DIAG_TICK=1 DM_SHADER_SKIP=1 DM_DRAW_TRACE=8 DM_CV_PROBE=1 DM_SAMPLER_BORDER=transparent';
+            // np607：**DM_WATCH_STALL=8 → 30**。这个看门狗到点会 `_exit(128+SIGALRM)`，也就是说
+            // 前几轮"73.5 s 停顿 + 进程自己退出"其实是**我们自己的看门狗杀的**。而真机读数里主线程是
+            // "运行/未在等"、CPU 每 5 秒涨 1.32 秒（≈26%）——这更像"在慢慢加载 NavMesh/物理"，不像死锁。
+            // 放到 30 秒既保留"真卡死能被抓"，又不会把一个长加载当场判死。
+            // np607: DM_WATCH_STALL 8 -> 30. This watchdog calls _exit(128+SIGALRM) when it fires, so the earlier
+            // "stall at 73.5 s then the process exits by itself" was our own watchdog killing it. On device the main
+            // thread was "running, not waiting" and its CPU grew 1.32 s per 5 s (~26%) -- that looks like a slow
+            // NavMesh/physics load, not a deadlock. 30 s keeps "a real hang is still caught" without executing a
+            // long load on the spot.
+            let envs = 'DM_NVN_LOG=1 DM_FS=1 DM_WATCH_STALL=30 DM_NVN_API_MAJOR=53 DM_DIAG_TICK=1 DM_SHADER_SKIP=1 DM_DRAW_TRACE=8 DM_CV_PROBE=1 DM_SAMPLER_BORDER=transparent';
             // romfs 双路（d1 瘦包）：
             //   A. HAP 里带 romfs/（fat 包，首次装机用）→ 照旧**每次点都重新解出**。
             //      ⚠ 不能用 pathExists 判"解没解过"：本机 fs.listFileSync 对不存在的路径也不抛
