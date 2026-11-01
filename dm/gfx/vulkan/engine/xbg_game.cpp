@@ -1375,7 +1375,7 @@ void capability_report(){
 }
 struct Image {
     tex_t source{}; uint64_t provenance_epoch=0,provenance_writer=0;unsigned provenance_write_site=0; VkImage image{};VkDeviceMemory memory{};VkFormat fmt{};VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageAspectFlags aspects{};VkImageUsageFlags usage{};uint32_t width{},height{},depth=1,levels{},layers{},bpp{};VkSampleCountFlagBits samples=VK_SAMPLE_COUNT_1_BIT;bool uploaded=false,gpu_written=false,decoded=false,mutable_format=false;VkImageCreateInfo create{}; // create: as created (no pNext), for upgrade_mutable
+    VkImageAspectFlags aspects{};VkImageUsageFlags usage{};uint32_t width{},height{},depth=1,levels{},layers{},bpp{};VkSampleCountFlagBits samples=VK_SAMPLE_COUNT_1_BIT;bool uploaded=false,gpu_written=false,decoded=false,mutable_format=false,vol_compat=false;VkImageCreateInfo create{}; // create: as created (no pNext), for upgrade_mutable
     uint64_t cpu_hash=0,checked_submission=UINT64_MAX,last_write=0;uint32_t stable_checks=0;int64_t mem_bytes=0,bc_bytes=0,bc_data=0;
     // 最近一次经 get_image 取用时的 slot_serial：等于当前值，说明这次提交里已有命令用过它（gfx-upload-prologue 据此判断能否提前上传）。
     // slot_serial at the last get_image of this image: equal to the current value means a command of this submission already used it
@@ -1403,8 +1403,23 @@ struct Image {
     }
     VkImageView view(const view_t *v,bool attachment=false,bool storage=false){
         uint32_t base=v&&v->set_levels?v->base_level:0,n=xbg_view_nlevels(v,levels);
-        uint32_t layer=v&&v->set_layers?v->min_layer:0,ls=v&&v->set_layers?v->nlayers:layers;
-        need(base<levels && n && n<=levels-base && layer<layers && ls && ls<=layers-layer,"Invalid texture view range");
+        // 3D 纹理的“层”是**深度切片**（L.layers 恒为 1，切片数在 d.depth）⇒ 视图的层号必须拿 depth 校验，
+        // 否则游戏渲染到第 1 片时会被判“越界”。这也是 NVN 允许渲染进 volume 切片的前提。
+        // A 3D texture's "layers" are depth slices (L.layers is always 1; the slice count lives in d.depth), so a
+        // view's layer number must be validated against depth -- otherwise rendering into slice 1 reads as
+        // out-of-range. This is also the premise for NVN allowing a render target inside a volume.
+        const bool volume=source.d.target==2;const uint32_t span=volume?std::max(1u,depth):layers;
+        // 未显式给层时：volume 仍是“1 层”（=第 0 片，与改动前 L.layers 等价）；数组纹理仍是整条。
+        // With no explicit layer: a volume is still "one layer" (slice 0, equal to L.layers before this change);
+        // an array texture still means the whole range.
+        uint32_t layer=v&&v->set_layers?v->min_layer:0,ls=v&&v->set_layers?v->nlayers:(volume?1u:layers);
+        need(base<levels && n && n<=levels-base && layer<span && ls && ls<=span-layer,"Invalid texture view range");
+        // 采样/存储用的 3D 视图按规范 baseArrayLayer 必须是 0（只有附件的 2D 兼容视图才允许指到某一层）。
+        // 这里保持改动前的口径：非附件视图一律从第 0 层起、单层，免得把“只对附件放宽”变成全局放宽。
+        // A sampled/storage 3D view must start at slice 0 (only an attachment's 2D-compatible view may name a
+        // slice), so keep the pre-change rule for non-attachment views: slice 0, one layer. The relaxation above
+        // is meant for attachments only.
+        if(volume && !attachment)need(layer==0 && ls<=1,"3D texture view must start at slice 0");
         if(attachment){need(ls==1,"Layered rendering not implemented");n=1;}
         VkFormat vf=view_format(v);
         if(vf!=fmt){static std::set<std::pair<int,int>> seen;if(seen.insert({int(fmt),int(vf)}).second)xbg_logf("NVN viewfmt image=%d view=%d nvn=%#x->%#x attachment=%d storage=%d mutable=%d",int(fmt),int(vf),source.d.format,v?v->format:0,int(attachment),int(storage),int(mutable_format));
@@ -1412,7 +1427,13 @@ struct Image {
         else if(mutable_test && !mutable_format && !attachment && !storage && aspects==VK_IMAGE_ASPECT_COLOR_BIT && source.serial%mutable_test==0)upgrade_mutable(*this);
         int target=v&&v->set_target?v->target:source.d.target;
         VkImageViewType type=target==2?VK_IMAGE_VIEW_TYPE_3D:target==0?VK_IMAGE_VIEW_TYPE_1D:target==3?VK_IMAGE_VIEW_TYPE_1D_ARRAY:target==4||target==6?VK_IMAGE_VIEW_TYPE_2D_ARRAY:VK_IMAGE_VIEW_TYPE_2D;
-        need(!attachment || source.d.target!=2,"Rendering directly to volume slices requires 2D compatible views");
+        // 3D 当渲染目标：图像必须带 2D_ARRAY_COMPATIBLE，下面那句 attachment 分支会把它建成 VIEW_TYPE_2D
+        // （baseArrayLayer=切片）。没有这个标志就说明设备拒了这种格式/用法组合，宁可 FATAL 报清原因，
+        // 也不要静默按 3D 视图画错。
+        // A 3D render target requires the image to carry 2D_ARRAY_COMPATIBLE; the attachment branch below then
+        // builds a VIEW_TYPE_2D with baseArrayLayer = slice. Without the flag the device refused this
+        // format/usage combination, so fail loudly rather than silently rendering through a 3D view.
+        if(attachment && volume)need(vol_compat,"3D texture was created without 2D-compatible view support");
         if(!attachment && (target==8 || target==9))type=target==8?VK_IMAGE_VIEW_TYPE_CUBE:VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
         if(attachment){need(source.d.target!=0 && source.d.target!=3,"1D render targets require 2D storage adaptation");type=VK_IMAGE_VIEW_TYPE_2D;}
         VkImageAspectFlags view_aspects=!attachment && (aspects&VK_IMAGE_ASPECT_DEPTH_BIT)?VK_IMAGE_ASPECT_DEPTH_BIT:aspects;
@@ -1754,7 +1775,22 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
         VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};ci.imageType=t->d.target==2?VK_IMAGE_TYPE_3D:t->d.target==0||t->d.target==3?VK_IMAGE_TYPE_1D:VK_IMAGE_TYPE_2D;ci.format=p->fmt;ci.extent={p->width,p->height,p->depth};ci.mipLevels=p->levels;ci.arrayLayers=p->layers;ci.samples=p->samples;ci.tiling=VK_IMAGE_TILING_OPTIMAL;ci.usage=usage;ci.sharingMode=VK_SHARING_MODE_EXCLUSIVE;
         p->usage=usage;if(p->aspects==VK_IMAGE_ASPECT_COLOR_BIT && !no_mutable_images)ci.flags|=VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;p->mutable_format=(ci.flags&VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)!=0;
         if(t->d.target==8 || t->d.target==9)ci.flags|=VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-        VkImageFormatProperties supported;VK(vkGetPhysicalDeviceImageFormatProperties(cfg.physical,ci.format,ci.imageType,ci.tiling,ci.usage,ci.flags,&supported));need(supported.sampleCounts&p->samples,"Texture sample count unsupported for actual format/usage");need(p->samples==VK_SAMPLE_COUNT_1_BIT || p->levels==1,"Multisample textures cannot have mipmaps");
+        // 3D 纹理要能“按切片”当渲染目标，图像必须带 2D_ARRAY_COMPATIBLE —— 这是 Vulkan 里渲进 volume 切片的
+        // 唯一正路（真机上由驱动保证切片与 3D 采样看到的是同一份存储）。设备可能对这种格式/用法组合不给
+        // OPTIMAL 平铺，所以先用它探一次；不支持就撤回标志，退回“3D 不能当附件”的旧行为并记一笔。
+        // A 3D texture used as a render target needs 2D_ARRAY_COMPATIBLE -- the only sanctioned way to render into a
+        // volume slice (the driver guarantees the slice and 3D sampling see the same storage). The device may refuse
+        // OPTIMAL tiling for this format/usage combination, so probe first; on refusal drop the flag and fall back to
+        // the previous "3D cannot be an attachment" behaviour, leaving a note.
+        const bool want_vol=t->d.target==2;p->vol_compat=want_vol;
+        if(want_vol)ci.flags|=VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+        VkImageFormatProperties supported;VkResult qr=vkGetPhysicalDeviceImageFormatProperties(cfg.physical,ci.format,ci.imageType,ci.tiling,ci.usage,ci.flags,&supported);
+        if(qr!=VK_SUCCESS && want_vol){
+            ci.flags&=~(VkImageCreateFlags)VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;p->vol_compat=false;
+            qr=vkGetPhysicalDeviceImageFormatProperties(cfg.physical,ci.format,ci.imageType,ci.tiling,ci.usage,ci.flags,&supported);}
+        VK(qr);need(supported.sampleCounts&p->samples,"Texture sample count unsupported for actual format/usage");need(p->samples==VK_SAMPLE_COUNT_1_BIT || p->levels==1,"Multisample textures cannot have mipmaps");
+        if(want_vol){static std::set<std::pair<uint32_t,unsigned>> seen;if(seen.insert({t->d.depth,unsigned(p->fmt)}).second)
+            xbg_logf("NVN vol compat serial=%llu depth=%u mip=%u vk=%u supported=%d",(unsigned long long)t->serial,t->d.depth,t->d.levels,unsigned(p->fmt),int(p->vol_compat));}
         VK(vkCreateImage(cfg.device,&ci,nullptr,&p->image));p->create=ci;VkMemoryRequirements r;vkGetImageMemoryRequirements(cfg.device,p->image,&r);
         p->mem_bytes=int64_t(r.size);image_bytes_live+=p->mem_bytes;if(xbg_bc_format_info(t->d.format,&info)==0){p->bc_bytes=p->mem_bytes;p->bc_data=int64_t(t->L.size);bc_image_bytes_live+=p->bc_bytes;bc_data_bytes_live+=p->bc_data;}
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ai.allocationSize=r.size;ai.memoryTypeIndex=memory_type(r.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);VK(vkAllocateMemory(cfg.device,&ai,nullptr,&p->memory));VK(vkBindImageMemory(cfg.device,p->image,p->memory,0));
@@ -3311,8 +3347,12 @@ bool create_pass(Pass &p,Commands &c,int clear_color=-1,bool clear_depth=false,b
         //   last level". Fall back to the latter and log once instead of FATALing the whole pass.
         uint32_t bl=v&&v->set_levels?uint32_t(v->base_level):0u;
         uint32_t nl=xbg_view_nlevels(v,uint32_t(t.d.levels));
-        extents[i]={1,t.d.width,t.d.height,t.d.levels,t.L.layers,bl,nl,
-            v&&v->set_layers?uint32_t(v->min_layer):0,v&&v->set_layers?uint32_t(v->nlayers):t.L.layers,uint32_t(std::max(1,t.d.samples))};
+        // 3D 附件的“层”同样是深度切片：可用槽位数 = depth（不是 L.layers 的 1），未指定视图层时默认第 0 片。
+        // A 3D attachment's "layer" is a depth slice too: the slot count is the depth (not L.layers, which is 1),
+        // and an unspecified view layer means slice 0.
+        const bool vol=t.d.target==2;const uint32_t span=vol?std::max(1u,t.d.depth):t.L.layers;
+        extents[i]={1,t.d.width,t.d.height,t.d.levels,span,bl,nl,
+            v&&v->set_layers?uint32_t(v->min_layer):0,v&&v->set_layers?uint32_t(v->nlayers):(vol?1u:t.L.layers),uint32_t(std::max(1,t.d.samples))};
         trace=(trace^t.serial^uint64_t(i)) * 1099511628211ull;trace^=hash_memory(&extents[i],sizeof(extents[i]));
         trace^=uint64_t(v&&v->set_format?v->format:t.d.format)<<32;
     }
