@@ -838,7 +838,18 @@ void retire_slot(Slot &s){
     if(!s.pending)return;
     poolreset::finish(s);
     {CPU_SCOPE(Fence);bool busy=vkGetFenceStatus(cfg.device,s.fence)==VK_NOT_READY;uint64_t b0=busy?timing_clock():0;
-     VK(vkWaitForFences(cfg.device,1,&s.fence,VK_TRUE,std::max<uint64_t>(cfg.fence_timeout_ns,10000000000ull)));
+     VkResult wr=vkWaitForFences(cfg.device,1,&s.fence,VK_TRUE,std::max<uint64_t>(cfg.fence_timeout_ns,10000000000ull));
+     // np633：**fence 死等兜底**。真 device lost 时提交被驱动"成功接收"但实际丢弃 ⇒ fence 永不 signal
+     // ⇒ 10 秒超时返回 -4，原 VK() 直接 FATAL（np630run2 看门狗现场就是它）。改成：不 FATAL，
+     // vkResetFences 后当完成处理（丢一帧画面，进程活着）；每 3 次报一行。DM_FENCE_SKIP=0 恢复严格。
+     // np633: fence-wait fallback. On a real device-lost the submission is "accepted" but dropped, so the
+     // fence never signals and the 10 s wait returns -4 (the np630run2 watchdog scene). Skip instead of
+     // FATAL: reset the fence and treat as done (one dropped frame, process alive).
+     if(wr!=VK_SUCCESS){static int fn=0;
+        if(retry_submit_enabled()){if(fn++<3||fn%20==0)xbg_logf("【宽限】fence 等待超时（%d）——重置后跳过本帧等待（第 %d 次）",int(wr),fn);
+            vkResetFences(cfg.device,1,&s.fence);}
+        else VK(wr);
+     }
      if(busy){block_ns[sync_site]+=timing_clock()-b0;++block_calls[sync_site];}}
     ++perf.waits;
     if(s.prof){
@@ -964,6 +975,12 @@ void submit_split_segment(){
       xbg_logf("【二分】段 %u 提交（draws=%u passes=%u）",split_seg,cur_digest.draws,cur_digest.passes);
       digest_ring[digest_at++&15u]=cur_digest;
       VkResult sr=vkQueueSubmit(cfg.queue,1,&si,fence);
+      // np632b：切段路径同款重试（np632 实测主路径三次穿透全兜住，切段路径也要兜）。
+      if(sr!=VK_SUCCESS && retry_submit_enabled()){
+         for(int attempt=0;attempt<6 && sr!=VK_SUCCESS;++attempt){usleep(3000u<<attempt);sr=vkQueueSubmit(cfg.queue,1,&si,fence);}
+         for(int attempt=0;attempt<50 && sr!=VK_SUCCESS;++attempt){usleep(100000u);sr=vkQueueSubmit(cfg.queue,1,&si,fence);}
+         static int ok3=0;if(sr==VK_SUCCESS && ok3++<3)xbg_logf("【宽限】切段重试成功（段 %u）",split_seg);
+      }
       if(sr!=VK_SUCCESS){xbg_logf("【红】二分段 %u 提交失败 %d —— 驱动在本段翻脸",split_seg,int(sr));
           xbg_fatalf("split segment %u submit failed: %d",split_seg,int(sr));}}
     }
@@ -1043,6 +1060,15 @@ void submit_slots(bool wait){
                 usleep(3000u<<attempt);   // 3ms,6ms,12ms,24ms,48ms,96ms —— 指数退避，6 次累计约 189ms
                 sr=vkQueueSubmit(cfg.queue,1,&si,s.fence);
                 static int ok=0;if(sr==VK_SUCCESS && ok++<6)xbg_logf("【重试】第 %d 次尝试成功（%ums）",attempt+1,3u<<attempt);
+            }
+            // np632：**长宽限**——6 次快退避全败（np631b 实测：驱动打 "Recover error end and return
+            // device lost" 后仍可能需要更长时间恢复），不再 FATAL，改 100ms × 50 次（累计 5 秒）继续试。
+            // 每 10 次报一行进度；全败才 FATAL（保持可观测）。这兜住的是"驱动 reset 流程超过 189ms"的场景。
+            for(int attempt=0;attempt<50 && sr!=VK_SUCCESS;++attempt){
+                usleep(100000u);
+                sr=vkQueueSubmit(cfg.queue,1,&si,s.fence);
+                static int ok2=0;if(sr==VK_SUCCESS && ok2++<3)xbg_logf("【宽限】长宽限第 %d 次尝试成功",ok2);
+                else if(attempt%10==9)xbg_logf("【宽限】已等待 %d 次（%ums）仍 -4",attempt+1,(attempt+1)*100);
             }
          }
          if(sr!=VK_SUCCESS){
