@@ -62,7 +62,7 @@ dm_dir, out = sys.argv[1:3]; want = set(sys.argv[3:])
 sys.path.insert(0, HERE); import dmsh_facts, pack_game_shaders
 XLATE = os.environ.get('XLATE', f'{DM_ROOT}/build/gfx/dmsh_xlate/dmsh_xlate')
 MAIN = os.environ.get('MAIN', f'{DM_ROOT}/data/switch/3.3.94012/Update/ExeFS/main')
-MAP = os.path.join(HERE, '../nvn/shader_map.tsv')
+MAP = os.environ.get('DMSH_MAP') or os.path.join(HERE, '../nvn/shader_map.tsv')   # np616：合成包（make_synthetic_pkg 产出的 map）用 DMSH_MAP 指过去；缺省仍是仓库的答案表
 FACTS = dmsh_facts.load()
 if not FACTS: sys.exit('【红】没有作答表 nvn/shader_facts.tsv')
 
