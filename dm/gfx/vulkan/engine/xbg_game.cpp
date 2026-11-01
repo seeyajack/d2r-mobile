@@ -173,6 +173,16 @@ VkBool32 custom_border_color_enabled=VK_FALSE, custom_border_without_format=VK_F
 // volume-attachment pass counts, draws and dispatches per submit turns "is it the np599 path?" into a reading.
 struct SubDigest{uint64_t serial=0;uint32_t passes=0,volpasses=0,draws=0,dispatches=0,volatt=0;};
 SubDigest digest_ring[16];unsigned digest_at=0;SubDigest cur_digest;
+// np627：**跨槽引用登记**。retire_slot 等栅栏后销毁本槽登记的资源，但若同一 VkBuffer 还被
+// "更晚提交、仍在飞"的槽引用着，销毁就是 GPU 侧用已释放内存 = 页错 = device lost。
+// device lost 是间歇性的（110/310/114 s），与负载无关 —— 这类竞态最像。断言只在证据出现时报，
+// 不改行为；两个槽的架构下最坏情况就是"另一个槽还在飞"。
+// np627: cross-slot reference registry. retire_slot destroys resources registered by the finished slot after
+// waiting its fence, but if the same VkBuffer is still referenced by a *later, in-flight* slot the destroy
+// hands freed memory to the GPU = page fault = device lost. The loss is intermittent (110/310/114 s) and
+// load-independent -- exactly this kind of race. Assertion only logs when the evidence appears; behavior unchanged.
+struct BufRef{std::vector<const void*> slots;};   // const Slot* 以 void* 存，避免 Slot 定义在前置位置
+std::map<VkBuffer,BufRef> buf_slot_refs;
 // np603：每个 (阶段,槽) 的绑定次数（见 OP_BIND_UBO 处理处）。只用于"空槽"这条 FATAL 的定性。
 // np603: bind counters per (stage, slot); only used to classify the "empty slot" fatal.
 uint64_t bind_hits[6][16];
@@ -850,7 +860,9 @@ void retire_slot(Slot &s){
     uint64_t c2=timing_clock();while(s.waiters.n.load())std::this_thread::yield();VK(vkResetFences(cfg.device,1,&s.fence));   // 栅栏已发信号，等待者马上返回 | the fence has signalled, so waiters return at once
     for(auto &f:s.framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);s.framebuffers.clear();
     for(auto &v:s.texel_views)vkDestroyBufferView(cfg.device,v.second,nullptr);s.texel_views.clear();
-    uint64_t c3=timing_clock();s.retire.run();release_descriptors(s);uint64_t c4=timing_clock();
+    uint64_t c3=timing_clock();s.retire.run();
+    {const void *me=&s;for(auto it=buf_slot_refs.begin();it!=buf_slot_refs.end();){auto &v=it->second.slots;v.erase(std::remove(v.begin(),v.end(),me),v.end());if(v.empty())it=buf_slot_refs.erase(it);else ++it;}}   // np627
+    release_descriptors(s);uint64_t c4=timing_clock();
     perf.arena_peak=std::max<uint64_t>(perf.arena_peak,s.stream.peak+s.readback.peak);s.stream.peak=s.readback.peak=0;
     s.stream.reset();s.readback.reset();
     // Every set is fully rewritten before use, so sets are recycled instead of resetting pools (vkAllocateDescriptorSets cost ~15 us/set on Maleoon).
@@ -3404,6 +3416,12 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                     data=dc.buffer.mapped;copy=n;buffer=out.keep(dc.buffer);}
                 else xbg_fatalf("Unsupported shader buffer source %u",b.source);
                 need(n && n<=size_t(is_storage?properties.limits.maxStorageBufferRange:properties.limits.maxUniformBufferRange),"Descriptor range exceeds device limit");
+                {BufRef &r=buf_slot_refs[buffer->buffer];const void *cur=&recording_slot();
+                 for(const void *old_slot:r.slots)if(old_slot!=cur){
+                     bool alive=false;for(const Slot &sl:slots)if(&sl==old_slot){alive=sl.pending||sl.recording;break;}
+                     if(!alive){static int n;if(n++<8)xbg_logf("【红】跨槽引用悬空 VkBuffer=%p 登记槽=%p 当前槽=%p serial=%llu（提前释放的形态）",(void*)buffer->buffer,old_slot,cur,(unsigned long long)slot_serial);}
+                 }
+                 if(r.slots.empty()||r.slots.back()!=cur){r.slots.push_back(cur);if(r.slots.size()>4)r.slots.erase(r.slots.begin());}}
                 if(write.descriptorType==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC){buffer_infos.push_back({buffer->buffer,0,n});if(desc_memo_recording)desc_memo_dyn.push_back({(uint64_t(b.binding)<<32)|element,buffer->buffer,uint32_t(buffer->offset+buffer_offset),b.source==XBG_SOURCE_UNIFORM,uint8_t(b.source),uint8_t(ns),uint8_t(b.source==XBG_SOURCE_DRIVER0?0:1)});dynamic_list.push_back({(uint64_t(b.binding)<<32)|element,uint32_t(buffer->offset+buffer_offset)});}
                 else buffer_infos.push_back({buffer->buffer,buffer->offset+buffer_offset,n});write.pBufferInfo=&buffer_infos.back();
                 if(capture.active){char label[100];snprintf(label,sizeof(label),"st%u-bind%u-el%u-buffer",st,b.binding,element);capture_log("BUFFER label=%s shader=%s nvnStage=%u sourceKind=%u slot=%u guest=%p copied=%zu descriptorBytes=%zu bufferOffset=%zu",label,shader.key.c_str(),ns,b.source,slot,data,copy,n,buffer_offset);capture_data(label,static_cast<const uint8_t*>(buffer->mapped)+buffer_offset,n);}
