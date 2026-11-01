@@ -1505,7 +1505,17 @@ struct Image {
         // slice), so keep the pre-change rule for non-attachment views: slice 0, one layer. The relaxation above
         // is meant for attachments only.
         if(volume && !attachment)need(layer==0 && ls<=1,"3D texture view must start at slice 0");
-        if(attachment){need(ls==1,"Layered rendering not implemented");n=1;}
+        if(attachment){
+            // np626：**放行层叠渲染**（真机读数：2D_ARRAY 深度图 896×896、layerCount=3 一次渲三层，
+            // 是阴影级联/环境贴图一类的用法；Vulkan 原生支持）。附件视图保留完整层区间（不再强制 1 层），
+            // framebuffer 的 layers 由 create_pass 末尾按附件的层区间取（见 np626 的 fb.layers）。
+            // 3D 体纹理的切片渲染走既有分支（volume 的 ls 恒 1）。
+            // np626: allow layered rendering. On-device read: a 2D_ARRAY depth texture 896x896 with layerCount=3
+            // rendered in one pass (shadow-cascade / env-map style); Vulkan supports this natively. Attachment
+            // views keep their full layer range (no longer forced to 1); the framebuffer's `layers` is taken from
+            // the attachments at the end of create_pass. Volume slice rendering keeps its existing branch.
+            n=ls;
+        }
         VkFormat vf=view_format(v);
         if(vf!=fmt){static std::set<std::pair<int,int>> seen;if(seen.insert({int(fmt),int(vf)}).second)xbg_logf("NVN viewfmt image=%d view=%d nvn=%#x->%#x attachment=%d storage=%d mutable=%d",int(fmt),int(vf),source.d.format,v?v->format:0,int(attachment),int(storage),int(mutable_format));
             if(!mutable_format)upgrade_mutable(*this);}
@@ -3584,7 +3594,12 @@ bool create_pass(Pass &p,Commands &c,int clear_color=-1,bool clear_depth=false,b
     auto &cache=persistent?persistent_framebuffers:slot.framebuffers;
     auto cached=cache.find(fb_key);
     if(cached!=cache.end()){p.framebuffer=cached->second;++fb_hits;}
-    else{VkFramebufferCreateInfo fb{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};fb.renderPass=p.pass;fb.attachmentCount=views.size();fb.pAttachments=views.data();fb.width=p.width;fb.height=p.height;fb.layers=1;VK(vkCreateFramebuffer(cfg.device,&fb,nullptr,&p.framebuffer));cache.emplace(fb_key,p.framebuffer);++fb_creates;
+    else{VkFramebufferCreateInfo fb{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};fb.renderPass=p.pass;fb.attachmentCount=views.size();fb.pAttachments=views.data();fb.width=p.width;fb.height=p.height;
+        // np626：层叠渲染时 framebuffer 的 layers 取所有附件层区间的最大值（单层附件=1，整条数组=层数）。
+        // np626: for layered rendering the framebuffer's layers is the max of the attachments' layer ranges
+        // (a single-layer attachment is 1, a whole-array attachment is its layer count).
+        {uint32_t layers=1;for(unsigned i=0;i<9;i++)if(targets[i]){const auto &e=extents[i];layers=std::max(layers,e.layer_count);}fb.layers=layers;}
+        VK(vkCreateFramebuffer(cfg.device,&fb,nullptr,&p.framebuffer));cache.emplace(fb_key,p.framebuffer);++fb_creates;
         if(persistent)for(auto *im:p.images)im->fb_keys.push_back(fb_key);}
     if(plain_draw && persistent){last_pass.rt=state.rt;last_pass.pass=p;last_pass.valid=true;}else last_pass.valid=false;
     return true;
