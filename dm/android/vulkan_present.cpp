@@ -328,6 +328,19 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
      VkPhysicalDeviceExternalMemoryHostPropertiesEXT host{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};VkPhysicalDeviceProperties2 pr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};pr.pNext=&host;vkGetPhysicalDeviceProperties2(physical,&pr);
      vlog("Device %s api=%u.%u.%u driver=%#x minImportedHostPointerAlignment=%llu",pr.properties.deviceName,VK_VERSION_MAJOR(pr.properties.apiVersion),VK_VERSION_MINOR(pr.properties.apiVersion),VK_VERSION_PATCH(pr.properties.apiVersion),pr.properties.driverVersion,(unsigned long long)host.minImportedHostPointerAlignment);}
     std::vector<const char*> dext={VK_KHR_SWAPCHAIN_EXTENSION_NAME};if(mirror)dext.push_back(VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME);
+    // np602：**自定义边框色**。NVN 的采样器边框色可以是任意 RGBA（1.6.0 真机用的是 0.5,0.5,0.5 灰），
+    // 而 Vulkan 的内建定点色只有透明黑/不透明黑/不透明白三种 ⇒ 其余颜色只能靠 VK_EXT_custom_border_color。
+    // 扩展必须在**设备创建时**启用，所以在这里判断并挂到 pNext 上；引擎侧只负责用它（xbg_game.cpp 探一次特性）。
+    // np602: custom border colour. NVN allows any RGBA border (the 1.6.0 payload uses mid grey 0.5,0.5,0.5) while
+    // Vulkan's built-in fixed colours are only transparent black / opaque black / opaque white, so anything else
+    // needs VK_EXT_custom_border_color. The extension has to be enabled **at device creation**, so it is decided
+    // and chained here; the engine side only consumes it (xbg_game.cpp probes the feature once).
+    VkPhysicalDeviceCustomBorderColorFeaturesEXT cbf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
+    bool custom_border=false;
+    for(auto &e:available)if(std::string(e.extensionName)==VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME)custom_border=true;
+    if(custom_border){VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};f2.pNext=&cbf;vkGetPhysicalDeviceFeatures2(physical,&f2);}
+    if(custom_border && cbf.customBorderColors){cbf.pNext=draw.pNext;draw.pNext=&cbf;dext.push_back(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);}
+    vlog("Device customBorderColor ext=%d colors=%u withoutFormat=%u",int(custom_border),unsigned(cbf.customBorderColors),unsigned(cbf.customBorderColorWithoutFormat));
     // Diagnostic (marker gfx-pipe-stats): the driver's per-pipeline statistics (VK_KHR_pipeline_executable_properties).
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pef{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
     if(FILE *ps=[&]{std::string dir=path;size_t cut=dir.find_last_of('/');return fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pipe-stats").c_str(),"rb");}()){fclose(ps);dext.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);pef.pipelineExecutableInfo=VK_TRUE;pef.pNext=draw.pNext;draw.pNext=&pef;}

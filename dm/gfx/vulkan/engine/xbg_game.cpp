@@ -159,6 +159,12 @@ void gfx_async_stop(){if(!gfx_worker.joinable())return;{std::lock_guard<std::mut
 char error_text[1024]{};
 bool initialized=false,failed=false;
 VkBool32 sampler_mirror_clamp_enabled=VK_FALSE;
+// np602：VK_EXT_custom_border_color 的可用性（懒探测一次）。NVN 的采样器边框色是任意 RGBA，Vulkan 的定点色
+// 只有黑/白/透明三种 ⇒ 其余颜色（1.6.0 真机撞到 0.5,0.5,0.5）必须靠这个扩展。
+// np602: availability of VK_EXT_custom_border_color (probed once, lazily). NVN border colours are arbitrary
+// RGBA while Vulkan's fixed colours are only black/white/transparent, so anything else (the 1.6.0 payload uses
+// mid grey 0.5,0.5,0.5) needs this extension.
+VkBool32 custom_border_color_enabled=VK_FALSE, custom_border_without_format=VK_FALSE;
 // Formatless storage access per format needs VK_KHR_format_feature_flags2 (core in Vulkan 1.3). Without it (Vulkan 1.1 drivers
 // such as Adreno 730 512.615) the spec's "Formats Without Shader Storage Format" rule applies: the shaderStorageImage{Read,Write}
 // WithoutFormat features cover exactly these formats, where the format also supports VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT.
@@ -1327,7 +1333,17 @@ VkFormat format(int f) {
     if(f>=0x41 && f<=0x50){static const VkFormat bc[16]={VK_FORMAT_BC1_RGB_UNORM_BLOCK,VK_FORMAT_BC1_RGBA_UNORM_BLOCK,VK_FORMAT_BC2_UNORM_BLOCK,VK_FORMAT_BC3_UNORM_BLOCK,
         VK_FORMAT_BC1_RGB_SRGB_BLOCK,VK_FORMAT_BC1_RGBA_SRGB_BLOCK,VK_FORMAT_BC2_SRGB_BLOCK,VK_FORMAT_BC3_SRGB_BLOCK,VK_FORMAT_BC4_UNORM_BLOCK,VK_FORMAT_BC4_SNORM_BLOCK,
         VK_FORMAT_BC5_UNORM_BLOCK,VK_FORMAT_BC5_SNORM_BLOCK,VK_FORMAT_BC7_UNORM_BLOCK,VK_FORMAT_BC7_SRGB_BLOCK,VK_FORMAT_BC6H_SFLOAT_BLOCK,VK_FORMAT_BC6H_UFLOAT_BLOCK};return bc[f-0x41];}
-    switch(f){case 0x37:case 0x38:return VK_FORMAT_R8G8B8A8_SRGB;case 0x3d:return VK_FORMAT_A2B10G10R10_UNORM_PACK32;case 0x3e:return VK_FORMAT_A2B10G10R10_UINT_PACK32;case 0x3f:return VK_FORMAT_B10G11R11_UFLOAT_PACK32;case 0x40:return VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;case 0x6d:return VK_FORMAT_R8G8B8A8_UNORM;case 0x9a:return VK_FORMAT_B8G8R8A8_UNORM;default:xbg_fatalf("Unsupported NVN format %#x",f);}
+    // np601：0x69 起是 RGB10A2 家族（NVN 头里 NVN_FORMAT_RGB10A2SN=0x69 / RGB10A2I=0x6A / RGB10A2_UI2F=0x6B / RGB10A2_I2F=0x6C）。
+    // 1.6.0 真机读到 TeraMeshRigidBody（物理网格）那一串文件时撞的就是 0x69。0x69/0x6A 的**存储**与 Vulkan 的
+    // SNORM/UINT PACK32 一一对应，直接映射；0x6B/0x6C 是"整数存储 + 着色器里当浮点用"，需要着色器侧转换语义，
+    // 不在这里糊弄（真撞上了再按需处理，宁可报清楚也不要静默画错）。
+    // np601: the RGB10A2 family (NVN_FORMAT_RGB10A2SN=0x69, RGB10A2I=0x6A, RGB10A2_UI2F=0x6B, RGB10A2_I2F=0x6C).
+    // On the 1.6.0 payload this is what the TeraMeshRigidBody (physics mesh) stream hit. 0x69/0x6A map 1:1 onto
+    // Vulkan's SNORM/UINT PACK32 storage; 0x6B/0x6C need shader-side conversion, so they are left to fail loudly
+    // instead of being approximated silently.
+    switch(f){case 0x37:case 0x38:return VK_FORMAT_R8G8B8A8_SRGB;case 0x3d:return VK_FORMAT_A2B10G10R10_UNORM_PACK32;case 0x3e:return VK_FORMAT_A2B10G10R10_UINT_PACK32;case 0x3f:return VK_FORMAT_B10G11R11_UFLOAT_PACK32;case 0x40:return VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+    case 0x69:return VK_FORMAT_A2B10G10R10_SNORM_PACK32;case 0x6a:return VK_FORMAT_A2B10G10R10_UINT_PACK32;
+    case 0x6d:return VK_FORMAT_R8G8B8A8_UNORM;case 0x9a:return VK_FORMAT_B8G8R8A8_UNORM;default:xbg_fatalf("Unsupported NVN format %#x",f);}
 }
 VkImageAspectFlags aspect(int f){if(f==0x31)return VK_IMAGE_ASPECT_STENCIL_BIT;if(f>=0x32 && f<=0x34)return VK_IMAGE_ASPECT_DEPTH_BIT;if(f==0x35 || f==0x36)return VK_IMAGE_ASPECT_DEPTH_BIT|VK_IMAGE_ASPECT_STENCIL_BIT;return VK_IMAGE_ASPECT_COLOR_BIT;}
 VkFormat decoded_format(uint32_t pixels) {
@@ -2688,7 +2704,7 @@ union DescEntry{VkDescriptorImageInfo image;VkDescriptorBufferInfo buffer;VkBuff
 
 std::map<std::vector<uint32_t>,LayoutEntry> layout_cache;
 std::map<std::array<const void*,7>,LayoutEntry*> shader_layouts; // shader set -> layout (bindings are immutable per shader)
-std::map<std::array<uint32_t,16>,VkSampler> sampler_cache;
+std::map<std::array<uint32_t,20>,VkSampler> sampler_cache;
 Arena static_arena; // never reset: immutable per-shader c1 constants
 std::map<std::pair<float,float>,Buffer> support_static; // support block per viewport size (contents depend on it only)
 struct SamplerFastKey{std::array<uint32_t,11> w;bool operator==(const SamplerFastKey &o)const{return w==o.w;}};
@@ -2756,15 +2772,48 @@ VkSampler sampler(const samp_par &p,Image &im,VkFormat viewed,bool integer_borde
     VkSampler out=sampler_slow(p,im,viewed,integer_border);sampler_fast.emplace(k,out);return out;
 }
 VkSampler sampler_slow(const samp_par &p,Image &im,VkFormat viewed,bool integer_border){
+    // np602：惰性探测一次 VK_EXT_custom_border_color。扩展必须**在设备创建时**就启用（dm/android/
+    // vulkan_present.cpp 只要设备报告该扩展就会启用），这里只确认"扩展在 + 特性支持"，并打一行读数。
+    // np602: probe VK_EXT_custom_border_color once. The extension has to be enabled at device creation
+    // (dm/android/vulkan_present.cpp enables it whenever the device reports it); this only confirms
+    // "extension present + feature supported" and logs one line.
+    {static int probed=0;if(!probed){probed=1;
+        uint32_t n=0;if(vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,nullptr)==VK_SUCCESS && n){
+            std::vector<VkExtensionProperties> ext(n);
+            if(vkEnumerateDeviceExtensionProperties(cfg.physical,nullptr,&n,ext.data())==VK_SUCCESS){
+                bool present=false;for(auto &e:ext)if(!strcmp(e.extensionName,VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME))present=true;
+                if(present){
+                    VkPhysicalDeviceCustomBorderColorFeaturesEXT f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
+                    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};f2.pNext=&f;
+                    vkGetPhysicalDeviceFeatures2(cfg.physical,&f2);
+                    custom_border_color_enabled=f.customBorderColors;custom_border_without_format=f.customBorderColorWithoutFormat;
+                }
+                xbg_logf("NVN caps customBorderColor ext=%d colors=%u withoutFormat=%u",int(present),unsigned(custom_border_color_enabled),unsigned(custom_border_without_format));
+            }}}}
     xbg_nvn_sampler_desc input{p.minf,p.magf,p.ws,p.wt,p.wr,p.cmp_mode,p.cmp_func,p.lod_min,p.lod_max,p.lod_bias,p.aniso,{p.border[0],p.border[1],p.border[2],p.border[3]}};
-    xbg_sampler_limits limits{cfg.enabled_core.samplerAnisotropy,sampler_mirror_clamp_enabled,VkBool32(integer_border),properties.limits.maxSamplerAnisotropy,properties.limits.maxSamplerLodBias};
-    VkSamplerCreateInfo s{};int result=xbg_sampler_from_nvn(&input,&limits,&s);
+    xbg_sampler_limits limits{cfg.enabled_core.samplerAnisotropy,sampler_mirror_clamp_enabled,VkBool32(integer_border),properties.limits.maxSamplerAnisotropy,properties.limits.maxSamplerLodBias,custom_border_color_enabled};
+    float border_rgba[4]={0,0,0,0};
+    VkSamplerCreateInfo s{};int result=xbg_sampler_from_nvn(&input,&limits,&s,border_rgba);
     if(result)xbg_fatalf("NVN sampler %s result=%d min=%u mag=%u wrap=%u/%u/%u lod=%g/%g bias=%g aniso=%g compare=%u/%u border=%g,%g,%g,%g texture=%llu format=%#x vk=%u mirrorEnabled=%u",xbg_sampler_error(result),result,p.minf,p.magf,p.ws,p.wt,p.wr,p.lod_min,p.lod_max,p.lod_bias,p.aniso,p.cmp_mode,p.cmp_func,p.border[0],p.border[1],p.border[2],p.border[3],(unsigned long long)im.source.serial,im.source.d.format,unsigned(viewed),sampler_mirror_clamp_enabled);
     const VkFormatProperties &fp=format_properties(viewed);
     if((s.minFilter==VK_FILTER_LINEAR || s.magFilter==VK_FILTER_LINEAR) && !(fp.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))xbg_fatalf("NVN sampler linear filtering unsupported min=%u mag=%u compare=%u/%u format=%#x vk=%u optimalFeatures=%#x texture=%llu decoded=%d imfmt=%u",p.minf,p.magf,p.cmp_mode,p.cmp_func,im.source.d.format,unsigned(viewed),fp.optimalTilingFeatures,(unsigned long long)im.source.serial,int(im.decoded),unsigned(im.fmt));
-    need(s.pNext==nullptr,"Unexpected sampler extension chain");
+    // np602：自定义边框色要在 pNext 上挂 VkSamplerCustomBorderColorCreateInfoEXT。format 只在
+    // customBorderColorWithoutFormat 可用时才能写 UNDEFINED，否则必须给**实际采样格式**（viewed）。
+    // np602: a custom border colour needs VkSamplerCustomBorderColorCreateInfoEXT on pNext. `format` may be
+    // UNDEFINED only with customBorderColorWithoutFormat; otherwise it must be the real sampled format (viewed).
+    VkSamplerCustomBorderColorCreateInfoEXT cbc{VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT};
+    if(s.borderColor==VK_BORDER_COLOR_FLOAT_CUSTOM_EXT || s.borderColor==VK_BORDER_COLOR_INT_CUSTOM_EXT){
+        for(int k=0;k<4;k++)cbc.customBorderColor.float32[k]=border_rgba[k];
+        cbc.format=custom_border_without_format?VK_FORMAT_UNDEFINED:viewed;
+        s.pNext=&cbc;
+    }
+    need(s.pNext==nullptr || s.pNext==&cbc,"Unexpected sampler extension chain");
     auto bits=[](float f){uint32_t u;memcpy(&u,&f,4);return u;};
-    std::array<uint32_t,16> key{s.flags,uint32_t(s.magFilter),uint32_t(s.minFilter),uint32_t(s.mipmapMode),uint32_t(s.addressModeU),uint32_t(s.addressModeV),uint32_t(s.addressModeW),bits(s.mipLodBias),s.anisotropyEnable,bits(s.maxAnisotropy),s.compareEnable,uint32_t(s.compareOp),bits(s.minLod),bits(s.maxLod),uint32_t(s.borderColor),s.unnormalizedCoordinates};
+    // np602：缓存键补上自定义边框色的四个分量——否则 borderColor 都是 *_CUSTOM_EXT 的两个不同颜色会撞同一个键。
+    // np602: the cache key also carries the four custom border components; otherwise two different custom colours
+    // share borderColor = *_CUSTOM_EXT and collide on one key.
+    std::array<uint32_t,20> key{s.flags,uint32_t(s.magFilter),uint32_t(s.minFilter),uint32_t(s.mipmapMode),uint32_t(s.addressModeU),uint32_t(s.addressModeV),uint32_t(s.addressModeW),bits(s.mipLodBias),s.anisotropyEnable,bits(s.maxAnisotropy),s.compareEnable,uint32_t(s.compareOp),bits(s.minLod),bits(s.maxLod),uint32_t(s.borderColor),s.unnormalizedCoordinates,
+        bits(border_rgba[0]),bits(border_rgba[1]),bits(border_rgba[2]),bits(border_rgba[3])};
     auto it=sampler_cache.find(key);if(it!=sampler_cache.end())return it->second;
     VkSampler out;VK(vkCreateSampler(cfg.device,&s,nullptr,&out));sampler_cache.emplace(key,out);return out;
 }

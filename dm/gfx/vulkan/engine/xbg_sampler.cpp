@@ -12,7 +12,7 @@ static int wrap(uint32_t n,VkBool32 mirror,VkSamplerAddressMode &out){
     default:return -2; // GL_CLAMP and MIRROR_CLAMP[_TO_BORDER] need shader support.
     }
 }
-extern "C" int xbg_sampler_from_nvn(const xbg_nvn_sampler_desc *p,const xbg_sampler_limits *limits,VkSamplerCreateInfo *out){
+extern "C" int xbg_sampler_from_nvn(const xbg_nvn_sampler_desc *p,const xbg_sampler_limits *limits,VkSamplerCreateInfo *out,float custom_rgba[4]){
     if(!p || !limits || !out)return -1;
     if(p->min_filter>5 || p->mag_filter>1)return -1;
     VkSamplerCreateInfo s{};s.sType=VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -38,7 +38,20 @@ extern "C" int xbg_sampler_from_nvn(const xbg_nvn_sampler_desc *p,const xbg_samp
         if(b[0]==0 && b[1]==0 && b[2]==0 && b[3]==0){}
         else if(b[0]==0 && b[1]==0 && b[2]==0 && b[3]==1)s.borderColor=limits->integer_border?VK_BORDER_COLOR_INT_OPAQUE_BLACK:VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
         else if(b[0]==1 && b[1]==1 && b[2]==1 && b[3]==1)s.borderColor=limits->integer_border?VK_BORDER_COLOR_INT_OPAQUE_WHITE:VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
-        else return -7; // VK_EXT_custom_border_color requires separate enabled contract.
+        // np602：非定点边框色（NVN 允许任意 RGBA，如 0.5 灰）。Vulkan 的定点色只有黑/白/透明三种，
+        // 其余只能走 VK_EXT_custom_border_color：这里只**判定**并交回四个分量，链结构由调用方按它
+        // 实际知道的格式拼（没有 customBorderColorWithoutFormat 时 format 不能写 UNDEFINED）。
+        // 设备没这个能力就照旧报 -7 —— 宁可停下并说清原因，也不要悄悄换成黑/白。
+        // np602: a noncanonical border colour (NVN allows any RGBA, e.g. mid grey). Vulkan's fixed colours are
+        // only black/white/transparent, so anything else needs VK_EXT_custom_border_color: decide here and hand
+        // the four components back; the caller builds the struct with the format it actually knows (UNDEFINED
+        // is only legal with customBorderColorWithoutFormat). Without the capability this still returns -7 --
+        // stop and say why instead of silently swapping in black or white.
+        else if(limits->custom_border_color){
+            s.borderColor=limits->integer_border?VK_BORDER_COLOR_INT_CUSTOM_EXT:VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
+            if(custom_rgba)for(int k=0;k<4;k++)custom_rgba[k]=b[k];
+        }
+        else return -7;
     }
     *out=s;return 0;
 }
