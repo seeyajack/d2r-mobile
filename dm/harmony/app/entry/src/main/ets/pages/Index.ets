@@ -554,6 +554,12 @@ struct Index {
             // thread was "running, not waiting" and its CPU grew 1.32 s per 5 s (~26%) -- that looks like a slow
             // NavMesh/physics load, not a deadlock. 30 s keeps "a real hang is still caught" without executing a
             // long load on the spot.
+            // np618/np620：这一轮只为**拿 dump**，所以把噪声源全关（DM_NVN_LOG 的"未实现被调用"、
+            // DM_DRAW_TRACE 的逐 draw 行）——日志预算就那么多，省下来给 ctlhex/datahex。
+            // 代码段长度也已按 ncode 真实长度打（np619，上限 32 KB），不再被 0x2000 截断。
+            // np618/np620: this round only exists to capture dumps, so the noise sources are off (DM_NVN_LOG's
+            // "unimplemented call" spam, DM_DRAW_TRACE's per-draw lines) -- the log budget is fixed, spend it on
+            // ctlhex/datahex. The code dump now uses the real ncode (np619, capped at 32 KB).
             let envs = 'DM_NVN_LOG=1 DM_FS=1 DM_WATCH_STALL=30 DM_NVN_API_MAJOR=53 DM_DIAG_TICK=1 DM_SHADER_SKIP=1 DM_DRAW_TRACE=8 DM_CV_PROBE=1 DM_SAMPLER_BORDER=transparent';
             // romfs 双路（d1 瘦包）：
             //   A. HAP 里带 romfs/（fat 包，首次装机用）→ 照旧**每次点都重新解出**。
