@@ -945,6 +945,21 @@ void submit_slots(bool wait){
             VK(vkEndCommandBuffer(s.pro));cbs[0]=s.pro;cbs[1]=s.cmd;ncb=2;s.pro_ops.clear();}
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};si.commandBufferCount=ncb;si.pCommandBuffers=cbs;
         {CPU_SCOPE(Submit);
+         // np611：**大提交的节奏**。要回答的是"那 44k draw 是一帧、还是加载期间攒下来的十几帧"：
+         // 每次提交带上当时的 presents 计数 —— 两次大提交若 presents 相同，说明它们同属一帧（= 攒帧），
+         // 若每次大提交 presents 都 +1，说明一帧就这么多（= 单帧太重）。只打前 30 次、之后每 50 次一次，有界。
+         // np611: the cadence of big submissions. The question is whether those 44k draws are one frame or a dozen
+         // frames accumulated during loading: each line carries the present counter at submit time -- two big
+         // submissions with the same presents belong to one frame (accumulated), +1 each time means one frame is
+         // genuinely that heavy. Bounded output: the first 30, then every 50th.
+         if(cur_digest.draws>=3000){
+            static uint64_t t0;static unsigned big_n;if(!t0)t0=timing_clock();
+            if(big_n<30 || big_n%50==0)
+                xbg_logf("[大提交] #%u serial=%llu t=%.2fs presents=%llu passes=%u draws=%u disp=%u",
+                    big_n,(unsigned long long)cur_digest.serial,(timing_clock()-t0)/1e9,
+                    (unsigned long long)stats.presents.load(),cur_digest.passes,cur_digest.draws,cur_digest.dispatches);
+            ++big_n;
+         }
          cur_digest.serial=slot_serial;digest_ring[digest_at++&15u]=cur_digest;cur_digest=SubDigest{};
          VkResult sr=vkQueueSubmit(cfg.queue,1,&si,s.fence);
          if(sr!=VK_SUCCESS){
