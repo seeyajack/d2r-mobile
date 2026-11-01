@@ -183,6 +183,21 @@ SubDigest digest_ring[16];unsigned digest_at=0;SubDigest cur_digest;
 // load-independent -- exactly this kind of race. Assertion only logs when the evidence appears; behavior unchanged.
 struct BufRef{std::vector<const void*> slots;};   // const Slot* 以 void* 存，避免 Slot 定义在前置位置
 std::map<VkBuffer,BufRef> buf_slot_refs;
+// np629：**提交二分**（DM_SPLIT_DRAWS=N，0=关）。大提交按"每 N 个 draw 切一段"提交：
+// 中间段用独立 fence 立即提交（不等待），最后一段挂槽 fence —— GPU 侧看到多个小提交，
+// CPU 端语义不变。切段点 = render pass 边界（draw() 的 draw 计数达到 N 且无 open pass）。
+// 判定"驱动在第几段翻脸"：每段提交带段号，device lost 时提交摘要 ring 里最后成功的段号就是答案。
+// np629: submission bisection (DM_SPLIT_DRAWS=N, 0=off). Big submissions are split every N draws:
+// intermediate segments are submitted immediately with their own fences (no waiting), the last segment
+// carries the slot's fence -- GPU sees many small submissions, CPU semantics unchanged. Cut points are
+// render-pass boundaries. Which segment the driver rejects: the digest ring's last successful segment.
+static int split_draws_env(){static int v=-1;if(v<0){const char *e=getenv("DM_SPLIT_DRAWS");v=e?atoi(e):0;if(v<0)v=0;
+    xbg_logf("二分 DM_SPLIT_DRAWS=%d（0=off）",v);}   // np629: log once -- verifies the env chain end to end
+  return v;}
+static unsigned split_draw_count=0;   // 本槽本段已录 draw 数
+static unsigned split_seg=0;          // 本槽已切出的段号（0 = 第一段）
+static VkFence split_fences[64]={};   // 中间段的 fence（环形复用）
+static unsigned split_fence_at=0;
 std::map<VkImageView,BufRef> img_slot_refs;   // np628：图像描述符同款登记（键 = VkImageView，一个图像可有多个视图）
 // np603：每个 (阶段,槽) 的绑定次数（见 OP_BIND_UBO 处理处）。只用于"空槽"这条 FATAL 的定性。
 // np603: bind counters per (stage, slot); only used to classify the "empty slot" fatal.
@@ -925,6 +940,43 @@ Slot &recording_slot(){
     }
     return s;
 }
+// np629：把"当前槽已录的命令"作为一段立即提交（独立 fence），然后重开命令缓冲继续录。
+// 关键语义：段之间 GPU 顺序执行（同一队列），CPU 不等中间段 —— 最终状态与单次提交等价；
+// 差别只在"驱动看到多个小提交"。这就是二分的测法。
+// np629: submit what the slot has recorded so far as one segment (own fence), then reopen the command
+// buffer and keep recording. Segments execute in queue order, the CPU never waits on intermediate ones --
+// the final state equals a single submission; only what the *driver* sees changes. That is the bisection.
+void submit_split_segment(){
+    Slot &s=slots[slot_index];
+    if(!s.recording || !s.cmd)return;
+    unsigned saved=cur_op;cur_op=60;
+    if(open_pass.cmd==s.cmd)end_open_pass();   // np629c：大 pass 内部也切（见切点注释）
+    // 段尾：栅栏 + 时间戳（与 submit_slots 同款收尾，但不做 query 拷贝——那要等最后一发）
+    full_barrier(s.cmd);
+    VK(vkEndCommandBuffer(s.cmd));
+    VkFence fence=VK_NULL_HANDLE;
+    {VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};VK(vkCreateFence(cfg.device,&fi,nullptr,&fence));
+     split_fences[split_fence_at++%64]=fence;}
+    {VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};si.commandBufferCount=1;si.pCommandBuffers=&s.cmd;
+     {CPU_SCOPE(Submit);
+      cur_digest.serial=slot_serial;
+      xbg_logf("【二分】段 %u 提交（draws=%u passes=%u）",split_seg,cur_digest.draws,cur_digest.passes);
+      digest_ring[digest_at++&15u]=cur_digest;
+      VkResult sr=vkQueueSubmit(cfg.queue,1,&si,fence);
+      if(sr!=VK_SUCCESS){xbg_logf("【红】二分段 %u 提交失败 %d —— 驱动在本段翻脸",split_seg,int(sr));
+          xbg_fatalf("split segment %u submit failed: %d",split_seg,int(sr));}}
+    }
+    ++split_seg;cur_digest=SubDigest{};cur_digest.serial=slot_serial;
+    // 重开命令缓冲继续录。**必须 bind_cache_reset()**：cache 记的是"旧 cmd 已绑 pipeline/描述符/视口"，
+    // 新 cmd 里什么都不在——不清的话下一个 draw 直接拿空 pipeline 去 draw（真机读数：
+    // `[rfs]pipeline is null` → `Draw internal fail` → 驱动判死，段 1 开始即挂）。
+    // np629d: reset the bind cache after reopening -- it records "bound in the old cmd buffer"; the new one
+    // starts empty, so the next draw would submit a null pipeline (device read: `[rfs]pipeline is null`).
+    bind_cache_reset();
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK(vkBeginCommandBuffer(s.cmd,&bi));
+    cur_op=saved;
+}
 // Submit the recording slot. With wait, block until all submitted work is done.
 void submit_slots(bool wait){
     Slot &s=slots[slot_index];
@@ -988,6 +1040,7 @@ void submit_slots(bool wait){
             xbg_fatalf("vkQueueSubmit(cfg.queue,1,&si,s.fence) failed: %d",int(sr));}
         }++submit_by[sync_site];poolreset::queue(s);
         s.recording=false;s.pending=true;s.covers=submitted;s.hud_frame=hud::frame.load(std::memory_order_relaxed);slot_index^=1;++perf.submits;snapshot_reset();++slot_serial;
+        if(split_draws_env()>0){static int n;if(n++<8 && split_seg)xbg_logf("【二分】本帧共 %u 段",split_seg);split_seg=0;split_draw_count=0;}   // np629
         pending_events.insert(pending_events.end(),recording_events.begin(),recording_events.end());recording_events.clear();
     }
     if(wait){retire_slot(slots[slot_index]);retire_slot(slots[slot_index^1]);}
@@ -3921,6 +3974,21 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     pass_prof_draw(c.command);
     if(indexed){if(bc.ib!=ib->buffer || bc.ibo!=ib->offset || bc.it!=index_type){vkCmdBindIndexBuffer(c.command,ib->buffer,ib->offset,index_type);bc.ib=ib->buffer;bc.ibo=ib->offset;bc.it=index_type;}else ++binds_skipped;vkCmdDrawIndexed(c.command,count,indexed->instances,0,indexed->base_vertex,indexed->base_instance);}else vkCmdDraw(c.command,count,instances,first,first_instance);
     if(!occlusion_batch_enabled)end_occlusion_query();c.finish();++perf.draws;++pass_prof_draws;pass_prof_verts+=uint64_t(uint32_t(count))*instances;
+    // np629：提交二分的切点。只在 pass 边界切（本 draw 刚 finish、若无 open pass 就是边界）；
+    // N=0 关闭。切点动作在 submit_split_segment()（见 submit_slots 上方）。
+    // np629: the cut point. Only at pass boundaries (this draw just finished; no open pass = boundary).
+    {int N=split_draws_env();
+     if(N>0 && cur_digest.draws && cur_digest.passes>=50){   // np629b：门槛 100→50。np611 读数 43k draw≈546 pass，
+        // 到第 8000 draw 时 passes≈97——差 3 个不到 100，门槛把所有切点全挡住了（首跑 0 段的根因）。
+        ++split_draw_count;
+        // np629c：真机读数（二分 到达 8000 draw：open_pass=0x1 连续多次）——大提交里有一个**超长 render pass**，
+        // pass 边界几乎不存在，按"只在边界切"永远切不开。改为：随时可切；若 pass 开着，先 end_open_pass()
+        // （状态由引擎的 bind cache 在下一个 draw 重放，语义等价于"驱动多看到一次 pass 间隔"）。
+        // np629c: device reads show one huge render pass inside the big submission (open_pass stays set across
+        // thousands of draws), so pass-boundary-only cuts never fire. Cut anywhere: end the open pass first
+        // (the bind cache replays state on the next draw; the driver just sees one extra pass gap).
+        if(split_draw_count>=unsigned(N)){submit_split_segment();split_draw_count=0;}
+     }}
     if(d.needs_writeback() || capture.active){unsigned saved=cur_op;cur_op=62;end_open_pass();full_barrier(c.command);cur_op=saved;VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;vkCmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,nullptr,0,nullptr);}
     {DRAW_SCOPE(Writeback);if(capture.active){if(d.needs_writeback())gpu_sync(perf.sync_writeback);d.writeback();}else d.defer_writeback();}stats.draws.fetch_add(1,std::memory_order_relaxed);   // diagnostics only: a seq_cst add (LDADDAL) waits for every earlier store, ~2.7% of the render thread
     if(capture.active){capture_pass(p);d.capture_read_images();capture.active=false;}
@@ -4562,6 +4630,7 @@ void destroy_slots(){
     poolreset::drain();for(auto &s:slots)s.reset_queued=false;
     texel_evict(0,true);texel_evict(1,true);
     for(auto &s:slots){s.retire.run();release_descriptors(s);for(auto &v:s.texel_views)vkDestroyBufferView(cfg.device,v.second,nullptr);s.texel_views.clear();for(auto &f:s.framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);s.framebuffers.clear();for(auto p:s.pools)vkDestroyDescriptorPool(cfg.device,p,nullptr);s.pools.clear();s.pool_next=0;s.stream.release();s.readback.release();s.viewed.clear();s.guard.clear();s.pro_ops.clear();s.pro=VK_NULL_HANDLE;if(s.fence)vkDestroyFence(cfg.device,s.fence,nullptr);if(s.timestamps)vkDestroyQueryPool(cfg.device,s.timestamps,nullptr);if(s.prof_pool)vkDestroyQueryPool(cfg.device,s.prof_pool,nullptr);for(auto q:s.occlusion_pools)vkDestroyQueryPool(cfg.device,q,nullptr);for(auto q:s.timestamp_pools)vkDestroyQueryPool(cfg.device,q,nullptr);if(s.pool)vkDestroyCommandPool(cfg.device,s.pool,nullptr);s=Slot{};}
+    for(VkFence f:split_fences)if(f)vkDestroyFence(cfg.device,f,nullptr);   // np629
     slot_index=0;snapshot_reset();
 }
 } // namespace
