@@ -532,7 +532,20 @@ struct Index {
             //   hit -> 0x1c81068; miss -> 0x1c80fc0 (create). Then bl 0x1c7faa0 copies the source into the local
             //   struct, but +0x58 is written ONLY in layout A (0x1c7fb38); layout B (0x1c7fbb4) leaves it.
             //   Four counters answer "did the table hit / which layout".
-            let envs = 'DM_NVN_LOG=1 DM_FS=1 DM_WATCH_STALL=8 DM_NVN_API_MAJOR=53 DM_DIAG_TICK=1 DM_SHADER_DUMP=1 DM_SHADER_SKIP=1 DM_DRAW_TRACE=8 DM_CV_PROBE=1';
+            // np604：`DM_SAMPLER_BORDER=transparent` 是本机（Maleoon 920，无 custom border colour）专用的
+            // 显式近似开关：NVN 允许任意 RGBA 边框色（这里 0.5 灰），Vulkan 定点色只有黑/白/透明。
+            // 去掉这个变量就回到"严格失败"，方便随时对账它到底影响了哪些像素。
+            // np604: DM_SAMPLER_BORDER=transparent is the explicit approximation switch for this device (Maleoon
+            // 920 has no custom border colour): NVN allows any RGBA border (here mid grey), Vulkan has only fixed
+            // black/white/transparent. Removing it goes back to "fail strictly", so its pixel impact stays auditable.
+            // np605：**去掉 DM_SHADER_DUMP=1**。它会把这个缺失着色器的十几 KB 十六进制整段灌进 hilog，
+            // 客体线程被大 I/O 楔住（仪器铁律），表现为"跑到 77.7 s 突然不动 + 看门狗 dump + 进程退出"。
+            // 缺包键名已经由 DM_SHADER_SKIP 枚举出来了，dump 只在需要现场翻译某个键时临时开。
+            // np605: drop DM_SHADER_DUMP. It floods hilog with tens of KB of hex for each missing shader and wedges
+            // the guest thread (big-I/O rule) -- which looked like "frozen at 77.7 s + watchdog dump + exit".
+            // DM_SHADER_SKIP already enumerates the keys; turn the dump on only when a specific one must be
+            // translated from the live capture.
+            let envs = 'DM_NVN_LOG=1 DM_FS=1 DM_WATCH_STALL=8 DM_NVN_API_MAJOR=53 DM_DIAG_TICK=1 DM_SHADER_SKIP=1 DM_DRAW_TRACE=8 DM_CV_PROBE=1 DM_SAMPLER_BORDER=transparent';
             // romfs 双路（d1 瘦包）：
             //   A. HAP 里带 romfs/（fat 包，首次装机用）→ 照旧**每次点都重新解出**。
             //      ⚠ 不能用 pathExists 判"解没解过"：本机 fs.listFileSync 对不存在的路径也不抛
