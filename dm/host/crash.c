@@ -455,6 +455,44 @@ static const char *fmt_off(uint64_t a) {
     snprintf(o, 64, "%#llx", (unsigned long long)a);
     return o;
 }
+// np600：**间接调用取证**（"跳到非法地址"这类崩点专用）。
+// 现象模板：`FAULT sig=7 pc=0xd lr=main+0x1a98708 addr=0xd` —— pc 是垃圾值，日志里却看不出是谁算出来的。
+// 这次的目标是 0x1a88af0（天气/昼夜系统）里的两处间接调用：
+//   0x1a88d94 ldr x8,[x20] → 0x1a88d9c ldr x8,[x8,#0x30] → blr x8
+//   0x1a88fac ldr x8,[x20] → 0x1a88fb0 ldr x8,[x8,#0x88] → blr x8
+// 所以只要在崩溃现场拿到 x20，再顺着读出 [x20]、[[x20]+0x30]、[[x20]+0x88]，就能回答
+// "是哪一条虚表槽坏了、坏成什么、这个对象到底是什么" —— 不用再靠帧链猜。
+// 读客体内存一律走 process_vm_readv（读不到就报"读不到"，绝不再崩一次）。
+// np600: indirect-call forensics for "jumped to a garbage address" faults. The pattern
+// `pc=0xd` tells nothing about who computed the target. The two indirect calls in 0x1a88af0 fetch
+// [[x20]+0x30] and [[x20]+0x88] and blr them, so grabbing x20 at the fault and reading those three
+// slots answers "which vtable slot is bad, what is it, and what is this object". Guest memory is read
+// only through process_vm_readv, so a bad address reports "unreadable" instead of faulting again.
+static int rd_guest_u64(uint64_t a, uint64_t *out) {
+    struct iovec li = { out, 8 }, ri = { (void *)(uintptr_t)a, 8 };
+    if (!a) return 0;
+    return process_vm_readv(getpid(), &li, 1, &ri, 1, 0) == 8;
+}
+static void dump_vcall_probe(const char *tag, uint64_t p) {
+    char b1[64], b2[64], b3[64], b4[64];
+    if (p < 0x1000) { fprintf(stderr, "[dm] np600 %s=%#llx（空/极小值 ⇒ 直接就是坏指针）\n", tag, (unsigned long long)p); return; }
+    uint64_t vptr = 0, s30 = 0, s88 = 0, s0 = 0;
+    int okp = rd_guest_u64(p, &vptr);
+    if (okp && vptr > 0x1000) { rd_guest_u64(vptr + 0x30, &s30); rd_guest_u64(vptr + 0x88, &s88); rd_guest_u64(vptr, &s0); }
+    snprintf(b1, sizeof b1, "%s", fmt_off(p));
+    snprintf(b2, sizeof b2, "%s", okp ? fmt_off(vptr) : "读不到");
+    snprintf(b3, sizeof b3, "%s", s30 ? fmt_off(s30) : "0");
+    snprintf(b4, sizeof b4, "%s", s88 ? fmt_off(s88) : "0");
+    fprintf(stderr, "[dm] np600 %s=%s vptr=%s 虚表 +0x30=%s +0x88=%s\n", tag, b1, b2, b3, b4);
+    if (okp) {   // 对象头 4 个字：vptr + 三个字段，用来辨"这是不是我以为的那个对象"
+        uint64_t w[4] = { 0, 0, 0, 0 };
+        struct iovec li = { w, sizeof w }, ri = { (void *)(uintptr_t)p, sizeof w };
+        if (process_vm_readv(getpid(), &li, 1, &ri, 1, 0) == (ssize_t)sizeof w)
+            fprintf(stderr, "     对象头 %#llx %#llx %#llx %#llx；vtable[0]=%s\n",
+                    (unsigned long long)w[0], (unsigned long long)w[1],
+                    (unsigned long long)w[2], (unsigned long long)w[3], fmt_off(s0));
+    }
+}
 static void dump_guest_stack_chain(uint64_t sp) {
     const char *nm; uint64_t off;
     uint64_t *p = (uint64_t *)(sp & ~7ull);
@@ -628,6 +666,19 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
                 (unsigned long long)(uintptr_t)si->si_addr,
                 (unsigned long long)UC_X(uc, 0), (unsigned long long)UC_SP(uc),
                 (unsigned long long)UC_FP(uc));
+    // np600：**寄存器全表 + 间接调用取证**。pc 是垃圾值时只有寄存器还能说明"谁算出了它"：
+    // 先打 x0..x28（两行），再对被调对象（x20 最可能，x8 次之）做虚表槽取证。
+    // np600: full register file plus indirect-call forensics. When pc is garbage only the registers can
+    // say who computed it: print x0..x28 on two lines, then probe the likely callee object (x20, then x8).
+    if (sig == SIGSEGV || sig == SIGBUS) {
+        fprintf(stderr, "[dm] np600 寄存器：");
+        for (int r = 0; r <= 14; r++) fprintf(stderr, " x%d=%#llx", r, (unsigned long long)UC_X(uc, r));
+        fprintf(stderr, "\n[dm]             ");
+        for (int r = 15; r <= 28; r++) fprintf(stderr, " x%d=%#llx", r, (unsigned long long)UC_X(uc, r));
+        fprintf(stderr, " x29=%#llx x30=%#llx\n", (unsigned long long)UC_FP(uc), (unsigned long long)UC_LR(uc));
+        dump_vcall_probe("x20", (uint64_t)UC_X(uc, 20));
+        if ((uint64_t)UC_X(uc, 8) != (uint64_t)UC_X(uc, 20)) dump_vcall_probe("x8 ", (uint64_t)UC_X(uc, 8));
+    }
     // np435：崩溃现场顺带把"每个文件读了几次/多少字节"打出来。启动期的崩溃常常早于 5 秒的滴答，
     // 不在这里打就永远看不到（np435 就是 0.7 秒崩的）。
     // np435: also dump the per-file read accounting at the crash site. Early-boot crashes usually beat the 5 s
