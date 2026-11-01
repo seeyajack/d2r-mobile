@@ -165,6 +165,9 @@ VkBool32 sampler_mirror_clamp_enabled=VK_FALSE;
 // RGBA while Vulkan's fixed colours are only black/white/transparent, so anything else (the 1.6.0 payload uses
 // mid grey 0.5,0.5,0.5) needs this extension.
 VkBool32 custom_border_color_enabled=VK_FALSE, custom_border_without_format=VK_FALSE;
+// np603：每个 (阶段,槽) 的绑定次数（见 OP_BIND_UBO 处理处）。只用于"空槽"这条 FATAL 的定性。
+// np603: bind counters per (stage, slot); only used to classify the "empty slot" fatal.
+uint64_t bind_hits[6][16];
 // Formatless storage access per format needs VK_KHR_format_feature_flags2 (core in Vulkan 1.3). Without it (Vulkan 1.1 drivers
 // such as Adreno 730 512.615) the spec's "Formats Without Shader Storage Format" rule applies: the shaderStorageImage{Read,Write}
 // WithoutFormat features cover exactly these formats, where the format also supports VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT.
@@ -2791,9 +2794,24 @@ VkSampler sampler_slow(const samp_par &p,Image &im,VkFormat viewed,bool integer_
                 xbg_logf("NVN caps customBorderColor ext=%d colors=%u withoutFormat=%u",int(present),unsigned(custom_border_color_enabled),unsigned(custom_border_without_format));
             }}}}
     xbg_nvn_sampler_desc input{p.minf,p.magf,p.ws,p.wt,p.wr,p.cmp_mode,p.cmp_func,p.lod_min,p.lod_max,p.lod_bias,p.aniso,{p.border[0],p.border[1],p.border[2],p.border[3]}};
-    xbg_sampler_limits limits{cfg.enabled_core.samplerAnisotropy,sampler_mirror_clamp_enabled,VkBool32(integer_border),properties.limits.maxSamplerAnisotropy,properties.limits.maxSamplerLodBias,custom_border_color_enabled};
+    // np604：`DM_SAMPLER_BORDER=transparent|black|white` —— **设备没有自定义边框色时**的显式近似开关。
+    // 不设就保持严格（-7 + FATAL）。设了就每出现一种新边框色打一行"我把它换成了什么"，
+    // 让"画面可能不对"这件事在日志里无法被忽略。
+    // np604: DM_SAMPLER_BORDER=transparent|black|white -- the explicit approximation switch for devices without
+    // custom border colours. Unset keeps it strict (-7 + FATAL). When set, every distinct border colour gets one
+    // line saying what it was replaced with, so "the picture may be wrong" cannot be missed in the log.
+    static const uint32_t border_approx=[](){const char *v=getenv("DM_SAMPLER_BORDER");if(!v||!*v)return 0u;
+        if(!strcmp(v,"transparent"))return 1u;if(!strcmp(v,"black"))return 2u;if(!strcmp(v,"white"))return 3u;
+        xbg_logf("【红】DM_SAMPLER_BORDER=%s 不认识（transparent|black|white），按严格处理",v);return 0u;}();
+    xbg_sampler_limits limits{cfg.enabled_core.samplerAnisotropy,sampler_mirror_clamp_enabled,VkBool32(integer_border),properties.limits.maxSamplerAnisotropy,properties.limits.maxSamplerLodBias,custom_border_color_enabled,border_approx};
     float border_rgba[4]={0,0,0,0};
     VkSamplerCreateInfo s{};int result=xbg_sampler_from_nvn(&input,&limits,&s,border_rgba);
+    if(!result && border_approx && !custom_border_color_enabled && (p.ws==5||p.wt==5||p.wr==5)){
+        static std::set<std::array<uint32_t,4>> seen;std::array<uint32_t,4> bk{};for(int i=0;i<4;i++){memcpy(&bk[size_t(i)],&p.border[i],4);}
+        if(seen.insert(bk).second)xbg_logf("NVN sampler border 近似：%g,%g,%g,%g → %s（设备无 custom border colour）",
+            double(p.border[0]),double(p.border[1]),double(p.border[2]),double(p.border[3]),
+            border_approx==1?"透明黑":border_approx==2?"不透明黑":"不透明白");
+    }
     if(result)xbg_fatalf("NVN sampler %s result=%d min=%u mag=%u wrap=%u/%u/%u lod=%g/%g bias=%g aniso=%g compare=%u/%u border=%g,%g,%g,%g texture=%llu format=%#x vk=%u mirrorEnabled=%u",xbg_sampler_error(result),result,p.minf,p.magf,p.ws,p.wt,p.wr,p.lod_min,p.lod_max,p.lod_bias,p.aniso,p.cmp_mode,p.cmp_func,p.border[0],p.border[1],p.border[2],p.border[3],(unsigned long long)im.source.serial,im.source.d.format,unsigned(viewed),sampler_mirror_clamp_enabled);
     const VkFormatProperties &fp=format_properties(viewed);
     if((s.minFilter==VK_FILTER_LINEAR || s.magFilter==VK_FILTER_LINEAR) && !(fp.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))xbg_fatalf("NVN sampler linear filtering unsupported min=%u mag=%u compare=%u/%u format=%#x vk=%u optimalFeatures=%#x texture=%llu decoded=%d imfmt=%u",p.minf,p.magf,p.cmp_mode,p.cmp_func,im.source.d.format,unsigned(viewed),fp.optimalTilingFeatures,(unsigned long long)im.source.serial,int(im.decoded),unsigned(im.fmt));
@@ -3043,6 +3061,21 @@ void desc_memo_reset(){img_cache.clear();
 Buffer &support_block(){size_t n=1392;auto k=std::make_pair(state.viewport.width,state.viewport.height);
     auto it=support_static.find(k);if(it!=support_static.end())return it->second;
     Buffer s=static_arena.alloc(uniform_range(n));xbg_support_defaults(s.mapped,state.viewport.width,state.viewport.height);s.flush();return support_static.emplace(k,s).first->second;}
+// np606：**声明了但客体从没绑过的 UBO 槽**用这块零缓冲顶上（按大小缓存，内容全 0，可共享）。
+// 为什么可以这样做：着色器包里"有这条 binding"只表示程序里声明了这个常量块，NVN 并不要求游戏把每个
+// 声明过的槽都绑上；真机上读一个没绑的槽是未定义值。参考实现（Ryujinx）同样塞零缓冲。
+// 判据（1.6.0 真机）：`NVN bindhits stage=0 … 2:0 …` —— 同一阶段 slot 0 绑了 91,386 次、slot 10 有 158,696 次，
+// 而 slot 2 一次都没有 ⇒ 不是"我们槽号算错"，是"游戏根本不用它"。原来这里直接 FATAL，等于用一个
+// 声明细节把整局拦下来。
+// np606: a zero-filled stand-in for UBO slots the guest declared but never bound (cached by size, all zeros, so
+// shareable). A binding in the shader bundle only means the program declares that constant block; NVN never
+// requires the game to bind every declared slot, and reading an unbound slot on hardware is undefined. The
+// reference implementation (Ryujinx) fills a zero buffer as well. Evidence (1.6.0 device): `NVN bindhits stage=0
+// ... 2:0 ...` -- slot 0 was bound 91,386 times and slot 10 158,696 times, slot 2 never, so this is "the game
+// simply does not use it", not a wrong slot number. FATALing here blocked the whole run over a declaration detail.
+Buffer &zero_block(size_t bytes){static std::map<size_t,Buffer> cache;size_t n=uniform_range(bytes);
+    auto it=cache.find(n);if(it!=cache.end())return it->second;
+    Buffer s=static_arena.alloc(n);memset(s.mapped,0,n);s.flush();return cache.emplace(n,s).first->second;}
 Buffer &driver_block(unsigned ns,unsigned bank){uint64_t gen=bank?tex_gen[ns]:buf_gen[ns];
     DriverCache &dc=driver_cache[ns][bank];if(dc.slot!=slot_serial || dc.gen!=gen || !dc.slot){Buffer s=stream_buffer(0x1000);fill_driver(static_cast<uint8_t*>(s.mapped),ns,bank?2:0);s.flush();dc.gen=gen;dc.slot=slot_serial;dc.buffer=s;}
     return dc.buffer;}
@@ -3241,7 +3274,31 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
             VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};write.dstSet=VK_NULL_HANDLE;write.dstBinding=b.binding;write.dstArrayElement=element;write.descriptorCount=1;write.descriptorType=UBO_DYN(dmode,b)?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:VkDescriptorType(b.type);
             if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || b.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER){DESC_SCOPE(BufferBind);
                 Buffer *buffer=nullptr;bool is_storage=b.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;uint32_t slot=b.slot+element;size_t n=0,buffer_offset=0;const void *data=nullptr;size_t copy=0;
-                if(b.source==XBG_SOURCE_UNIFORM || b.source==XBG_SOURCE_STORAGE){need(slot<16,"Buffer slot out of bounds");auto r=b.source==XBG_SOURCE_UNIFORM?state.ub[ns][slot]:state.sb[ns][slot];need(r.address && r.size,"Required NVN buffer slot is unbound");data=reinterpret_cast<void*>(r.address);copy=r.size;
+                if(b.source==XBG_SOURCE_UNIFORM || b.source==XBG_SOURCE_STORAGE){need(slot<16,"Buffer slot out of bounds");auto r=b.source==XBG_SOURCE_UNIFORM?state.ub[ns][slot]:state.sb[ns][slot];
+                    // np603：**"游戏没绑"与"我们槽位映射错了"的分水岭**。原来这条 FATAL 只说"某个槽是空的"，
+                    // 分不清两种完全不同的病：① 客体这一帧真的没绑（上游被我们跳过/丢帧）；
+                    // ② 客体绑了，但我们从着色器里推出的 slot 号不对（那就要去查 binding.slot 的来源）。
+                    // 所以这里把同一阶段的 16 个槽（UB 与 SB 两个银行都打）连同 shader key 一起打出来：
+                    //   全空 ⇒ ①；有别的槽有值 ⇒ ②（把那个号跟 binding 对一下就知道差在哪）。
+                    // np603: the dividing line between "the game never bound it" and "our slot mapping is wrong".
+                    // The old message only said "a slot is empty", which cannot tell ① the guest really bound nothing
+                    // this frame (something upstream was skipped) from ② the guest did bind, but the slot number we
+                    // derived from the shader is wrong (then binding.slot's origin is the suspect). So dump all 16
+                    // slots of both banks for this stage plus the shader key: all empty => ①; any other slot with
+                    // data => ② (compare that index against binding.slot to see the offset).
+                    if(!(r.address && r.size)){
+                        // np606：不是错误，是"这条 binding 只是声明"。用零缓冲顶上，并按 (shader,binding) 报一次，
+                        // 让"这个槽整轮没绑过"在日志里留痕（既不是静默，也不是把整局拦下来）。
+                        // np606: not an error, just a declaration. Fill a zero buffer and log once per (shader, binding)
+                        // so "this slot was never bound at all" stays visible -- neither silent nor fatal.
+                        static std::set<std::pair<std::string,unsigned>> noted;
+                        if(noted.insert({shader.key,b.binding}).second)
+                            xbg_logf("NVN unbound UBO 用零缓冲：stage=%u shader=%s binding=%u slot=%u bindhits=%llu declared=%u",
+                                st,shader.key.c_str(),b.binding,slot,(unsigned long long)bind_hits[ns][slot],b.bytes);
+                        size_t want=uniform_range(std::min<size_t>(b.bytes?b.bytes:256,properties.limits.maxUniformBufferRange));
+                        Buffer &zb=zero_block(want);data=zb.mapped;copy=want;n=zb.size;buffer=out.keep(zb);
+                    }else{
+                        data=reinterpret_cast<void*>(r.address);copy=r.size;
                     if(is_storage){n=copy;for(auto &v:out.storage)if(r.address>=v.first.first && r.address+r.size<=v.first.first+v.first.second){buffer=v.second;buffer_offset=r.address-v.first.first;break;}need(buffer,"Storage alias allocation not found");need(buffer_offset%properties.limits.minStorageBufferOffsetAlignment==0,"NVN storage offset violates Vulkan alignment");}
                     else{
                         // 镜头实验：除了按正交视锥剔除的那条计算着色器，任何阶段、任何槽位的主相机都换成透视拷贝（cam::bound / cam::patch）
@@ -3249,6 +3306,7 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                         // compute shader that culls against the orthographic frustum
                         const bool cam_ok=!(compute && shader.key.compare(0,16,cam::cull_cs)==0);
                         copy=cam::bound(r.address,std::min<size_t>(copy,b.bytes?b.bytes:65536),r.size,cam_ok);n=uniform_range(copy);buffer=out.keep(uniform_snapshot(r.address,copy,cam_ok));}
+                    }
                 }else if(b.source==XBG_SOURCE_SUPPORT){n=1392;need(state.color.alpha_func==8,"Nontrivial NVN alpha test not translated");
                     Buffer &sb=support_block();data=sb.mapped;copy=n;buffer=out.keep(sb);}
                 else if(b.source==XBG_SOURCE_C1){
@@ -4290,6 +4348,16 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
         case OP_BIND_VSTREAM:{auto a=variable_payload<p_bind_vstream>(p,n);need(a.first>=0 && a.n>=0 && a.first+a.n<=16 && n>=offsetof(p_bind_vstream,st)+size_t(a.n)*sizeof(vs_st),"Invalid vertex stream record");memcpy(state.stream+a.first,a.st,a.n*sizeof(vs_st));break;}
         case OP_BIND_VBUF:{auto a=variable_payload<p_bind_vbuf>(p,n);need(a.first>=0 && a.n>=0 && a.first+a.n<=16 && n>=offsetof(p_bind_vbuf,r)+size_t(a.n)*sizeof(NVNbufferRange),"Invalid vertex buffer record");memcpy(state.vb+a.first,a.r,a.n*sizeof(NVNbufferRange));break;}
         case OP_BIND_UBO:case OP_BIND_SSBO:{auto a=payload<p_bind_buf>(p,n);need(a.stage>=0 && a.stage<6 && a.index>=0 && a.index<16,"Invalid shader buffer slot");
+            // np603：**每个 (阶段,槽) 被绑过多少次**。着色器清单里写着"要 slot 2"，而客体侧 slot 2 是空的，
+            // 这时必须分清两件事：① 游戏从头到尾就没绑过这个槽（那多半是导出器给的槽号不对，或这条 shader
+            // 的那个 UBO 根本没人用）；② 平时会绑、只是这一帧漏了（那要往"谁清掉了"查）。
+            // 计数是零成本的（一次自增），只在 fatal 那条路径上打出来。
+            // np603: how often each (stage, slot) has ever been bound. The shader bundle asks for slot 2 while the
+            // guest side has it empty, and two very different stories fit: ① the game never bound that slot at all
+            // (the exporter's slot number is wrong, or that UBO is simply unused) ② it is bound normally and only
+            // this frame skipped it (then look for who cleared it). One increment per bind, dumped only on the
+            // fatal path.
+            if(a.index<16)++bind_hits[a.stage][a.index];
             // np541：与 UBUPDATE 成对取证——看游戏绑定给着色器的缓冲区地址是不是也在未映射区。
             // np541: pairs with UBUPDATE -- check whether the buffer addresses bound to the shaders are also unmapped.
             {static int nb;if(nb<16){++nb;void *pg=(void*)(uintptr_t)(a.addr&~0xfffull);unsigned char mv=0;
