@@ -1768,7 +1768,15 @@ void prepare_read(Image &im,VkCommandBuffer cmd){
         //   through (undefined in Vulkan, but drivers read the current contents). Device criterion: passes
         //   512 -> ~120, GPU per frame well below 1.1-1.6 s, frames advance.
         if(in_open)++prep_read_feedback;
-        if(need_barrier||in_open)full_barrier_in_pass(cmd);
+        // np648：**反馈读不再补屏障**。np644 时这里对每次 in_open 都发一条全内存屏障，实测每帧 3901 次；
+        //   tile 型 GPU 上 pass 内的全内存屏障会逼 tile flush，代价可能比省下的 pass 重开还高。
+        //   而且这条屏障本来也修不了"附件同时被采样"的冲突（Vulkan 上就是未定义），所以只在
+        //   "上次屏障之后被写过"时才发。
+        // np648: no barrier for a feedback read. np644 issued a full memory barrier for every in_open
+        //   (3901 per frame measured); on a tiled GPU an in-pass full barrier forces a tile flush, which can
+        //   cost more than the pass reopen it saved -- and it cannot fix "an attachment is also sampled"
+        //   anyway (undefined in Vulkan). Only emit it when the image was written since the last barrier.
+        if(need_barrier)full_barrier_in_pass(cmd);
         return;
     }
     ++prep_read_end;
