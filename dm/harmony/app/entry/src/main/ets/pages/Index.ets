@@ -613,7 +613,14 @@ struct Index {
             //   warp32/nan_minmax first enabled) -- not a real deadlock (0x1008 was spinning, 0x1023
             //   merely had historical work). 90 s still catches a real hang: a ring-wait never heals,
             //   one more minute costs nothing.
-            let envs = 'DM_NVN_LOG=1 DM_FS=1 DM_WATCH_STALL=90 DM_NVN_API_MAJOR=53 DM_DIAG_TICK=1 DM_SHADER_SKIP=1 DM_DRAW_TRACE=8 DM_CV_PROBE=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000';
+            // np657：A/B——单独关异步翻译（DM_NVN_SYNC=0 强覆盖缺省值块的 0→它本来就是 0？
+            //   不：缺省值块 setenv(...,"0",0) 是"异步=0"——0 就代表异步。同步是 1。这里显式传 1 回同步。
+            //   判据：过 306 秒挂点 = 翻译线程插进了 job 依赖环；仍挂 = 环与翻译无关，转 0x1008 的
+            //   环形缓冲控制块取证。
+            // np657: A/B -- disable async translation. DM_NVN_SYNC=0 means async (the default), 1 = sync.
+            //   Pass 1 explicitly here: past the 306 s hang point = the translation thread is part of the
+            //   job-dependency ring; still hangs = the ring is translation-independent, go dump the ring buffer.
+            let envs = 'DM_NVN_SYNC=1 DM_NVN_LOG=1 DM_FS=1 DM_WATCH_STALL=90 DM_NVN_API_MAJOR=53 DM_DIAG_TICK=1 DM_SHADER_SKIP=1 DM_DRAW_TRACE=8 DM_CV_PROBE=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000';
             // romfs 双路（d1 瘦包）：
             //   A. HAP 里带 romfs/（fat 包，首次装机用）→ 照旧**每次点都重新解出**。
             //      ⚠ 不能用 pathExists 判"解没解过"：本机 fs.listFileSync 对不存在的路径也不抛
