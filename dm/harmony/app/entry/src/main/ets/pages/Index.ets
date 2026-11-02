@@ -604,7 +604,16 @@ struct Index {
             // ctlhex/datahex. The code dump now uses the real ncode (np619, capped at 32 KB).
             // np647：判别探针用完已撤（默认关；要再跑 A/B 时加 `DM_PROBE_TINY_SCISSOR=32`）。
             // np647: the probe is done, switched off again (add `DM_PROBE_TINY_SCISSOR=32` for another A/B).
-            let envs = 'DM_NVN_LOG=1 DM_FS=1 DM_WATCH_STALL=30 DM_NVN_API_MAJOR=53 DM_DIAG_TICK=1 DM_SHADER_SKIP=1 DM_DRAW_TRACE=8 DM_CV_PROBE=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000';
+            // np654：**DM_WATCH_STALL 30 → 90**。np653 的死是看门狗在 2.5 分钟处判"30 秒无进展"
+            //   杀的——当时正是转场/着色器首译期（warp32/nan_minmax 首开后管线全量重建），不是真死锁
+            //   （0x1008 在自旋、0x1023 只是历史活多）。30 秒对"新开性能档位后的首译深谷"太紧，
+            //   90 秒仍能抓真死锁（环等不会自愈，多等一分钟无所谓）。
+            // np654: DM_WATCH_STALL 30 -> 90. np653 died by the watchdog's "30 s without progress"
+            //   verdict right in the transition/first-translation trough (pipeline full rebuild after
+            //   warp32/nan_minmax first enabled) -- not a real deadlock (0x1008 was spinning, 0x1023
+            //   merely had historical work). 90 s still catches a real hang: a ring-wait never heals,
+            //   one more minute costs nothing.
+            let envs = 'DM_NVN_LOG=1 DM_FS=1 DM_WATCH_STALL=90 DM_NVN_API_MAJOR=53 DM_DIAG_TICK=1 DM_SHADER_SKIP=1 DM_DRAW_TRACE=8 DM_CV_PROBE=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000';
             // romfs 双路（d1 瘦包）：
             //   A. HAP 里带 romfs/（fat 包，首次装机用）→ 照旧**每次点都重新解出**。
             //      ⚠ 不能用 pathExists 判"解没解过"：本机 fs.listFileSync 对不存在的路径也不抛
