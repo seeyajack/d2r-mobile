@@ -996,6 +996,21 @@ static void death_note(const char *why, uint64_t pc, uint64_t addr, int sig) {
             (unsigned long long)g_gate_regs[19], (unsigned long long)g_gate_regs[20],
             (unsigned long long)g_gate_regs[21], (unsigned long long)g_gate_regs[29],
             (unsigned long long)g_gate_regs[30]);
+        // np657：pc 处指令码 16 字节 + sp 前 8 字节。np657 的 SEGV 现场里 pc（img+0xa05324）
+        // 反汇编是条无害 strb [sp,#0x92c]、与 si_addr=0x8 矛盾 ⇒ 需要直接看故障指令字节来分辨
+        // "pc 不可靠 / 基址错位 / 跳进数据段"三种假设。pc 在客体 main 内才转储（宿主地址不读，
+        // 避免 np530 的 ptrprobe 读崩重演）。
+        // np657: dump 16 bytes at pc + 8 stack words. The np657 SEGV note had pc=img+0xa05324
+        //   disassembling to a harmless strb, contradicting si_addr=0x8 -- the instruction bytes tell
+        //   "unreliable pc / base off / jumped into data" apart. Guest-main pc only (host addresses are
+        //   not dereferenced, see the np530 ptrprobe lesson).
+        if (pc >= base && pc < base + 0x2420000) {
+            n += snprintf(line + n, sizeof line - (size_t)n, "code@pc=");
+            for (int i = 0; i < 16; i++)
+                n += snprintf(line + n, sizeof line - (size_t)n, "%02x",
+                    *(const unsigned char *)(uintptr_t)(pc + i));
+            n += snprintf(line + n, sizeof line - (size_t)n, "\n");
+        }
         for (int i = 0; i < 64 && n > 0 && (size_t)n + 40 < sizeof line; i++) {
             uint64_t v = 0;
             if (g_gate_sp > 0x10000ull && g_gate_sp < 0x800000000000ull)
