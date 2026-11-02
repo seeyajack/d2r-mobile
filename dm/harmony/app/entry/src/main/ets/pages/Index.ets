@@ -386,6 +386,29 @@ struct Index {
             //   different key; to force a rewrite, delete that .xgs.)
             {
               const allX: string[] = rawList(rm, 'shaders_extra');
+              // np652：**先清沙箱里残留的旧标记**。标记解到 filesDir 根，重装 HAP、换构建树
+              //   都不会删它 ⇒ gfx-perf-sample=1 等四个残留标记从 np646 污染到 np651 六轮读数
+              //   （连 np650 的 presentation -4 崩溃都发生在"已证不安全"的 preflight=0 残留下）。
+              //   原则：**每轮跑什么配置，以 HAP 内的清单为准**——包里没有的标记一律删掉，
+              //   有则照投。删除失败不阻断启动（引擎日志三行自报仍可判别污染）。
+              // np652: purge stale markers first. Markers extract into filesDir root and survive HAP
+              //   reinstalls and build-tree switches -- four leftover markers (gfx-perf-sample=1 etc.)
+              //   polluted six rounds of readings (np646-np651). Rule: the HAP manifest is the source
+              //   of truth for what runs this round -- markers not in the bundle get deleted, present
+              //   ones get written. Deletion failure does not block start (the engine's three self-report
+              //   log lines still reveal pollution).
+              try {
+                const names: string[] = fs.listFileSync(ctx.filesDir);
+                let purged = 0;
+                for (const nm of names) {
+                  if (!nm.startsWith('gfx-')) { continue; }
+                  if (allX.some((s: string): boolean => s === nm + '.mark.gz')) { continue; }
+                  try { fs.unlinkSync(ctx.filesDir + '/' + nm); purged++; } catch (e) { }
+                }
+                if (purged > 0) { trace(ctx, 'np652: 清掉沙箱残留标记 ' + purged + ' 个（HAP 内无此 .mark.gz）'); }
+              } catch (err) {
+                trace(ctx, 'np652: 标记清扫失败（不阻断）：' + (err as Error).message);
+              }
               // np634：**标记文件直投 files/**。引擎读开关标记的目录是 **shader 目录的父目录**
               //   （xbg_game.cpp 里 marker() 会 `find_last_of('/')` 砍掉最后一段），而 shaders_extra 只会解到
               //   shaders/ ⇒ 标记投不进去。约定：`<标记名>.mark.gz` 解到 filesDir 根、去掉 .mark.gz 后缀；
