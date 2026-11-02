@@ -755,6 +755,28 @@ uint64_t depth_idle_passes=0;
 // Diagnostic (NVN PERF pass_ends): render-pass ends and full barriers per frame, by the guest op being executed
 // (pseudo-ops: 60 submit, 61 present, 62 storage-writing draw).
 unsigned cur_op=0;uint64_t pass_end_by[64],barrier_by[64];
+// np639：**开新 pass 的原因**。每帧 221 个 pass 是这个项目现在最大的开销来源（np634–np638），
+//   但"为什么开"一直没读数：可能是换了 VkRenderPass（附件格式组合变了）、换了 framebuffer（附件身份变了）、
+//   换了命令缓冲，或者根本没有 pass 开着。四个计数器分开记，另记每帧"开过多少个不同的 framebuffer"。
+// np639: why a new pass is opened. 221 passes per frame is the biggest cost here (np634-np638) and there was
+//   no reading for the reason: a different VkRenderPass (attachment formats), a different framebuffer
+//   (attachment identity), a different command buffer, or no pass open at all. Four counters, plus how many
+//   distinct framebuffers were opened per frame.
+uint64_t pass_open_by[4];std::set<uint64_t> pass_open_fbs;
+// np641：**pass 是被谁关的**。np639 已经证明"断 pass 的不是 RT 切换"，但 `pass_open none` 一直涨，
+//   说明还有别处在 draw 之间把 pass 关掉。这里给每个 end_open_pass 调用点一个编号，直方图直接点名。
+// np641: who closes the pass. np639 showed it is not the render-target switch, yet `pass_open none` keeps
+//   growing, so something else closes the pass between draws. Each end_open_pass call site gets an id and the
+//   histogram names it: 1 split segment, 2 submit, 3 Commands (non-draw op), 4 image transition,
+//   5 draw's pass switch, 6 storage readback (draw / readback_buffer), 7 clear.
+int pass_end_cause_now=0;uint64_t pass_end_cause[8];
+static int g_probe_tiny_scissor=[](){const char *e=getenv("DM_PROBE_TINY_SCISSOR");return e?atoi(e):0;}();   // np647：判别探针，默认关
+uint64_t prep_read_feedback;   // np644：反馈读（采样当前 pass 附件）而不断 pass 的次数 | np644: feedback reads let through without ending the pass
+uint64_t prep_read_end;   // np641：prepare_read 里断 pass 的次数（每帧）| np641: pass ends inside prepare_read per frame
+// np643：这一帧开 pass 的顺序（行程编码用）。512 条足够覆盖场景帧的 ~440 次。
+// np643: this frame's pass-open order, for run-length encoding. 512 entries cover the scene frame's ~440 opens.
+struct PassSeqEnt{uint64_t fb;uint32_t w,h,att;};
+PassSeqEnt pass_seq[512];unsigned pass_seq_n=0;
 // Samples-passed counting: one precise occlusion query per run of counted draws inside a pass (Metal counts per pass,
 // nvn_mtl.m), not one per draw. A run ends with its pass, at a counter reset, and at a report (which ends the pass), so a
 // report still sums exactly the draws since its reset. ~2200 begin/end pairs per D2R camp frame cost the Adreno 730
@@ -770,8 +792,22 @@ void begin_occlusion_query(VkCommandBuffer cmd,VkQueryPool pool,uint32_t index){
     need(!open_occlusion.cmd,"Nested occlusion query");
     vkCmdBeginQuery(cmd,pool,index,VK_QUERY_CONTROL_PRECISE_BIT);open_occlusion={cmd,pool,index};++occlusion_queries_started;
 }
-void end_open_pass(){if(open_pass.cmd){end_occlusion_query();vkCmdEndRenderPass(open_pass.cmd);if(open_pass.depth_attached && !open_pass.depth_used){++depth_idle_passes;pass_prof_depth_idle(open_pass.cmd);}pass_prof_end(open_pass.cmd);open_pass=OpenPass{};++pass_end_by[cur_op<64?cur_op:63];}}
+void end_open_pass(){if(open_pass.cmd){end_occlusion_query();vkCmdEndRenderPass(open_pass.cmd);if(open_pass.depth_attached && !open_pass.depth_used){++depth_idle_passes;pass_prof_depth_idle(open_pass.cmd);}pass_prof_end(open_pass.cmd);open_pass=OpenPass{};++pass_end_by[cur_op<64?cur_op:63];++pass_end_cause[pass_end_cause_now&7];}}
+void end_pass(int cause){pass_end_cause_now=cause;end_open_pass();pass_end_cause_now=0;}   // np641：带"谁关的"编号的 end_open_pass | np641: end_open_pass tagged with the call site
 void full_barrier(VkCommandBuffer cmd){VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&b,0,nullptr,0,nullptr);barrier_seq=write_seq;++barrier_by[cur_op<64?cur_op:63];}
+// np640：**pass 内合法的内存屏障**。render pass 内部不能出现 pass 之外的阶段（ALL_COMMANDS 会带进来，
+//   验证层报 VUID），所以 pass 开着时把阶段掩码收窄到图形阶段；pass 没开就保持 ALL_COMMANDS 的原语义。
+//   用途：不该断 pass 的地方（barrier 回放、storage 回读的拷贝）就地发屏障，别再 end_open_pass()。
+// np640: a memory barrier that is legal inside a render pass. Inside a pass the stage mask must not name stages
+//   outside it (ALL_COMMANDS does, and the validation layer says so), so the mask is narrowed to graphics stages
+//   while a pass is open; with no pass open it keeps full_barrier's ALL_COMMANDS semantics. Used where ending the
+//   pass is unnecessary (barrier replay, the storage-readback copy).
+void full_barrier_in_pass(VkCommandBuffer cmd){
+    VkPipelineStageFlags st=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    if(open_pass.cmd==cmd)st=VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT|VK_PIPELINE_STAGE_VERTEX_INPUT_BIT|VK_PIPELINE_STAGE_VERTEX_SHADER_BIT|VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT|VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT|VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT|VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd,st,st,0,1,&b,0,nullptr,0,nullptr);barrier_seq=write_seq;++barrier_by[cur_op<64?cur_op:63];
+}
 struct PerfCounts{size_t pipelines,layouts,samplers,passes,images,host_segments,host_bytes;};
 PerfCounts perf_counts();
 struct Perf {
@@ -962,7 +998,7 @@ void submit_split_segment(){
     Slot &s=slots[slot_index];
     if(!s.recording || !s.cmd)return;
     unsigned saved=cur_op;cur_op=60;
-    if(open_pass.cmd==s.cmd)end_open_pass();   // np629c：大 pass 内部也切（见切点注释）
+    if(open_pass.cmd==s.cmd)end_pass(1);   // np629c：大 pass 内部也切（见切点注释）
     // 段尾：栅栏 + 时间戳（与 submit_slots 同款收尾，但不做 query 拷贝——那要等最后一发）
     full_barrier(s.cmd);
     VK(vkEndCommandBuffer(s.cmd));
@@ -999,7 +1035,7 @@ void submit_split_segment(){
 void submit_slots(bool wait){
     Slot &s=slots[slot_index];
     if(s.recording){
-        if(open_pass.cmd==s.cmd){unsigned saved=cur_op;cur_op=60;end_open_pass();cur_op=saved;}barrier_seq=0;
+        if(open_pass.cmd==s.cmd){unsigned saved=cur_op;cur_op=60;end_pass(2);cur_op=saved;}barrier_seq=0;
         // Occlusion results: GPU copies them into mapped memory (vkGetQueryPoolResults is slow on this driver).
         s.query_copied=0;if(s.occlusion_used){size_t used=s.occlusion_used;s.query_results=s.readback.alloc(used*8);
             for(size_t i=0;i*256<used;i++){uint32_t n=uint32_t(std::min<size_t>(256,used-i*256));vkCmdCopyQueryPoolResults(s.cmd,s.occlusion_pools[i],0,n,s.query_results.buffer,s.query_results.offset+i*256*8,8,VK_QUERY_RESULT_64_BIT);}
@@ -1130,7 +1166,26 @@ void perf_frame(){
     pipelines_unsaved+=size_t(warm::compiled.exchange(0));
     if(pipelines_unsaved && stats.presents.load()>=pipeline_save_frame+300){pipeline_save_frame=stats.presents.load();save_pipeline_cache();}
     uint64_t now=timing_clock();if(!perf.window_start){perf.window_start=now;perf.frames=0;return;}
-    if(++perf.frames<60)return;
+    // np639：**大帧立刻报一次**。原来固定每 60 帧一份，而"场景帧"每帧开 221 个 pass、只活 1–2 帧就挂，
+    //   永远落不到报告窗口里（np635/np636 两轮白跑）。这一帧开了 >100 个 pass 就当场出报告。
+    // np639: report immediately on a big frame. The report used to be fixed at every 60 frames, but the scene
+    //   frame opens 221 passes and lives for 1-2 frames before the hang, so it never landed in a window
+    //   (np635/np636 were wasted rounds). More than 100 passes opened in one frame reports right away.
+    bool big_frame=false;
+    {static uint64_t last_passes;uint64_t pnow=perf.passes;big_frame=(pnow>=last_passes && pnow-last_passes>100);last_passes=pnow;
+     // np643：**把这一帧开 pass 的顺序打出来**（行程编码）。要回答的是：443 次开 pass 是在 54 个 framebuffer
+     //   之间 A→B→A→B 抖动（= 我们规划有问题），还是有序遍历（= 游戏本来就这样）。
+     // np643: dump this frame's pass-open order as run-length runs. The question: are the 443 opens thrashing
+     //   A->B->A->B between 54 framebuffers (our planner's fault) or an ordered walk (the game's own design)?
+     if(big_frame){
+         unsigned i=0,runs=0;
+         while(i<pass_seq_n){unsigned j=i+1;while(j<pass_seq_n && pass_seq[j].fb==pass_seq[i].fb)++j;
+             if(runs<160)xbg_logf("PASSSEQ run=%u fb=%#llx %ux%u att=%u",j-i,(unsigned long long)pass_seq[i].fb,pass_seq[i].w,pass_seq[i].h,pass_seq[i].att);
+             ++runs;i=j;}
+         xbg_logf("PASSSEQ total_opens=%u runs=%u distinct_fb=%zu",pass_seq_n,runs,pass_open_fbs.size());
+     }
+     pass_seq_n=0;
+     if(++perf.frames<60 && !big_frame)return;}
     double wall=double(now-perf.window_start)/1e6,f=double(perf.frames);
     if(poolreset::enabled){xbg_logf("NVN PERF poolreset queued=%.2f waits=%.2f wait_ms=%.3f",poolreset::queued/f,poolreset::waits/f,poolreset::wait_ns/1e6/f);poolreset::queued=poolreset::waits=poolreset::wait_ns=0;}
     const double tf=perf_timed_frames?double(perf_timed_frames):1.0;   // parts and descriptor timers come from the timed frames only
@@ -1170,12 +1225,24 @@ void perf_frame(){
      at+=snprintf(line+at,sizeof(line)-at," legacy_wait_total=%.2f submit_by",legacy_wait_ns/1e6/f);
      for(int i=0;i<SITE_COUNT && at<int(sizeof(line))-40;i++)if(submit_by[i])at+=snprintf(line+at,sizeof(line)-at," %s=%.2f",site_names[i],submit_by[i]/f);
      xbg_logf("%s",line);for(int i=0;i<SITE_COUNT;i++)block_ns[i]=block_calls[i]=submit_by[i]=0;legacy_wait_ns=0;}
-    {char line[1024];int at=snprintf(line,sizeof(line),"NVN PERF pass_ends");
+    {char line[1536];int at=snprintf(line,sizeof(line),"NVN PERF pass_ends");
      for(int i=0;i<64 && at<int(sizeof(line))-24;i++)if(pass_end_by[i])at+=snprintf(line+at,sizeof(line)-at," op%d=%.1f",i,pass_end_by[i]/f);
      at+=snprintf(line+at,sizeof(line)-at," fb_hits=%.1f fb_creates=%.2f fb_live=%zu texel_binds=%.1f distinct=%.1f reused=%.1f resident=%zu/%zu hits=%.1f refresh=%.1f fallback=%.2f evict=%.2f occlusion=%.1f reports=%.1f samples=%.0f ops=%.1f/%.1f/%.1f pending=%zu pipe_fast=%.1f pass_fast=%.1f barriers",fb_hits/f,fb_creates/f,persistent_framebuffers.size(),texel_binds/f,texel_distinct/f,texel_reused/f,texel_resident[0].size(),texel_resident[1].size(),texel_hits/f,texel_refreshes/f,texel_fallbacks/f,texel_evictions/f,occlusion_queries_started/f,samples_reports/f,samples_reported/f,counter_ops[0]/f,counter_ops[1]/f,counter_ops[2]/f,pending_reports.size(),pipeline_fast_hits/f,pass_fast_hits/f);pipeline_fast_hits=0;pass_fast_hits=0;fb_hits=fb_creates=0;occlusion_queries_started=samples_reports=samples_reported=0;for(auto &c:counter_ops)c=0;texel_binds=texel_distinct=texel_reused=0;texel_hits=texel_refreshes=texel_fallbacks=texel_evictions=0;
      for(int i=0;i<64 && at<int(sizeof(line))-24;i++)if(barrier_by[i])at+=snprintf(line+at,sizeof(line)-at," op%d=%.1f",i,barrier_by[i]/f);
      if(at<int(sizeof(line))-24)at+=snprintf(line+at,sizeof(line)-at," depth_idle=%.1f",depth_idle_passes/f);
-     xbg_logf("%s",line);for(int i=0;i<64;i++)pass_end_by[i]=barrier_by[i]=0;depth_idle_passes=0;}
+     // np639：开新 pass 的四个原因（none 没有 pass 开着 / cmd 换命令缓冲 / rp 换 VkRenderPass / fb 换 framebuffer），
+     //   以及窗口内"每帧开过多少个不同的 framebuffer"（fb_distinct 接近 pass 数 ⇒ 每个 pass 的附件身份都不同）。
+     // np639: the four reasons a new pass is opened (none / cmd buffer / VkRenderPass / framebuffer) and how many
+     //   distinct framebuffers were opened per frame (fb_distinct near the pass count means every pass has its own).
+     at+=snprintf(line+at,sizeof(line)-at," pass_open none=%.1f cmd=%.1f rp=%.1f fb=%.1f fb_distinct=%.1f",
+         pass_open_by[0]/f,pass_open_by[1]/f,pass_open_by[2]/f,pass_open_by[3]/f,double(pass_open_fbs.size())/f);
+     // np641：pass 是被谁关的（1 切段 / 2 提交 / 3 非 draw 命令 / 4 图像转换 / 5 draw 换 pass / 6 回读 / 7 清屏）
+     // np641: who closed the pass (1 split / 2 submit / 3 non-draw op / 4 image transition / 5 draw's pass switch / 6 readback / 7 clear)
+     at+=snprintf(line+at,sizeof(line)-at," pass_end_by_cause 1=%.1f 2=%.1f 3=%.1f 4=%.1f 5=%.1f 6=%.1f 7=%.1f prep_read_end=%.1f",
+         pass_end_cause[1]/f,pass_end_cause[2]/f,pass_end_cause[3]/f,pass_end_cause[4]/f,pass_end_cause[5]/f,pass_end_cause[6]/f,pass_end_cause[7]/f,prep_read_end/f);
+     at+=snprintf(line+at,sizeof(line)-at," prep_read_feedback=%.1f",prep_read_feedback/f);
+     xbg_logf("%s",line);for(int i=0;i<64;i++)pass_end_by[i]=barrier_by[i]=0;depth_idle_passes=0;
+     for(int i=0;i<4;i++)pass_open_by[i]=0;pass_open_fbs.clear();for(int i=0;i<8;i++)pass_end_cause[i]=0;prep_read_end=0;prep_read_feedback=0;}
     xbg_logf("NVN PERF cleanup_ms_per_frame queries=%.2f writebacks=%.2f(%.1fMB) views=%.2f retire=%.2f arena_pools=%.2f",cleanup_ns[0]/1e6/f,cleanup_ns[1]/1e6/f,writeback_bytes/1048576.0/f,cleanup_ns[2]/1e6/f,cleanup_ns[3]/1e6/f,cleanup_ns[4]/1e6/f);for(auto &c:cleanup_ns)c=0;writeback_bytes=0;
     xbg_logf("NVN PERF xview views=%.2f races=%.2f guarded=%.2f guarded_kb=%.1f",xviews/f,xview_races/f,xview_guarded/f,xview_guarded_bytes/1024.0/f);xviews=xview_races=xview_guarded=xview_guarded_bytes=0;
     if(uploads_prologue || uploads_inpass){xbg_logf("NVN PERF uploads window prologue=%llu inpass=%llu broke_pass=%llu",(unsigned long long)uploads_prologue,(unsigned long long)uploads_inpass,(unsigned long long)uploads_broke_pass);uploads_prologue=uploads_inpass=uploads_broke_pass=0;}
@@ -1454,8 +1521,8 @@ struct Commands {
     // Non-draw operations keep the former submit-per-operation semantics: they
     // end any open pass and are fenced by full barriers before and after.
     explicit Commands(bool is_draw=false):draw(is_draw){Slot &s=recording_slot();command=s.cmd;++perf.ops;++s.ops;
-        if(!draw){end_open_pass();full_barrier(command);}}
-    void finish(){if(!draw){end_open_pass();full_barrier(command);}}
+        if(!draw){end_pass(3);full_barrier(command);}}
+    void finish(){if(!draw){end_pass(3);full_barrier(command);}}
 };
 VkFormat format(int f) {
     static const VkFormat table[]={VK_FORMAT_UNDEFINED,
@@ -1676,13 +1743,40 @@ template<class F> void for_images_overlapping(uint64_t address,uint64_t bytes,F 
 // needs a layout change.
 void prepare_read(Image &im,VkCommandBuffer cmd){
     bool in_open=open_pass.cmd && std::find(open_pass.images.begin(),open_pass.images.end(),&im)!=open_pass.images.end();
-    if(im.layout!=VK_IMAGE_LAYOUT_GENERAL || im.last_write>barrier_seq || in_open){
-        end_open_pass();if(im.layout!=VK_IMAGE_LAYOUT_GENERAL)im.transition(cmd,VK_IMAGE_LAYOUT_GENERAL);full_barrier(cmd);
+    bool need_layout=im.layout!=VK_IMAGE_LAYOUT_GENERAL,need_barrier=im.last_write>barrier_seq;
+    // np641：**只有真需要才断 pass**。np641 实测：这一处每帧断 445 次 pass，是"每帧 ~440 个 pass"的真凶
+    //   （`pass_end_by_cause 4=445`，而 storage 回读那条是 0）。三种情况分开处理：
+    //   ① 布局不是 GENERAL ⇒ 必须断 pass（图像布局转换不能在 pass 内做）；
+    //   ② 图像是本 pass 的附件（反馈读）⇒ 必须断 pass（Vulkan 不允许同时当附件和采样）；
+    //   ③ 只是"上次屏障之后被写过" ⇒ **pass 内发一条内存屏障就够**，不用断。
+    // np641: only end the pass when it is really required. Measured: this site ended the pass 445 times per
+    //   frame and is the real cause of "~440 passes per frame" (`pass_end_by_cause 4=445`; the storage-readback
+    //   site is 0). Three cases are now separated: (1) layout is not GENERAL -> must end the pass, an image
+    //   layout transition cannot happen inside one; (2) the image is an attachment of the open pass (feedback
+    //   read) -> must end the pass, Vulkan forbids sampling an attachment; (3) it was merely written since the
+    //   last barrier -> a memory barrier inside the pass is enough, no need to end it.
+    if(!need_layout){
+        // np644：**反馈读不再断 pass**。np643 的读数：同一个 8 附件 1600×900 的 framebuffer 被连续开
+        //   131/80/185 次（`PASSSEQ run=`），每帧 399 次 × ~92 MB ≈ 37 GB —— 而**断完重开的新 pass 附件
+        //   还是同一批**，采样冲突原样存在 ⇒ 这次断 pass 既没换来正确性、又白付带宽。
+        //   按 NVN 的 tile 内存语义：采样当前目标就让它读（Vulkan 上是未定义行为，但驱动通常按当前内容读）。
+        //   真机判据：pass 数应 512 → ~120、GPU 每帧从 1.1–1.6 s 掉下来、帧数推进。
+        // np644: a feedback read no longer ends the pass. np643 read: the same 8-attachment 1600x900 framebuffer
+        //   was opened 131/80/185 times in a row (`PASSSEQ run=`), 399 times per frame x ~92 MB = ~37 GB -- while
+        //   the reopened pass has the SAME attachments, so the sampling conflict is unchanged: ending the pass
+        //   bought no correctness and paid the bandwidth. Follow NVN's tile-memory semantics and let the read
+        //   through (undefined in Vulkan, but drivers read the current contents). Device criterion: passes
+        //   512 -> ~120, GPU per frame well below 1.1-1.6 s, frames advance.
+        if(in_open)++prep_read_feedback;
+        if(need_barrier||in_open)full_barrier_in_pass(cmd);
+        return;
     }
+    ++prep_read_end;
+    end_pass(4);im.transition(cmd,VK_IMAGE_LAYOUT_GENERAL);full_barrier(cmd);
 }
 void prepare_attachment(Image &im,VkCommandBuffer cmd){
     bool in_open=open_pass.cmd && std::find(open_pass.images.begin(),open_pass.images.end(),&im)!=open_pass.images.end();
-    if(im.layout!=VK_IMAGE_LAYOUT_GENERAL && !in_open){end_open_pass();im.transition(cmd,VK_IMAGE_LAYOUT_GENERAL);}
+    if(im.layout!=VK_IMAGE_LAYOUT_GENERAL && !in_open){end_pass(4);im.transition(cmd,VK_IMAGE_LAYOUT_GENERAL);}
     im.last_write=++write_seq;
 }
 void provenance_image(const char *event,const tex_t *t,const Image &im,const view_t *v=nullptr){
@@ -3446,7 +3540,16 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
     for(auto &r:ranges){if(!merged.empty() && r.begin<merged.back().end){merged.back().end=std::max(merged.back().end,r.end);merged.back().written=merged.back().written||r.written;}else merged.push_back(r);}
     for(auto &r:merged){uint64_t base=r.begin,bytes=r.end-base;
         if(r.written){Buffer view,*b;
-            if(pending_view(base,bytes,1,view)){b=out.keep(readback_buffer(bytes));VkCommandBuffer cmd=recording_slot().cmd;end_open_pass();VkBufferCopy region{view.offset,b->offset,bytes};vkCmdCopyBuffer(cmd,view.buffer,b->buffer,1,&region);full_barrier(cmd);}
+            // np640：**这一处已回退**。去掉 end_open_pass() 让拷贝留在 pass 内，真机读数反而更差
+            //   （GPU 峰值 1.6 s → 3.1 s、pass 数 421 → 495）：tile 型 GPU 上 pass 中途做传输要 flush/restore
+            //   tile，比"断 pass 再开"更贵。真正把 pass 关掉的是 readback_buffer() 里那句 end_open_pass()
+            //   （`xbg_game.cpp:4566`），删掉这里那句不解决问题。
+            // np640: reverted. Dropping end_open_pass() to keep the copy inside the pass made the device reading
+            //   worse (GPU peak 1.6 s -> 3.1 s, passes 421 -> 495): on a tiled GPU a mid-pass transfer flushes and
+            //   restores the tile, which costs more than ending and reopening the pass. The pass is actually closed
+            //   by the end_open_pass() inside readback_buffer() (`xbg_game.cpp:4566`), so removing this one changed
+            //   little.
+            if(pending_view(base,bytes,1,view)){b=out.keep(readback_buffer(bytes));VkCommandBuffer cmd=recording_slot().cmd;end_pass(6);VkBufferCopy region{view.offset,b->offset,bytes};vkCmdCopyBuffer(cmd,view.buffer,b->buffer,1,&region);full_barrier(cmd);}
             else{cpu_access(base,bytes,3);b=out.keep(readback_buffer(bytes,reinterpret_cast<void*>(base),bytes));}out.storage.push_back({{base,bytes},b});out.written.push_back({{base,bytes},b});}
         else{snap_site=3;out.storage.push_back({{base,bytes},out.keep(snapshot(base,bytes,properties.limits.minStorageBufferOffsetAlignment))});snap_site=0;}
     }
@@ -3562,7 +3665,7 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                         else desc_memo_texel_fail=true;}   // the set then holds a per-frame view: not memoized
                     if(!res){
                     Buffer *buf=nullptr;uint64_t base=uint64_t(texture.mem),bytes=texture.L.size;
-                    if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){Buffer view;if(pending_view(base,bytes,1,view)){buf=out.keep(readback_buffer(bytes));VkCommandBuffer cmd=recording_slot().cmd;end_open_pass();VkBufferCopy region{view.offset,buf->offset,bytes};vkCmdCopyBuffer(cmd,view.buffer,buf->buffer,1,&region);full_barrier(cmd);}else{cpu_access(base,bytes,8);buf=out.keep(readback_buffer(bytes,texture.mem,bytes));}out.storage.push_back({{base,bytes},buf});out.written.push_back({{base,bytes},buf});}
+                    if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){Buffer view;if(pending_view(base,bytes,1,view)){buf=out.keep(readback_buffer(bytes));VkCommandBuffer cmd=recording_slot().cmd;end_pass(6);VkBufferCopy region{view.offset,buf->offset,bytes};vkCmdCopyBuffer(cmd,view.buffer,buf->buffer,1,&region);full_barrier(cmd);}else{cpu_access(base,bytes,8);buf=out.keep(readback_buffer(bytes,texture.mem,bytes));}out.storage.push_back({{base,bytes},buf});out.written.push_back({{base,bytes},buf});}
                     else{snap_site=4;buf=out.keep(snapshot(base,bytes,properties.limits.minTexelBufferOffsetAlignment));snap_site=0;texel_frame_keys.insert((base<<12)^bytes);++texel_binds;}
                     VkBufferViewCreateInfo v{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};v.buffer=buf->buffer;v.offset=buf->offset;v.format=format(texture.d.format);v.range=bytes;VkBufferView bv;{auto &cache=recording_slot().texel_views;std::array<uint64_t,4> key{uint64_t(v.buffer),v.offset,v.range,uint64_t(v.format)};auto f=cache.find(key);if(f!=cache.end())bv=f->second;else{VK(vkCreateBufferView(cfg.device,&v,nullptr,&bv));cache.emplace(key,bv);}}texel_views.push_back(bv);write.pTexelBufferView=&texel_views.back();}}
                 else{if(aspect(texture.d.format)!=VK_IMAGE_ASPECT_COLOR_BIT){auto prior=images.find(texture.serial);if(prior==images.end() || (!prior->second->uploaded && !prior->second->gpu_written))xbg_logf("NVN initial depth descriptor shader=%s stage=%u slot=%u id=%d serial=%llu format=%#x",shader.key.c_str(),ns,slot,id,(unsigned long long)texture.serial,texture.d.format);}
@@ -3986,7 +4089,13 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     VkQueryPool occlusion{};uint32_t occlusion_index=0;const bool counting=state.count_samples && !no_occlusion_queries && !ab_off("occ");
     const bool new_run=counting && (!occlusion_batch_enabled || ab_off("query") || !open_occlusion.cmd || open_pass.cmd!=c.command || open_pass.pass!=p.pass || open_pass.framebuffer!=p.framebuffer);
     if(new_run){need(cfg.enabled_core.occlusionQueryPrecise,"Precise samples-passed query disabled");occlusion_query(occlusion,occlusion_index);}   // a new pool ends the pass first
-    if(open_pass.cmd!=c.command || open_pass.pass!=p.pass || open_pass.framebuffer!=p.framebuffer){end_open_pass();
+    if(open_pass.cmd!=c.command || open_pass.pass!=p.pass || open_pass.framebuffer!=p.framebuffer){
+        // np639：记"为什么开新 pass"（0 没有 pass 开着 / 1 换了命令缓冲 / 2 换了 VkRenderPass / 3 换了 framebuffer）
+        // np639: record why a new pass is opened (0 nothing open / 1 other cmd buffer / 2 other VkRenderPass / 3 other framebuffer)
+        ++pass_open_by[!open_pass.cmd?0:(open_pass.cmd!=c.command?1:(open_pass.pass!=p.pass?2:3))];
+        if(p.framebuffer)pass_open_fbs.insert(uint64_t(uintptr_t(p.framebuffer)));
+        if(pass_seq_n<512)pass_seq[pass_seq_n++]={uint64_t(uintptr_t(p.framebuffer)),uint32_t(p.width),uint32_t(p.height),uint32_t(p.images.size())};
+        end_pass(5);
         // Proven full overwrite: begin with the color-DONT_CARE twin; open_pass keeps p.pass, so later draws continue this pass.
         if(p.pass_noload && quad_indices.empty() && !ab_off("noload") && ui_uy==0 && ui_vs==1 && first_draw_covers(p,prim,first,count,indexed,vertex_buffers,ib,index_type)){VkRenderPass keep=p.pass;p.pass=p.pass_noload;begin_pass(p,c);p.pass=keep;++noload_passes;}
         else begin_pass(p,c);
@@ -4007,6 +4116,13 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     need(viewport.width<=properties.limits.maxViewportDimensions[0] && -viewport.height<=properties.limits.maxViewportDimensions[1] && viewport.x>=properties.limits.viewportBoundsRange[0] && viewport.x+viewport.width<=properties.limits.viewportBoundsRange[1] && viewport.y>=properties.limits.viewportBoundsRange[0] && viewport.y<=properties.limits.viewportBoundsRange[1] && viewport.y+viewport.height>=properties.limits.viewportBoundsRange[0],"NVN viewport exceeds device bounds");
     if(!bc.has_vp || memcmp(&bc.vp,&viewport,sizeof viewport)){vkCmdSetViewport(c.command,0,1,&viewport);bc.vp=viewport;bc.has_vp=true;}else ++binds_skipped;
     VkRect2D sc=scissor(p);
+    // np647：**"填充 vs 顶点"判别探针**。`DM_PROBE_TINY_SCISSOR=<n>` 只对**没有颜色附件**的 pass
+    //   （阴影/深度预 pass）把 scissor 压到左上 n×n，其它状态一律不动。判据：那一段 pass 的 GPU 时间
+    //   塌下来 ⇒ 填充/overdraw 主导；几乎不变 ⇒ 顶点/驱动侧。默认 0 = 关，只用于 A/B。
+    // np647: a fill-vs-vertex probe. DM_PROBE_TINY_SCISSOR=<n> clamps the scissor to the top-left n x n for
+    //   passes with no color attachments (shadow / depth prepass) and changes nothing else. If that pass's GPU
+    //   time collapses it is fill/overdraw bound; if it barely moves it is vertex/driver bound. 0 = off.
+    if(g_probe_tiny_scissor>0 && p.color_slots==0){sc.offset={0,0};sc.extent={uint32_t(g_probe_tiny_scissor),uint32_t(g_probe_tiny_scissor)};}
     if(ui_uy>0 || ui_vs!=1){long so=g_ui_moff!=0?lround(ui_uy*p.height):0;int64_t y0=sc.offset.y<=0?0:sc.offset.y+so,y1=ui_vs!=1?int64_t(p.height):int64_t(sc.offset.y)+sc.extent.height+so;   // 剪裁跟着下移；从顶边起的不动（宿主上提的贴顶控件） | the scissor moves down with it; ones starting at the top edge stay (controls the host lifted to the top)
         if(y1>int64_t(p.height))y1=p.height;if(y1<y0)y1=y0;sc.offset.y=int32_t(y0);sc.extent.height=uint32_t(y1-y0);}
     if(!bc.has_sc || memcmp(&bc.sc,&sc,sizeof sc)){vkCmdSetScissor(c.command,0,1,&sc);bc.sc=sc;bc.has_sc=true;}else ++binds_skipped;
@@ -4030,7 +4146,7 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
         // (the bind cache replays state on the next draw; the driver just sees one extra pass gap).
         if(split_draw_count>=unsigned(N)){submit_split_segment();split_draw_count=0;}
      }}
-    if(d.needs_writeback() || capture.active){unsigned saved=cur_op;cur_op=62;end_open_pass();full_barrier(c.command);cur_op=saved;VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;vkCmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,nullptr,0,nullptr);}
+    if(d.needs_writeback() || capture.active){unsigned saved=cur_op;cur_op=62;end_pass(6);full_barrier(c.command);cur_op=saved;VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;vkCmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,nullptr,0,nullptr);}
     {DRAW_SCOPE(Writeback);if(capture.active){if(d.needs_writeback())gpu_sync(perf.sync_writeback);d.writeback();}else d.defer_writeback();}stats.draws.fetch_add(1,std::memory_order_relaxed);   // diagnostics only: a seq_cst add (LDADDAL) waits for every earlier store, ~2.7% of the render thread
     if(capture.active){capture_pass(p);d.capture_read_images();capture.active=false;}
 }
@@ -4212,7 +4328,7 @@ void clear_attachment(const p_clear_color *color,const p_clear_ds *depth,int sca
         if(!needs_preserve || ti.gpu_written || ti.uploaded){
             Commands c(true);Pass p;
             if(create_pass(p,c,-1,false,true)){
-                if(open_pass.cmd!=c.command || open_pass.pass!=p.pass || open_pass.framebuffer!=p.framebuffer){end_open_pass();begin_pass(p,c);open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;open_pass.depth_attached=state.rt.depth!=nullptr;++perf.passes;}
+                if(open_pass.cmd!=c.command || open_pass.pass!=p.pass || open_pass.framebuffer!=p.framebuffer){++pass_open_by[!open_pass.cmd?0:(open_pass.cmd!=c.command?1:(open_pass.pass!=p.pass?2:3))];if(p.framebuffer)pass_open_fbs.insert(uint64_t(uintptr_t(p.framebuffer)));end_pass(7);begin_pass(p,c);open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;open_pass.depth_attached=state.rt.depth!=nullptr;++perf.passes;}
                 if(depth)open_pass.depth_used=true;
                 VkClearRect r{scissor(p),0,1};if(r.rect.extent.width && r.rect.extent.height)vkCmdClearAttachments(c.command,1,&a,1,&r);
                 ++perf.folded_clears;return;
@@ -4516,7 +4632,7 @@ bool gpu_buffer_copy(uint64_t src,uint64_t dst,uint64_t n){preflight_cpu_reads()
     for(auto &w:pending_writebacks)if(dst<w.addr+w.bytes && dst+n>w.addr)return false;
     Buffer view;if(!pending_view(src,n,1,view))return false;
     invalidate_cpu_range(dst,n);
-    Slot &s=recording_slot();end_open_pass();Buffer b=readback_buffer(n);
+    Slot &s=recording_slot();end_pass(6);Buffer b=readback_buffer(n);
     VkBufferCopy region{view.offset,b.offset,n};vkCmdCopyBuffer(s.cmd,view.buffer,b.buffer,1,&region);full_barrier(s.cmd);
     pending_writebacks.push_back({dst,n,b,&s});return true;
 }
@@ -4646,10 +4762,20 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
         case OP_DRAW:{auto a=payload<p_draw>(p,n);draw(a.prim,a.first,a.count,nullptr);break;}
         case OP_DRAW_IDX:{auto a=payload<p_draw_idx>(p,n);draw(a.prim,0,a.count,&a);break;}
         case OP_DISPATCH:dispatch(payload<p_dispatch>(p,n));break;
-        // Commands ends the open pass and records a full barrier. The explicit barrier and finish() recorded the same barrier
-        // twice more with no command between them (3 per game barrier, ~130 per D2R fight frame), which Vulkan treats as one.
-        // A/B target barrier3 records all three again.
-        case OP_BARRIER:{Commands c;if(ab_off("barrier3")){VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;vkCmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&b,0,nullptr,0,nullptr);c.finish();}break;}
+        // np637：**内存屏障不再断 pass**。这一句原来是 `Commands c`——它的非 draw 构造与 `finish()` 各调一次
+        //   `end_open_pass()`，于是游戏每个 `nvnCommandBufferBarrier` 都把 8 附件 1600x900 的 pass 关掉重开。
+        //   场景帧因此变成 ~500 个 1-draw pass、附件带宽 ~10 GB/帧、GPU 1.1–1.6 s/帧（np634 逐 pass 剖析：
+        //   498 个 pass 里 460 个只画 1 个 draw，`pass_ends` 里 op28(BARRIER)=17.5/帧 ≥ op26(DRAW_IDX)=14.0/帧）。
+        //   屏障只是内存屏障（不带 layout 转换），在 render pass 内部发是合法的；pass 开着时把阶段掩码收窄到
+        //   图形阶段（ALL_COMMANDS 含 pass 外的阶段，验证层会报）。
+        // np637: a memory barrier must not end the pass. This used to be `Commands c`, whose non-draw ctor and
+        //   finish() each call end_open_pass(), so every nvnCommandBufferBarrier closed and reopened an 8-attachment
+        //   1600x900 pass -- the scene frame became ~500 single-draw passes, ~10 GB/frame of attachment traffic and
+        //   1.1-1.6 s of GPU time (np634 per-pass profile: 460 of 498 passes had exactly one draw, and pass_ends
+        //   showed op28(BARRIER)=17.5/frame vs op26(DRAW_IDX)=14.0/frame). A memory barrier carries no layout
+        //   transition, so issuing it inside a render pass is legal; while a pass is open the stage mask is narrowed
+        //   to graphics stages (ALL_COMMANDS includes stages outside the pass and the validation layer complains).
+        case OP_BARRIER:{Slot &s=recording_slot();++perf.ops;++s.ops;full_barrier_in_pass(s.cmd);break;}
         case OP_SET_TEX_POOL:{auto a=payload<p_set_pool>(p,n);need(a.pool,"Null texture pool");state.texture_pool=*a.pool;break;}
         case OP_SET_SAMP_POOL:{auto a=payload<p_set_pool>(p,n);need(a.pool,"Null sampler pool");state.sampler_pool=*a.pool;break;}
         case OP_COPY_B2T:copy_texture_buffer(payload<p_copy_b2t>(p,n),false);break;

@@ -385,7 +385,26 @@ struct Index {
             //   accessSync and heals a half-finished extraction. (A key is a content hash, so a changed bundle is a
             //   different key; to force a rewrite, delete that .xgs.)
             {
-              const extra: string[] = rawList(rm, 'shaders_extra').filter((s: string): boolean => s.endsWith('.gz'));
+              const allX: string[] = rawList(rm, 'shaders_extra');
+              // np634：**标记文件直投 files/**。引擎读开关标记的目录是 **shader 目录的父目录**
+              //   （xbg_game.cpp 里 marker() 会 `find_last_of('/')` 砍掉最后一段），而 shaders_extra 只会解到
+              //   shaders/ ⇒ 标记投不进去。约定：`<标记名>.mark.gz` 解到 filesDir 根、去掉 .mark.gz 后缀；
+              //   其余 .gz 照旧进 shaders/。没有标记文件时这段完全惰行。
+              // np634: markers go straight into files/. The engine reads switch markers from the PARENT of the
+              //   shader directory (marker() strips the last path component), while shaders_extra only extracts into
+              //   shaders/, so a marker could never land there. Convention: `<name>.mark.gz` extracts to filesDir
+              //   with the .mark.gz suffix dropped; every other .gz still goes to shaders/. Inert when absent.
+              for (const nm of allX.filter((s: string): boolean => s.endsWith('.mark.gz'))) {
+                const base: string = nm.substring(0, nm.length - 8);
+                try {
+                  const buf = rm.getRawFileContentSync('shaders_extra/' + nm);
+                  const w: number = dms2.writeFileGz(ctx.filesDir + '/' + base, buf.buffer);
+                  trace(ctx, '标记已投 files/' + base + '（' + w + ' 字节）');
+                } catch (err) {
+                  trace(ctx, '标记投递失败：' + nm + ' → ' + (err as Error).message);
+                }
+              }
+              const extra: string[] = allX.filter((s: string): boolean => s.endsWith('.gz') && !s.endsWith('.mark.gz'));
               if (extra.length > 0) {
                 let ok = 0;
                 let skip = 0;
@@ -560,6 +579,8 @@ struct Index {
             // np618/np620: this round only exists to capture dumps, so the noise sources are off (DM_NVN_LOG's
             // "unimplemented call" spam, DM_DRAW_TRACE's per-draw lines) -- the log budget is fixed, spend it on
             // ctlhex/datahex. The code dump now uses the real ncode (np619, capped at 32 KB).
+            // np647：判别探针用完已撤（默认关；要再跑 A/B 时加 `DM_PROBE_TINY_SCISSOR=32`）。
+            // np647: the probe is done, switched off again (add `DM_PROBE_TINY_SCISSOR=32` for another A/B).
             let envs = 'DM_NVN_LOG=1 DM_FS=1 DM_WATCH_STALL=30 DM_NVN_API_MAJOR=53 DM_DIAG_TICK=1 DM_SHADER_SKIP=1 DM_DRAW_TRACE=8 DM_CV_PROBE=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000';
             // romfs 双路（d1 瘦包）：
             //   A. HAP 里带 romfs/（fat 包，首次装机用）→ 照旧**每次点都重新解出**。
