@@ -2937,7 +2937,25 @@ void pstat_log(VkPipeline pl){
 // prefix were recorded by v2.0.1 without inlining (gfx-inline) and are dropped when read: inlined, the shader most likely
 // builds, and if it still crashes it is recorded again.
 namespace pipeguard{
-std::mutex mu;std::unordered_set<std::string> skip,told,proven;bool loaded=false;std::atomic<int> slots{0};
+std::mutex mu,serial;std::unordered_set<std::string> skip,told,proven;bool loaded=false,careful=false;std::atomic<int> slots{0};std::string crash_test;
+// np655：上游 fec76d1（#170/#203）的 pipeline guard——上次死时有在建的管线，这次启动就把还没
+//   建成过的管线一条一条建（careful：建之前拿同一把锁 serial、建完放）。预热线程每次按清单
+//   同样的顺序取，驱动在罪魁上再崩时，旁边线程上的也多半又在建，并发着建会把它们一起冤枉进
+//   gfx-pipe-skip；一条一条建，第二次死时在建的只有罪魁。已建成过的不排队，正常启动照常并行。
+//   测试钩子 DM_GFX_PIPE_CRASH_TEST=<键>：轮到建含这个着色器键的管线时进程当场 _exit（留下
+//   在建记号、不留崩溃转储）。
+//   对 Maleoon 直接相关：这颗驱动的 reset/-4 高发（np609 起的整条链），驱动死在自家编译器里时
+//   正好用这个把罪魁管线隔离出来，而不是整轮 reset 之后无从追查。
+// np655: upstream fec76d1 (#170/#203) pipeline guard. When the last boot died with pipelines in
+//   flight, this boot builds the not-yet-built ones one at a time (careful: take the same serial
+//   lock before the build, release after). Warm-up threads take the list in the same order every
+//   boot, so a second driver crash on the culprit has only the culprit in flight -- concurrent
+//   builds would wrongly blame their neighbours into gfx-pipe-skip. Already-built pipelines do not
+//   queue; normal boots stay parallel. Test hook DM_GFX_PIPE_CRASH_TEST=<key>: the process _exits
+//   when a pipeline holding that shader key is about to be built (in-flight marker stays, no dump).
+//   Directly relevant to Maleoon: this driver resets / returns -4 a lot (the whole np609+ chain),
+//   and when the driver dies inside its own compiler this isolates the culprit pipeline instead of
+//   leaving an unattributable reset.
 std::string base(){std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');return cut==std::string::npos?dir:dir.substr(0,cut);}
 std::string marker(){thread_local const int slot=slots.fetch_add(1);return base()+"/gfx-pipe-inflight."+std::to_string(slot);}
 // 有阶段认不出键（引擎自己的模块没登记）就返回空串：这条管线不进兜底，免得不同的管线撞成同一个条目。
@@ -2967,14 +2985,19 @@ void load(){
     for(auto &k:now){if(before.count(k))record_locked(k,"was being built when the last two boots ended");else{keep+=k+"\n";xbg_logf("NVN pipeline %s was being built when the last boot ended",k.c_str());}}
     if(keep.empty())remove(suspect.c_str());else if(FILE *f=fopen(suspect.c_str(),"wb")){fputs(keep.c_str(),f);fclose(f);}
     if(!skip.empty())xbg_logf("NVN pipelines skipped=%zu (gfx-pipe-skip)",skip.size());
+    careful=!now.empty();if(careful)xbg_logf("NVN pipelines not built yet are built one at a time this boot (%zu were being built when the last boot ended)",now.size());
+    if(const char *e=getenv("DM_GFX_PIPE_CRASH_TEST"))if(*e){crash_test=e;xbg_logf("NVN pipeline crash test armed for shader key %s",e);}
 }
 bool skipped(const std::string &key){if(key.empty())return false;load();std::lock_guard<std::mutex> l(mu);if(!skip.count(key))return false;if(told.insert(key).second)xbg_logf("NVN pipeline %s skipped (gfx-pipe-skip)",key.c_str());return true;}
 // 一条管线第一次建成之后就不再写记号：同样的着色器换状态再建不会走到编译器的另一条路，也省掉之后的文件操作。
 // Once a pipeline has built once it is no longer marked: rebuilding the same shaders with other state does not take the
 // compiler down a different path, and later builds do not pay for the file operations.
-thread_local bool marking=false;
-void begin(const std::string &key){if(key.empty()){marking=false;return;}load();{std::lock_guard<std::mutex> l(mu);marking=!proven.count(key);}if(marking)if(FILE *f=fopen(marker().c_str(),"wb")){fprintf(f,"%s\n",key.c_str());fclose(f);}}
-void end(const std::string &key,bool ok){if(!marking)return;marking=false;remove(marker().c_str());if(ok){std::lock_guard<std::mutex> l(mu);proven.insert(key);}}
+thread_local bool marking=false,holding=false;
+void begin(const std::string &key){if(key.empty()){marking=false;return;}load();bool one=false;{std::lock_guard<std::mutex> l(mu);marking=!proven.count(key);one=marking && careful;}
+    if(one){serial.lock();holding=true;}
+    if(marking)if(FILE *f=fopen(marker().c_str(),"wb")){fprintf(f,"%s\n",key.c_str());fclose(f);}
+    if(marking && !crash_test.empty() && key.find(crash_test)!=std::string::npos){xbg_logf("NVN pipeline crash test: exiting while building %s",key.c_str());_exit(134);}}
+void end(const std::string &key,bool ok){if(!marking)return;marking=false;remove(marker().c_str());if(ok){std::lock_guard<std::mutex> l(mu);proven.insert(key);}if(holding){holding=false;serial.unlock();}}
 }
 void pipeline_lookup(PipelineLease &out,const XbgPipelineKey &key,bool cacheable,const VkGraphicsPipelineCreateInfo *graphics,const VkComputePipelineCreateInfo *compute,bool may_skip=false){
     static std::string bytes;bytes.clear();   // reused key buffer (graphics thread only)
