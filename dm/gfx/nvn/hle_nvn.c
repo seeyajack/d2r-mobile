@@ -1205,6 +1205,13 @@ NVN(nvnCommandBufferSetLineWidth, void, NVNcommandBuffer *c, float w) { (void)c;
 NVN(nvnCommandBufferSetPointSize, void, NVNcommandBuffer *c, float s) { (void)c; (void)s; ONCE_LOG("[nvn] SetPointSize：点大小来自着色器"); }
 NVN(nvnCommandBufferSetScissor, void, NVNcommandBuffer *c, int x, int y, int w, int h) { *REC(c, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h}; }
 NVN(nvnCommandBufferSetDepthRange, void, NVNcommandBuffer *c, float n, float f) { *REC(c, OP_DEPTH_RANGE, p_depth_range) = (p_depth_range){n, f}; }
+// np660：游戏首次调用（np659 打穿 306 秒天花板后新深度）。NVN 语义：位域 0=禁用钳位，非 0=把
+// 片元深度钳到 [0,1]。宿主管线本就不钳位（depthClampEnable=VK_FALSE）⇒ 参数为 0 时行为一致；
+// 非 0 暂不支持（留痕），等画面验证阶段看是否可见。
+// np660: first-ever call (new depth reached after np659 broke the 306 s ceiling). NVN semantics: bitmask,
+//   0 = clamping disabled, nonzero = clamp fragment depth to [0,1]. Host pipelines are already
+//   depthClampEnable=VK_FALSE so the 0 case matches; nonzero is logged for now.
+NVN(nvnCommandBufferSetDepthClamp, void, NVNcommandBuffer *c, uint32_t mask) { (void)c; if (mask) ONCE_LOG("[nvn] SetDepthClamp mask=%#x：宿主暂不支持深度钳位（按禁用处理）", mask); }
 NVN(nvnCommandBufferBindProgram, void, NVNcommandBuffer *c, const NVNprogram *p, int stages) {
     *REC(c, OP_BIND_PROGRAM, p_bind_program) = (p_bind_program){snap_prog(p), stages};
 }

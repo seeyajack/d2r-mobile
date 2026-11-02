@@ -437,9 +437,37 @@ void check(VkResult r,const char *call) { if(r!=VK_SUCCESS) xbg_fatalf("%s faile
 // np651: do not FATAL on device loss. A real lost makes vkWaitForFences/present return -4 and the code used
 //   to xbg_fatalf; the same build sometimes ran 236 s and sometimes died at 50 s, i.e. a random penetration.
 //   Log once and return "not complete" instead, so the caller retries or the watchdog handles it.
+// np658：lost 时刻记账（lost_not_fatal 调）与冷却剩余毫秒（提交站点在 vkQueueSubmit 前调，
+// 返回 >0 就先睡这么多再交——让驱动 reset 恢复窗口安静过去，喂给 render_service 的
+// "Submit commandlist fail" 归零，连坐杀不再被触发）。DM_LOST_COOLDOWN_MS 可调，默认 2500。
+// np658: lost timestamp bookkeeping (from lost_not_fatal) and remaining-cooldown query (submitters call
+//   before vkQueueSubmit; >0 means sleep that long first) -- keep the driver recovery window quiet so
+//   render_service's fail counter stays at zero. DM_LOST_COOLDOWN_MS tunable, default 2500.
+static std::mutex g_lost_mu;static uint64_t g_lost_ns=0;
+static unsigned lost_cooldown_ms_env(){
+    static unsigned cached=0;static bool read=false;
+    if(!read){read=true;const char *e=getenv("DM_LOST_COOLDOWN_MS");cached=e?(unsigned)atoi(e):2500u;}
+    return cached;
+}
+static void lost_arm(){std::lock_guard<std::mutex> l(g_lost_mu);g_lost_ns=timing_clock();}
+static unsigned lost_cooldown_ms(){
+    std::lock_guard<std::mutex> l(g_lost_mu);
+    if(!g_lost_ns)return 0;
+    uint64_t elapsed=(timing_clock()-g_lost_ns)/1000000u;
+    unsigned cd=lost_cooldown_ms_env();
+    return elapsed>=cd?0u:cd-(unsigned)elapsed;
+}
 bool lost_not_fatal(VkResult r,const char *what){
     if(r!=VK_ERROR_DEVICE_LOST)return false;
     static int n=0;if(n++<8)xbg_logf("【红】%s 返回 device lost(-4) —— 不再 FATAL（第 %d 次）",what,n);
+    // np658：**冷却退避**。np657 复盘：render_service 按"5 分钟窗口内 Submit commandlist fail(13)
+    // 次数"记账，攒满就连坐 signal 9（37 次全发生在 reset 后 0.9~1.7s 的恢复窗口内 ⇒ 都是
+    // 我们的提交撞在驱动恢复期）。lost 时在这里记账，提交站点 submit 前用 lost_cooldown_ms() 睡掉。
+    // np658: cooldown backoff. np657 postmortem: render_service counts "Submit commandlist fail(13)" within a
+    //   5-minute window and group-kills the app when it fills up (all 37 hits landed 0.9~1.7 s after a reset,
+    //   i.e. our submits slamming into the driver's recovery window). lost_not_fatal arms it; submitters
+    //   sleep through the remaining window via lost_cooldown_ms() before submitting.
+    lost_arm();
     return true;
 }
 
@@ -1022,11 +1050,18 @@ void submit_split_segment(){
       cur_digest.serial=slot_serial;
       xbg_logf("【二分】段 %u 提交（draws=%u passes=%u）",split_seg,cur_digest.draws,cur_digest.passes);
       digest_ring[digest_at++&15u]=cur_digest;
+      // np658：同款冷却（切段路径也要在恢复窗口内保持安静）。
+      // np658: same cooldown (the split path must stay quiet during recovery too).
+      if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}
       VkResult sr=vkQueueSubmit(cfg.queue,1,&si,fence);
       // np632b：切段路径同款重试（np632 实测主路径三次穿透全兜住，切段路径也要兜）。
       if(sr!=VK_SUCCESS && retry_submit_enabled()){
-         for(int attempt=0;attempt<6 && sr!=VK_SUCCESS;++attempt){usleep(3000u<<attempt);sr=vkQueueSubmit(cfg.queue,1,&si,fence);}
-         for(int attempt=0;attempt<50 && sr!=VK_SUCCESS;++attempt){usleep(100000u);sr=vkQueueSubmit(cfg.queue,1,&si,fence);}
+         for(int attempt=0;attempt<6 && sr!=VK_SUCCESS;++attempt){usleep(3000u<<attempt);
+            if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}  // np661：同款冷却（切段路径）。
+            sr=vkQueueSubmit(cfg.queue,1,&si,fence);}
+         for(int attempt=0;attempt<50 && sr!=VK_SUCCESS;++attempt){usleep(100000u);
+            if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}  // np661：同款冷却（切段路径长宽限）。
+            sr=vkQueueSubmit(cfg.queue,1,&si,fence);}
          static int ok3=0;if(sr==VK_SUCCESS && ok3++<3)xbg_logf("【宽限】切段重试成功（段 %u）",split_seg);
       }
       if(sr!=VK_SUCCESS){xbg_logf("【红】二分段 %u 提交失败 %d —— 驱动在本段翻脸",split_seg,int(sr));
@@ -1095,6 +1130,9 @@ void submit_slots(bool wait){
             ++big_n;
          }
          cur_digest.serial=slot_serial;digest_ring[digest_at++&15u]=cur_digest;cur_digest=SubDigest{};
+         // np658：reset 恢复窗口内不敲队列（防 Submit commandlist fail 攒账被连坐杀）。
+         // np658: keep quiet inside the driver recovery window (avoids piling up Submit commandlist fail).
+         if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}
          VkResult sr=vkQueueSubmit(cfg.queue,1,&si,s.fence);
          // np631：**冷路径首提交重试**。vkQueueSubmit -4 时等 3ms 重试一次（默认开，DM_RETRY_SUBMIT=0 关）。
          // 依据：① 驱动自带恢复（系统日志 "Gpu is reset when queue submit. Recover queue error now."）；
@@ -1106,6 +1144,11 @@ void submit_slots(bool wait){
             static int rn=0;if(rn++<6)xbg_logf("【重试】vkQueueSubmit %d，开始指数退避（serial=%llu）",int(sr),(unsigned long long)slot_serial);
             for(int attempt=0;attempt<6 && sr!=VK_SUCCESS;++attempt){
                 usleep(3000u<<attempt);   // 3ms,6ms,12ms,24ms,48ms,96ms —— 指数退避，6 次累计约 189ms
+                // np661：重试的每次尝试也在冷却窗内 ⇒ 同样先睡掉剩余再敲（np660 复盘：CQ 失败从
+                // 37 降到 14 但没归零，剩余全来自重试循环每 100ms 敲一次）。
+                // np661: each retry attempt is also inside the cooldown window -- sleep the remainder first
+                //   (np660: CQ failures dropped 37->14 but not zero; the rest came from the retry loop).
+                if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}
                 sr=vkQueueSubmit(cfg.queue,1,&si,s.fence);
                 static int ok=0;if(sr==VK_SUCCESS && ok++<6)xbg_logf("【重试】第 %d 次尝试成功（%ums）",attempt+1,3u<<attempt);
             }
@@ -1114,6 +1157,9 @@ void submit_slots(bool wait){
             // 每 10 次报一行进度；全败才 FATAL（保持可观测）。这兜住的是"驱动 reset 流程超过 189ms"的场景。
             for(int attempt=0;attempt<50 && sr!=VK_SUCCESS;++attempt){
                 usleep(100000u);
+                // np661：长宽限同款（5 秒 × 每 100ms 一发 = 恢复窗口内最多 50 发，全部喂给记账）。
+                // np661: same for the long grace loop (5 s x every 100 ms = up to 50 knocks inside the window).
+                if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}
                 sr=vkQueueSubmit(cfg.queue,1,&si,s.fence);
                 static int ok2=0;if(sr==VK_SUCCESS && ok2++<3)xbg_logf("【宽限】长宽限第 %d 次尝试成功",ok2);
                 else if(attempt%10==9)xbg_logf("【宽限】已等待 %d 次（%ums）仍 -4",attempt+1,(attempt+1)*100);
@@ -5177,7 +5223,11 @@ extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
     return fence<=completed;
 }
 extern "C" void xbg_legacy_finish(){gfx_drain();std::lock_guard<std::recursive_mutex> lock(mutex);need(initialized,"Queue finish before Vulkan initialization");++perf.why_finish;complete_all();VK(vkQueueWaitIdle(cfg.queue));}
-static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();{SiteScope site(SITE_PRESENT);cur_op=61;TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");uint64_t present_begin=timing_clock();Image &im=get_image(texture,false);need(im.gpu_written,"Game tried to present a texture never rendered");Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);c.finish();submit_slots(false);int r;{CPU_SCOPE(Present);r=cfg.present(cfg.userdata,window->native,im.image,im.fmt,im.width,im.height,window->crop,window->interval);}
+static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();{SiteScope site(SITE_PRESENT);cur_op=61;TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");uint64_t present_begin=timing_clock();Image &im=get_image(texture,false);need(im.gpu_written,"Game tried to present a texture never rendered");Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);c.finish();submit_slots(false);int r;{CPU_SCOPE(Present);
+         // np658：reset 恢复窗口内先安静（present 也走队列，同样会喂 render_service 的失败计数）。
+         // np658: stay quiet during the recovery window (present also goes through the queue and feeds the counter).
+         if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}
+         r=cfg.present(cfg.userdata,window->native,im.image,im.fmt,im.width,im.height,window->crop,window->interval);}
          // np651：**present 也要兜底**。真 device lost 时 present 返回 -4，原来直接 `xbg_fatalf`
          //   ——np649/np650 两跑都死在这里（`FATAL: Game presentation failed: -4`），而同一份代码
          //   np648 能跑 236 秒，说明这是随机的 lost 穿透，不是确定性 bug。按提交路径同款重试；
@@ -5188,8 +5238,15 @@ static void xbg_present_texture_now(const win_t *window,const tex_t *texture){st
          //   drop this frame (no present, no presents++) and keep the process alive.
          if(r && retry_submit_enabled()){
              static int pn=0;if(pn++<3)xbg_logf("【重试】present %d，开始退避",int(r));
-             for(int a=0;a<6 && r;++a){usleep(3000u<<a);r=cfg.present(cfg.userdata,window->native,im.image,im.fmt,im.width,im.height,window->crop,window->interval);}
-             for(int a=0;a<20 && r;++a){usleep(100000u);r=cfg.present(cfg.userdata,window->native,im.image,im.fmt,im.width,im.height,window->crop,window->interval);}
+             // np658：先睡掉冷却窗再敲 present（present 也会触发队列错误被 render_service 记账）。
+             // np658: sleep through the cooldown before knocking on present (it also feeds the fail counter).
+             if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}
+             for(int a=0;a<6 && r;++a){usleep(3000u<<a);
+                 if(unsigned cd2=lost_cooldown_ms()){usleep(cd2*1000u);}  // np661：present 重试同款。
+                 r=cfg.present(cfg.userdata,window->native,im.image,im.fmt,im.width,im.height,window->crop,window->interval);}
+             for(int a=0;a<20 && r;++a){usleep(100000u);
+                 if(unsigned cd3=lost_cooldown_ms()){usleep(cd3*1000u);}  // np661：present 长宽限同款。
+                 r=cfg.present(cfg.userdata,window->native,im.image,im.fmt,im.width,im.height,window->crop,window->interval);}
              static int okp=0;if(!r && okp++<3)xbg_logf("【宽限】present 重试成功");
          }
          if(r){static int dn=0;if(dn++<8)xbg_logf("【红】present 失败 %d —— 丢掉这一帧（第 %d 次）",int(r),dn);return;}
