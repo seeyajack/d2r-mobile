@@ -431,6 +431,18 @@ VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SU
 void need(bool condition,const char *text) { if (!condition) xbg_fatalf("%s",text); }
 void check(VkResult r,const char *call) { if(r!=VK_SUCCESS) xbg_fatalf("%s failed: %d",call,int(r)); }
 #define VK(call) check((call),#call)
+// np651：**device lost 不再当场 FATAL**。真 lost 时 vkWaitForFences/present 返回 -4，原来直接
+//   xbg_fatalf；而同一份代码有的跑 236 秒、有的 50 秒就死，是随机穿透。这里统一改成"记一行红、
+//   按未完成返回"，让上层重试或看门狗接手（看门狗至少会 dump 现场，比硬死有用）。
+// np651: do not FATAL on device loss. A real lost makes vkWaitForFences/present return -4 and the code used
+//   to xbg_fatalf; the same build sometimes ran 236 s and sometimes died at 50 s, i.e. a random penetration.
+//   Log once and return "not complete" instead, so the caller retries or the watchdog handles it.
+bool lost_not_fatal(VkResult r,const char *what){
+    if(r!=VK_ERROR_DEVICE_LOST)return false;
+    static int n=0;if(n++<8)xbg_logf("【红】%s 返回 device lost(-4) —— 不再 FATAL（第 %d 次）",what,n);
+    return true;
+}
+
 uint32_t memory_type(uint32_t bits,VkMemoryPropertyFlags flags) {
     for(uint32_t i=0;i<memories.memoryTypeCount;i++)
         if((bits&(1u<<i)) && (memories.memoryTypes[i].propertyFlags&flags)==flags) return i;
@@ -5115,7 +5127,7 @@ extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
                 if(r==VK_TIMEOUT)return 0;
                 // 设备错误不能被 completed 快路吞掉；原 fatal 状态仍在 engine 下处理。
                 // Completion must not hide device errors; handle the original fatal state while holding engine.
-                if(r!=VK_SUCCESS){lock.lock();fold_completion_wait_stats();VK(r);}
+                if(r!=VK_SUCCESS){if(lost_not_fatal(r,"guest fence wait"))return 0;lock.lock();fold_completion_wait_stats();VK(r);}
                 XTRACE_BEGIN("dm-legacy-relock");const auto acquired=completion_wait.acquire(lock,fence,deadline);XTRACE_END();
                 XTRACE_COUNT("dm-legacy-relock-result", int(acquired));XTRACE_COUNT("dm-legacy-completed", completed.load());
                 if(acquired==xbg_completion::Acquire::Completed)return 1;
@@ -5125,7 +5137,7 @@ extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
                 XTRACE_BEGIN("dm-legacy-relock");lock.lock();XTRACE_END();XTRACE_COUNT("dm-legacy-relock-result", 0);
                 XTRACE_COUNT("dm-legacy-completed", completed.load());
                 block_ns[SITE_LEGACY_WAIT]+=b1-b0;++block_calls[SITE_LEGACY_WAIT];legacy_wait_ns+=b1-b0;
-                if(r==VK_TIMEOUT)return 0;VK(r);
+                if(r==VK_TIMEOUT)return 0;if(lost_not_fatal(r,"guest fence wait"))return 0;VK(r);
             }}
         retire_done();if(fence<=completed)return 1;}
     if(completion_path && deadline.expired())return fence<=completed;
@@ -5136,13 +5148,29 @@ extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
         if(!completion_path && timeout!=UINT64_MAX){auto elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count();remaining=uint64_t(elapsed)>=timeout?0:timeout-uint64_t(elapsed);}
         bool busy=vkGetFenceStatus(cfg.device,slot.fence)==VK_NOT_READY;uint64_t b0=busy?timing_clock():0;
         VkResult r=vkWaitForFences(cfg.device,1,&slot.fence,VK_TRUE,remaining);if(busy){block_ns[SITE_LEGACY_WAIT]+=timing_clock()-b0;++block_calls[SITE_LEGACY_WAIT];}
-        if(r==VK_TIMEOUT)return 0;VK(r);retire_slot(slot);
+        if(r==VK_TIMEOUT)return 0;if(lost_not_fatal(r,"slot fence wait"))return 0;VK(r);retire_slot(slot);
     }
     resolve_known_reports();if(pending_writebacks.empty()&&pending_reports.empty()){publish_completed(submitted);}
     return fence<=completed;
 }
 extern "C" void xbg_legacy_finish(){gfx_drain();std::lock_guard<std::recursive_mutex> lock(mutex);need(initialized,"Queue finish before Vulkan initialization");++perf.why_finish;complete_all();VK(vkQueueWaitIdle(cfg.queue));}
-static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();{SiteScope site(SITE_PRESENT);cur_op=61;TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");uint64_t present_begin=timing_clock();Image &im=get_image(texture,false);need(im.gpu_written,"Game tried to present a texture never rendered");Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);c.finish();submit_slots(false);int r;{CPU_SCOPE(Present);r=cfg.present(cfg.userdata,window->native,im.image,im.fmt,im.width,im.height,window->crop,window->interval);}if(r)xbg_fatalf("Game presentation failed: %d",r);++stats.presents;if(pass_prof_enabled && stats.presents.load()==pass_prof_frame)xbg_logf("NVN GPASS boundary frame=%llu slots=%u skipped_slots=%u reserved_queries=%u max_queries=%u max_slots=%u",(unsigned long long)pass_prof_frame,pass_prof_slots,pass_prof_skipped_slots,pass_prof_queries,pass_prof_query_limit,pass_prof_slot_limit);perf.present_cpu_ns+=timing_clock()-present_begin;perf_frame();if(provenance_file && stats.presents.load()>=provenance.target)provenance_close("END");if(capture.trace && stats.presents==capture.frame){capture_log("END frame=%llu events=%u bytes=%llu presentedSerial=%llu image=%p",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes,(unsigned long long)texture->serial,(void*)im.image);fclose(capture.trace);capture.trace=nullptr;capture.active=false;xbg_logf("NVN one-frame capture complete frame=%llu events=%u bytes=%llu",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes);}}timing_boundary();}
+static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();{SiteScope site(SITE_PRESENT);cur_op=61;TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");uint64_t present_begin=timing_clock();Image &im=get_image(texture,false);need(im.gpu_written,"Game tried to present a texture never rendered");Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);c.finish();submit_slots(false);int r;{CPU_SCOPE(Present);r=cfg.present(cfg.userdata,window->native,im.image,im.fmt,im.width,im.height,window->crop,window->interval);}
+         // np651：**present 也要兜底**。真 device lost 时 present 返回 -4，原来直接 `xbg_fatalf`
+         //   ——np649/np650 两跑都死在这里（`FATAL: Game presentation failed: -4`），而同一份代码
+         //   np648 能跑 236 秒，说明这是随机的 lost 穿透，不是确定性 bug。按提交路径同款重试；
+         //   重试仍失败就**丢掉这一帧**（不 present、不加 presents），进程继续活。
+         // np651: the present path needs the same fallback. On a real device loss present returns -4 and the
+         //   code used to call xbg_fatalf -- np649/np650 both died here while the same build (np648) ran for
+         //   236 s, i.e. a random lost, not a deterministic bug. Retry like the submit path; if it still fails,
+         //   drop this frame (no present, no presents++) and keep the process alive.
+         if(r && retry_submit_enabled()){
+             static int pn=0;if(pn++<3)xbg_logf("【重试】present %d，开始退避",int(r));
+             for(int a=0;a<6 && r;++a){usleep(3000u<<a);r=cfg.present(cfg.userdata,window->native,im.image,im.fmt,im.width,im.height,window->crop,window->interval);}
+             for(int a=0;a<20 && r;++a){usleep(100000u);r=cfg.present(cfg.userdata,window->native,im.image,im.fmt,im.width,im.height,window->crop,window->interval);}
+             static int okp=0;if(!r && okp++<3)xbg_logf("【宽限】present 重试成功");
+         }
+         if(r){static int dn=0;if(dn++<8)xbg_logf("【红】present 失败 %d —— 丢掉这一帧（第 %d 次）",int(r),dn);return;}
+         ++stats.presents;if(pass_prof_enabled && stats.presents.load()==pass_prof_frame)xbg_logf("NVN GPASS boundary frame=%llu slots=%u skipped_slots=%u reserved_queries=%u max_queries=%u max_slots=%u",(unsigned long long)pass_prof_frame,pass_prof_slots,pass_prof_skipped_slots,pass_prof_queries,pass_prof_query_limit,pass_prof_slot_limit);perf.present_cpu_ns+=timing_clock()-present_begin;perf_frame();if(provenance_file && stats.presents.load()>=provenance.target)provenance_close("END");if(capture.trace && stats.presents==capture.frame){capture_log("END frame=%llu events=%u bytes=%llu presentedSerial=%llu image=%p",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes,(unsigned long long)texture->serial,(void*)im.image);fclose(capture.trace);capture.trace=nullptr;capture.active=false;xbg_logf("NVN one-frame capture complete frame=%llu events=%u bytes=%llu",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes);}}timing_boundary();}
 extern "C" void xbg_legacy_read_texels(const tex_t *t,unsigned level,unsigned layer,const NVNcopyRegion *r,uint8_t *dst,size_t row,size_t image){gfx_drain();std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();need(t&&r&&dst,"Invalid ReadTexels arguments");auto found=images.find(t->serial);if(found==images.end() || !found->second->gpu_written){int bw,bh,bpp=nvn_fmt_bpb(t->d.format,&bw,&bh);need(bpp && r->xoffset==0 && r->yoffset==0 && r->zoffset==0 && r->depth==1 && uint32_t(r->width)==std::max(1u,t->d.width>>level) && uint32_t(r->height)==std::max(1u,t->d.height>>level),"CPU ReadTexels partial region unsupported");need(!(t->d.flags&0x10),"Linear CPU ReadTexels not implemented");need(nvn_deswizzle(&t->d,level,layer,t->mem,dst,row)==0,"ReadTexels deswizzle failed");}
     else{p_copy_b2t p{};p.src=uint64_t(dst);p.tex=t;p.has_view=1;p.view.set_levels=p.view.set_layers=1;p.view.base_level=level;p.view.nlevels=1;p.view.min_layer=layer;p.view.nlayers=1;p.r=*r;int64_t old=state.copy_stride,old_image=state.copy_image_stride;state.copy_stride=row;state.copy_image_stride=image;copy_texture_buffer(p,true);state.copy_stride=old;state.copy_image_stride=old_image;}}
 
