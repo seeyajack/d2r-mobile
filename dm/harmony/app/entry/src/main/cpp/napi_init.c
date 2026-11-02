@@ -838,6 +838,28 @@ static napi_value Start(napi_env env, napi_callback_info info) {
             char kv[256]; snprintf(kv, sizeof kv, "%s", *e);
             OH_LOG_Print(LOG_APP, LOG_INFO, DM_LOG_DOMAIN, "dm-host", "start: env %{public}s", kv);
         }
+    // np653：鸿蒙缺省值（照抄上游 dm/harmony/native/napi_ohos.c 的缺省值块）。工程壳的启动入口
+    //   一直是这份 napi_init.c，而上游那套实测缺省值（Pura X / Mate90 实测，见 dm/harmony/README.md
+    //   的性能一节）只在 napi_ohos.c 里 ⇒ **一个都没生效**：np652 定性出 read_preflight=1 让
+    //   提交侧每帧付 ~236 ms 的 fence 全排空（真实 CPU 活才 ~207 ms），warp32 / readback-cached /
+    //   nan_minmax / pipe_memo 等也全在引擎默认的关闭位。这里补齐，全部只在环境里没有时设
+    //   （dm/env 与标记文件仍可逐项覆盖）。
+    // np653: HarmonyOS defaults (ported from upstream dm/harmony/native/napi_ohos.c). The app-shell entry
+    //   is this file, and upstream's measured defaults never applied here: np652 showed read_preflight=1
+    //   costing ~236 ms/frame of fence drains on the submit side (real CPU work is only ~207 ms), with
+    //   warp32 / readback-cached / nan_minmax / pipe_memo all left at the engine's off defaults. Ported
+    //   verbatim; each is set only when absent (dm/env and marker files still override individually).
+    setenv("DM_3D_SCALE_GPU", "1", 0);   // 动态 3D 比例按 GPU 耗时调（发热后 GPU 成瓶颈时降，最低 0.40）
+    setenv("DM_3D_SCALE_DYN", "1", 0);   // 3D 比例与下限由 front_game_res 按出图分辨率定
+    setenv("DM_NVN_SYNC", "0", 0);       // 翻译走异步线程（同 iOS；安卓走同步）；标记 dm/nvn-async 写 0 退回同步
+    setenv("DM_GFX_DEFER_EVENTS", "2", 0);       // 事件延后（同安卓）
+    setenv("DM_GFX_READ_PREFLIGHT", "0", 0);     // 绘制前不无条件等待写回，读点按区间判（同安卓）
+    setenv("DM_GFX_READBACK_CACHED", "1", 0);    // 读回缓冲用带缓存内存（马良最佳实践）
+    setenv("DM_GFX_PIPE_MEMO", "1", 0); setenv("DM_GFX_QUAD_DERIVATIVES", "1", 0); setenv("DM_GFX_WARP32", "1", 0); setenv("DM_GFX_NAN_MINMAX", "1", 0);
+    setenv("DM_GFX_NATIVE_BC", "0", 0);          // 马良不支持 BC 贴图（textureCompressionBC = 0），软解
+    setenv("DM_GFX_ASYNC_POOL_RESET", "0", 0); setenv("DM_GFX_WB_SKIP", "0", 0);
+    setenv("DM_GFX_NOLOAD", "1", 0);             // 首绘可证全覆盖的通道不读入颜色附件
+    setenv("DM_PACE_ADAPT", "1", 0);             // 自适应出图档：游戏帧按撑得住的最高整除档均匀放行（hle_nvn.c）
     // 宿主 shell 的读表约定：设 DM_DERIVED 后显式调（弱引用，没有这个接口的构建跳过）
     char derived[1300];
     snprintf(derived, sizeof derived, "%s/derived.tsv", g_runtime);
