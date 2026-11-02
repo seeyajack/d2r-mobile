@@ -193,7 +193,7 @@ def export(key, stage, c1, spv, res):
         vid, tid, sc = by_bind[vbind(b['binding'])]
         off = b['cb_offset'] * 4 if b['cb_slot'] == 0 else None
         if off is None: raise ValueError(f'存储缓冲不在 c0：{b}')
-        if stage == 'cs' and 0x210 <= off < 0x310 and (off - 0x210) % 16 == 0: nvn = {'kind': 'uniform_pointer', 'slot': (off - 0x210) // 16}
+        if stage == 'cs' and 0x210 <= off <= 0x310 and (off - 0x210) % 16 == 0: nvn = {'kind': 'uniform_pointer', 'slot': (off - 0x210) // 16}
         elif sbase is not None and 0 <= off - sbase < 0x100 and (off - sbase) % 16 == 0: nvn = {'kind': 'storage_pointer', 'slot': (off - sbase) // 16}
         else: raise ValueError(f'存储缓冲槽解不出：{stage} off={off:#x}')
         descs.append({'name': names.get(vid, ''), 'binding': vbind(b['binding']), 'type': 'storage_buffer', 'count': 1,
