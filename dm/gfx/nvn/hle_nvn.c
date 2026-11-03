@@ -1306,7 +1306,7 @@ NVN(nvnCommandBufferDrawArrays, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, 
 //   instances with ibuf=0 as the "non-indexed" marker; the replay side routes ibuf==0 to vkCmdDraw.
 NVN(nvnCommandBufferDrawArraysInstanced, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, int first, int n, int inst) {
     if (inst == 1) { *REC(c, OP_DRAW, p_draw) = (p_draw){pr, first, n}; return; }   // inst=1 退化为普通 DrawArrays
-    *REC(c, OP_DRAW_IDX, p_draw_idx) = (p_draw_idx){pr, 0, n, 0, 0, inst, 0};      // ibuf=0 = 非索引
+    *REC(c, OP_DRAW_IDX, p_draw_idx) = (p_draw_idx){pr, 0, n, first, 0, inst, 0};   // ibuf=0 = 非索引；first 借 base_vertex 携带
 }
 NVN(nvnCommandBufferDrawElementsInstanced, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, int n, NVNbufferAddress ib,
     int bv, int bi, int inst) {

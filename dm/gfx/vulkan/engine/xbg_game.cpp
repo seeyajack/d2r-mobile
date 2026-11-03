@@ -439,14 +439,17 @@ void check(VkResult r,const char *call) { if(r!=VK_SUCCESS) xbg_fatalf("%s faile
 //   Log once and return "not complete" instead, so the caller retries or the watchdog handles it.
 // np658：lost 时刻记账（lost_not_fatal 调）与冷却剩余毫秒（提交站点在 vkQueueSubmit 前调，
 // 返回 >0 就先睡这么多再交——让驱动 reset 恢复窗口安静过去，喂给 render_service 的
-// "Submit commandlist fail" 归零，连坐杀不再被触发）。DM_LOST_COOLDOWN_MS 可调，默认 2500。
+// "Submit commandlist fail" 归零，连坐杀不再被触发）。DM_LOST_COOLDOWN_MS 可调。
+// np662：默认 2500 → **8000**：np662 实测该轮 17 次 CQ fail 全部落在 arm 后 2.5s 之外
+// （3.3~7.4s，比 np657 时代的 0.9~1.7s 长得多）——驱动恢复时长本身有波动，冷却要盖住 p75。
 // np658: lost timestamp bookkeeping (from lost_not_fatal) and remaining-cooldown query (submitters call
-//   before vkQueueSubmit; >0 means sleep that long first) -- keep the driver recovery window quiet so
-//   render_service's fail counter stays at zero. DM_LOST_COOLDOWN_MS tunable, default 2500.
+//   before vkQueueSubmit; >0 means sleep that long first). DM_LOST_COOLDOWN_MS tunable.
+// np662: default 2500 -> **8000** -- np662 measured all 17 CQ fails landing 3.3~7.4 s after arm
+//   (much longer than np657's 0.9~1.7 s); driver recovery time itself varies, cover its p75.
 static std::mutex g_lost_mu;static uint64_t g_lost_ns=0;
 static unsigned lost_cooldown_ms_env(){
     static unsigned cached=0;static bool read=false;
-    if(!read){read=true;const char *e=getenv("DM_LOST_COOLDOWN_MS");cached=e?(unsigned)atoi(e):2500u;}
+    if(!read){read=true;const char *e=getenv("DM_LOST_COOLDOWN_MS");cached=e?(unsigned)atoi(e):8000u;}
     return cached;
 }
 static void lost_arm(){std::lock_guard<std::mutex> l(g_lost_mu);g_lost_ns=timing_clock();}
@@ -4851,10 +4854,11 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
         case OP_DRAW:{auto a=payload<p_draw>(p,n);draw(a.prim,a.first,a.count,nullptr);break;}
         case OP_DRAW_IDX:{auto a=payload<p_draw_idx>(p,n);
             // np662：ibuf==0 = DrawArraysInstanced 的"非索引"约定（hle_nvn.c 同日新增）——
-            // 走非索引实例化路径，不碰索引缓冲。
+            // 走非索引实例化路径，不碰索引缓冲。first 借 base_vertex 携带（p_draw_idx 无 first 字段）。
             // np662: ibuf==0 marks the non-indexed DrawArraysInstanced convention (added same day in
-            //   hle_nvn.c) -- route to the non-indexed instanced path, don't touch the index buffer.
-            if(!a.ibuf){draw(a.prim,a.first,a.count,nullptr,uint32_t(a.instances>0?a.instances:1));break;}
+            //   hle_nvn.c) -- route to the non-indexed instanced path; `first` rides in base_vertex
+            //   (p_draw_idx has no first field).
+            if(!a.ibuf){draw(a.prim,a.base_vertex,a.count,nullptr,uint32_t(a.instances>0?a.instances:1));break;}
             draw(a.prim,0,a.count,&a);break;}
         case OP_DISPATCH:dispatch(payload<p_dispatch>(p,n));break;
         // np637：**内存屏障不再断 pass**。这一句原来是 `Commands c`——它的非 draw 构造与 `finish()` 各调一次
