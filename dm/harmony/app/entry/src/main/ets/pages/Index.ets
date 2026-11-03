@@ -620,7 +620,7 @@ struct Index {
             // np657: A/B -- disable async translation. DM_NVN_SYNC=0 means async (the default), 1 = sync.
             //   Pass 1 explicitly here: past the 306 s hang point = the translation thread is part of the
             //   job-dependency ring; still hangs = the ring is translation-independent, go dump the ring buffer.
-            let envs = 'DM_NVN_SYNC=1 DM_FS=1 DM_WATCH_STALL=90 DM_NVN_API_MAJOR=53 DM_DIAG_TICK=1 DM_SHADER_SKIP=1 DM_CV_PROBE=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000 DM_PRESENT_PROBE_EVERY_MS=20000 DM_DRAW_STATE=1 DM_PRESENT_PROBE_SERIALS=222,6224';
+            let envs = 'DM_NVN_SYNC=1 DM_FS=1 DM_WATCH_STALL=90 DM_NVN_API_MAJOR=53 DM_DIAG_TICK=1 DM_SHADER_SKIP=1 DM_CV_PROBE=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000 DM_PRESENT_PROBE_EVERY_MS=20000 DM_DRAW_STATE=1 DM_VERTEX_DUMP=1 DM_PRESENT_PROBE_SERIALS=222,6224';
             // romfs 双路（d1 瘦包）：
             //   A. HAP 里带 romfs/（fat 包，首次装机用）→ 照旧**每次点都重新解出**。
             //      ⚠ 不能用 pathExists 判"解没解过"：本机 fs.listFileSync 对不存在的路径也不抛

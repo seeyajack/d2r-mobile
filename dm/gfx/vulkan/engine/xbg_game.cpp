@@ -4277,6 +4277,28 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     {static int want=-1;if(want<0){const char *e=getenv("DM_DRAW_STATE");want=(e&&*e=='1')?0:-2;}
      if(want==0){static int n=0;if(n++<20)xbg_logf("[绘制] #%d prim=%d count=%d indexed=%d instances=%d mask=%#x blendEn=%#x dt=%d dw=%d df=%d st=%d cull=%d vp=%gx%g sc=%ux%u",
         n,prim,count,indexed?1:0,indexed?indexed->instances:instances,state.mask.mask,state.color.blend_en,int(state.ds.dt),int(state.ds.dw),int(state.ds.df),int(state.ds.st),state.poly.cull,state.viewport.width,state.viewport.height,unsigned(scissor(p).extent.width),unsigned(scissor(p).extent.height));}}
+    // np687：**顶点/索引流 dump**（DM_VERTEX_DUMP=1）。合成 draw 是 6 索引全屏 quad、状态全对却一个像素都没有，
+    //   最可能是顶点数据退化（位置全 0 / w=0 被裁掉）或索引错位。这里只打前 4 个"目标是窗口缓冲"的 draw。
+    // np687: vertex/index stream dump. The composite draw is a 6-index fullscreen quad with all state correct yet
+    //   writes nothing; the prime suspect is degenerate vertex data (positions 0, or w=0 -> clipped) or a bad
+    //   index stream. Only the first 4 draws whose target is a window buffer.
+    {static int vd=-1;if(vd<0){const char *e=getenv("DM_VERTEX_DUMP");vd=(e&&*e=='1')?0:-2;}
+     if(vd==0 && p.images.n && win_serial_match(p.images.v[0]?p.images.v[0]->source.serial:0)){
+        static int n=0;if(n++<4){
+            xbg_logf("[顶点] #%d 目标serial=%llu %ux%u 流数=%zu count=%d indexed=%d prim=%d",n,
+                (unsigned long long)p.images.v[0]->source.serial,p.width,p.height,vertex_buffers.size(),count,indexed?1:0,prim);
+            for(size_t i=0;i<vertex_buffers.size() && i<3;i++){const Buffer *vb=vertex_buffers[i].second;if(!vb)continue;
+                char hex[3*64+1]={0};size_t nb=vb->size<64?vb->size:64;const uint8_t *q=static_cast<const uint8_t*>(vb->mapped);
+                for(size_t k=0;k<nb;k++)snprintf(hex+3*k,4,"%02x ",q[k]);
+                xbg_logf("[顶点]   流%zu binding=%u size=%zu 前%zu字节: %s",i,vertex_buffers[i].first,vb->size,nb,hex);}
+            if(state.shader[0])xbg_logf("[顶点]   顶点着色器 key=%s 声明输入=%zu 类=%zu 属性数=%zu",state.shader[0]->key.c_str(),state.shader[0]->inputs.size(),state.shader[0]->input_classes.size(),attributes.size());
+            else xbg_logf("[顶点]   顶点着色器为空（属性数=%zu）",attributes.size());
+            for(size_t i=0;i<bindings.size() && i<4;i++)xbg_logf("[顶点]   绑定%zu binding=%u stride=%u rate=%d",i,bindings[i].binding,bindings[i].stride,int(bindings[i].inputRate));
+            for(size_t i=0;i<attributes.size() && i<8;i++)xbg_logf("[顶点]   属性%zu loc=%u binding=%u fmt=%d off=%u",i,attributes[i].location,attributes[i].binding,int(attributes[i].format),attributes[i].offset);
+            if(ib){char hex[3*12+1]={0};size_t nb=ib->size<12?ib->size:12;const uint8_t *q=static_cast<const uint8_t*>(ib->mapped);
+                for(size_t k=0;k<nb;k++)snprintf(hex+3*k,4,"%02x ",q[k]);
+                xbg_logf("[顶点]   索引 size=%zu 前%zu字节: %s",ib->size,nb,hex);}
+        }}}
     if(indexed){if(bc.ib!=ib->buffer || bc.ibo!=ib->offset || bc.it!=index_type){vkCmdBindIndexBuffer(c.command,ib->buffer,ib->offset,index_type);bc.ib=ib->buffer;bc.ibo=ib->offset;bc.it=index_type;}else ++binds_skipped;vkCmdDrawIndexed(c.command,count,indexed->instances,0,indexed->base_vertex,indexed->base_instance);}else vkCmdDraw(c.command,count,instances,first,first_instance);
     if(!occlusion_batch_enabled)end_occlusion_query();c.finish();++perf.draws;++pass_prof_draws;pass_prof_verts+=uint64_t(uint32_t(count))*instances;
     // np629：提交二分的切点。只在 pass 边界切（本 draw 刚 finish、若无 open pass 就是边界）；
