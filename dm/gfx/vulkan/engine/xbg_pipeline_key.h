@@ -6,6 +6,17 @@
 // Exact, pointer/padding-free keys for the backend's pipeline definitions.
 // Unknown extension/specialization/immutable-sampler state bypasses the cache.
 // No hash-only equality: the cache compares all serialized bytes.
+// np695: the depth-clip pNext nodes (np693/np694: DepthClipControl on the viewport state,
+//   DepthClipState on the rasterization state) carry no per-pipeline variability within a process --
+//   negativeOneToOne=TRUE and depthClipEnable=FALSE are constants, and the attach switches are read
+//   once from env/device support. They are skipped so the key bytes stay identical to the pre-np693
+//   format: the accumulated warm list (vk-pipeline-list.bin) and the shipped seed keep matching.
+//   A draw whose chain holds an UNKNOWN pNext still bypasses. If DM_DEPTH_CLAMP / DM_CLIP_NEG_ONE is
+//   ever flipped on a device that already has a list, clear files/vk-pipeline-list.bin first --
+//   the key cannot tell the two modes apart, and the warmer would otherwise serve pipelines built
+//   in the other clip mode.
+// np695: the depth-clip pNext nodes carry no in-process variability (see above), so they are skipped
+//   instead of rejected; any other pNext still bypasses the cache.
 struct XbgPipelineKeyView {const uint32_t *words;uint32_t count;bool valid;};
 struct XbgPipelineKey {
     static constexpr uint32_t Capacity=4096;
@@ -48,12 +59,24 @@ inline bool xbg_stage_key(XbgPipelineKey &k,const VkPipelineShaderStageCreateInf
     k.u(s.flags);k.u(s.stage);k.q(xbg_module_id_hook?xbg_module_id_hook(s.module):(uint64_t)s.module);return k.valid;
 }
 inline void xbg_stencil_key(XbgPipelineKey &k,const VkStencilOpState &s){k.u(s.failOp);k.u(s.passOp);k.u(s.depthFailOp);k.u(s.compareOp);k.u(s.compareMask);k.u(s.writeMask);k.u(s.reference);}
+// np695: known depth-clip pNext nodes are skipped (they carry no in-process variability -- see the
+//   header comment); returns non-null when some UNKNOWN node is chained, which the caller rejects.
+// np695: skip the known depth-clip pNext nodes; a non-null return means an unknown node is present.
+inline const void *xbg_pnext_depth_skip(const void *p){
+    while(p){const VkBaseInStructure *n=(const VkBaseInStructure *)p;
+        if(n->sType==VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT)p=((const VkPipelineViewportDepthClipControlCreateInfoEXT *)p)->pNext;
+        else if(n->sType==VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT)p=((const VkPipelineRasterizationDepthClipStateCreateInfoEXT *)p)->pNext;
+        else return p;}
+    return nullptr;
+}
 inline bool xbg_graphics_pipeline_key(XbgPipelineKey &k,const VkGraphicsPipelineCreateInfo &p,XbgPipelineKeyView layout,XbgPipelineKeyView pass){
     if(p.pNext || p.basePipelineHandle || (p.flags&VK_PIPELINE_CREATE_DERIVATIVE_BIT) || !p.pStages || !p.pVertexInputState || !p.pInputAssemblyState || !p.pViewportState || !p.pRasterizationState || !p.pMultisampleState || !p.pDepthStencilState || !p.pColorBlendState || !p.pDynamicState)return false;
     k.u(1);k.piece(layout);k.piece(pass);k.u(p.flags);k.u(p.subpass);k.u(p.stageCount);
     for(uint32_t i=0;i<p.stageCount;i++)if(!xbg_stage_key(k,p.pStages[i]))return false;
     const auto &v=*p.pVertexInputState;const auto &a=*p.pInputAssemblyState;const auto &vp=*p.pViewportState;const auto &r=*p.pRasterizationState;const auto &m=*p.pMultisampleState;const auto &d=*p.pDepthStencilState;const auto &b=*p.pColorBlendState;const auto &dy=*p.pDynamicState;
-    if(v.pNext || a.pNext || vp.pNext || r.pNext || m.pNext || d.pNext || b.pNext || dy.pNext || (p.pTessellationState && p.pTessellationState->pNext))return false;
+    if(v.pNext || a.pNext || m.pNext || d.pNext || b.pNext || dy.pNext || (p.pTessellationState && p.pTessellationState->pNext))return false;
+    // np695: vp/rs may chain the depth-clip nodes (np693/np694); unknown chains still bypass.
+    if(xbg_pnext_depth_skip(vp.pNext) || xbg_pnext_depth_skip(r.pNext))return false;
     if((v.vertexBindingDescriptionCount && !v.pVertexBindingDescriptions) || (v.vertexAttributeDescriptionCount && !v.pVertexAttributeDescriptions) || (b.attachmentCount && !b.pAttachments) || (dy.dynamicStateCount && !dy.pDynamicStates))return false;
     k.u(v.flags);k.u(v.vertexBindingDescriptionCount);for(uint32_t i=0;i<v.vertexBindingDescriptionCount;i++){const auto &x=v.pVertexBindingDescriptions[i];k.u(x.binding);k.u(x.stride);k.u(x.inputRate);}
     k.u(v.vertexAttributeDescriptionCount);for(uint32_t i=0;i<v.vertexAttributeDescriptionCount;i++){const auto &x=v.pVertexAttributeDescriptions[i];k.u(x.location);k.u(x.binding);k.u(x.format);k.u(x.offset);}

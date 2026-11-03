@@ -2960,6 +2960,16 @@ bool build(const Rec &rec){
     b.attachmentCount=nb;b.pAttachments=ba.data();for(float &x:b.blendConstants)x=r.f();
     VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};dy.flags=r.u();uint32_t nd=r.u();if(nd>64)return false;std::vector<VkDynamicState> ds(nd);for(auto &x:ds)x=VkDynamicState(r.u());dy.dynamicStateCount=nd;dy.pDynamicStates=ds.data();
     if(r.bad || r.i!=r.n)return false;
+    // np695: warm-rebuilt pipelines must carry the same depth-clip pNext as the on-demand path
+    //   (np693/np694) -- the key skips these nodes, so a draw served from the warm list would
+    //   otherwise get a pipeline without the GL clip space and be clipped away again.
+    // np695: warm-rebuilt pipelines must attach the same depth-clip pNext as the on-demand path
+    //   (the key skips these nodes), otherwise draws taken from the warm list lose the GL clip space
+    //   again and get clipped in full.
+    VkPipelineViewportDepthClipControlCreateInfoEXT clipctl{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT};
+    VkPipelineRasterizationDepthClipStateCreateInfoEXT clipst{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT};
+    if(clip_neg_one()){clipctl.negativeOneToOne=VK_TRUE;clipctl.pNext=vp.pNext;vp.pNext=&clipctl;}
+    if(depth_clamp_on()){clipst.depthClipEnable=VK_FALSE;clipst.pNext=rs.pNext;rs.pNext=&clipst;}
     ci.stageCount=ns;ci.pStages=st;ci.pVertexInputState=&v;ci.pInputAssemblyState=&a;ci.pTessellationState=ht?&t:nullptr;ci.pViewportState=&vp;ci.pRasterizationState=&rs;ci.pMultisampleState=&m;ci.pDepthStencilState=&d;ci.pColorBlendState=&b;ci.pDynamicState=&dy;ci.layout=layout;ci.renderPass=pass;
     const std::string guard=pipeguard::graphics_key(rec.keys);if(pipeguard::skipped(guard))return false;
     uint64_t c0=timing_clock();VkPipeline pl;pipeguard::begin(guard);const VkResult made=vkCreateGraphicsPipelines(cfg.device,pipeline_cache,1,&ci,nullptr,&pl);pipeguard::end(guard,made==VK_SUCCESS);
