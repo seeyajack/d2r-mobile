@@ -2632,6 +2632,12 @@ static void dump_missing_shader(const std::string &key,const void *control,uint6
 //   让流程能继续跑到 present，好回答"着色器之外还剩几道门"。画面必然是错的。
 // np529: drop the rest of this frame's commands when a shader bundle is missing (diagnostics only).
 static bool g_shader_skip_abort=false;
+// np670：**绘制落点记账**（诊断用）。用 present 自检时回答一个很具体的问题：这一帧的绘制到底画进了哪张图？
+//   屏幕上黑、而窗口纹理（present 拿到的那个 serial）每帧都被绑成渲染目标，两种可能必须分开：
+//   ① 绘制确实进了窗口纹理 ⇒ 黑在别处（layout/store/present 拷贝）；② 绘制全进了别的 serial ⇒ 窗口纹理
+//   只是被"绑了一下"，真正的合成步骤缺失。只读诊断：不加锁、不进日志热路径。
+// np670: where do the draws land? Companion to the present probe. Diagnostic only, no locks, no hot-path logging.
+static uint64_t g_draws_since_present=0,g_draws_to_present_serial=0,g_last_draw_serial=0,g_present_serial_hint=0;static void *g_last_draw_image=nullptr;
 // np598：DM_SHADER_SKIP 是否开着（只读一次）。draw() 要用它决定"没有顶点着色器"是丢这一条还是报错。
 // np598: whether DM_SHADER_SKIP is on (read once). draw() uses it to decide whether a missing vertex shader
 //   means "drop this draw" or a hard error.
@@ -4240,6 +4246,9 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
      }}
     if(d.needs_writeback() || capture.active){unsigned saved=cur_op;cur_op=62;end_pass(6);full_barrier(c.command);cur_op=saved;VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;vkCmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,nullptr,0,nullptr);}
     {DRAW_SCOPE(Writeback);if(capture.active){if(d.needs_writeback())gpu_sync(perf.sync_writeback);d.writeback();}else d.defer_writeback();}stats.draws.fetch_add(1,std::memory_order_relaxed);   // diagnostics only: a seq_cst add (LDADDAL) waits for every earlier store, ~2.7% of the render thread
+    // np670：绘制落点记账（见 g_draws_since_present 的注释）| np670: draw landing bookkeeping
+    {Image *col=open_pass.images.n?open_pass.images.v[0]:nullptr;++g_draws_since_present;
+     if(col){g_last_draw_serial=col->source.serial;g_last_draw_image=(void*)col->image;if(g_present_serial_hint && col->source.serial==g_present_serial_hint)++g_draws_to_present_serial;}}
     if(capture.active){capture_pass(p);d.capture_read_images();capture.active=false;}
 }
 // 3D 画面加亮（iOS dm/gfx/nvn/nvn_mtl.m bright_lut 的 Vulkan 版；#112 vickwv fe7b655 在 Android 上做过同样的移植）：游戏每帧用
@@ -5233,6 +5242,49 @@ extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
     return fence<=completed;
 }
 extern "C" void xbg_legacy_finish(){gfx_drain();std::lock_guard<std::recursive_mutex> lock(mutex);need(initialized,"Queue finish before Vulkan initialization");++perf.why_finish;complete_all();VK(vkQueueWaitIdle(cfg.queue));}
+// np665：**上屏源图自检**。要回答的是一个二选一：屏幕全黑是"源图本来就黑"（渲染侧）还是"上屏没生效"
+//   （呈现侧）。做法：在第 N 次 present 时（DM_PRESENT_PROBE=N）把**正要上屏的那张纹理**读回 CPU，
+//   打一行统计 + 一张 32x18 的 ASCII 亮度图。走日志而不落盘——本平台大 I/O 会楔死客体线程（铁律：1.1MB
+//   dump 就有前科），而这张图只需要"有没有内容"，不需要像素级保真。
+// np665: presented-source self-check. The question is binary: is the black screen "the source texture is
+//   black" (render side) or "present does not reach the screen" (present side)? On the N-th present
+//   (DM_PRESENT_PROBE=N) read the texture that is about to be presented back to the CPU and log one stats
+//   line plus a 32x18 ASCII luminance map. Log rather than a file: big I/O wedges the guest thread on this
+//   platform, and the map only has to answer "is there anything in it".
+static int present_probe_target(){static int v=-2;if(v==-2){const char *e=getenv("DM_PRESENT_PROBE");v=e?atoi(e):0;if(v>0)xbg_logf("上屏自检 DM_PRESENT_PROBE=%d（第 %d 次 present 读回源图）",v,v);}return v;}
+// np666：按**时间**采样（DM_PRESENT_PROBE_EVERY_MS=T，最多 8 次）。为什么不用 present 计数：存活天花板
+//   在 1600~2550 presents 之间随机落地，用计数触发经常"还没采样就卡住了"。按时间采样还顺带给出
+//   "上线图像的亮度随时间怎么走"这条曲线（加载期 → 进游戏）。
+// np666: sample by wall clock (DM_PRESENT_PROBE_EVERY_MS=T, at most 8 shots). Present-count triggering
+//   often never fires because the run dies somewhere between 1600 and 2550 presents; a time series also
+//   yields "how the presented brightness evolves" (loading -> in game).
+static bool present_probe_due(){    static int every=-2;if(every==-2){const char *e=getenv("DM_PRESENT_PROBE_EVERY_MS");every=e?atoi(e):0;if(every>0)xbg_logf("上屏自检 每 %d ms 采样一次（最多 8 次）",every);}
+    if(every<=0)return false;
+    static uint64_t t0=0,next=0;static int shots=0;
+    uint64_t now=timing_clock()/1000000ull;
+    if(!t0){t0=now;next=now+uint64_t(every);}
+    if(shots>=8||now<next)return false;
+    next=now+uint64_t(every);++shots;return true;
+}
+static void present_probe_report(const Buffer &buf,uint32_t w,uint32_t h,uint32_t bpp){
+    if(!buf.mapped || !w || !h || bpp<3)return;
+    const uint8_t *p=static_cast<const uint8_t*>(buf.mapped)+buf.offset;
+    uint64_t sum[3]={0,0,0},nz=0,n=uint64_t(w)*h;unsigned lo[3]={255,255,255},hi[3]={0,0,0};
+    for(uint64_t i=0;i<n;i++){const uint8_t *q=p+i*bpp;for(int k=0;k<3;k++){unsigned v=q[k];sum[k]+=v;if(v<lo[k])lo[k]=v;if(v>hi[k])hi[k]=v;}if(q[0]|q[1]|q[2])++nz;}
+    xbg_logf("[上屏] 源图 %ux%u bpp=%u 均值 %.1f/%.1f/%.1f 非黑像素 %llu/%llu = %.1f%% 范围 R%u-%u G%u-%u B%u-%u",
+        w,h,bpp,double(sum[0])/double(n),double(sum[1])/double(n),double(sum[2])/double(n),
+        (unsigned long long)nz,(unsigned long long)n,100.0*double(nz)/double(n),
+        lo[0],hi[0],lo[1],hi[1],lo[2],hi[2]);
+    static const char ramp[]=" .:-=+*#%@";const int cols=32,rows=18;
+    for(int ry=0;ry<rows;ry++){char line[cols+1];
+        for(int rx=0;rx<cols;rx++){
+            uint32_t x0=uint32_t(uint64_t(rx)*w/cols),x1=uint32_t(uint64_t(rx+1)*w/cols);if(x1<=x0)x1=x0+1;if(x1>w)x1=w;
+            uint32_t y0=uint32_t(uint64_t(ry)*h/rows),y1=uint32_t(uint64_t(ry+1)*h/rows);if(y1<=y0)y1=y0+1;if(y1>h)y1=h;
+            uint64_t acc=0,cnt=0;
+            for(uint32_t y=y0;y<y1;y++)for(uint32_t x=x0;x<x1;x++){const uint8_t *q=p+(uint64_t(y)*w+x)*bpp;acc+=(uint64_t(q[0])*3+q[1]*6+q[2]);++cnt;}
+            unsigned v=cnt?unsigned(acc/cnt/10):0u;line[rx]=ramp[v>9?9:v];}
+        line[cols]=0;xbg_logf("[上屏] |%s|",line);}
+}
 static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();{SiteScope site(SITE_PRESENT);cur_op=61;TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");
          // np662：**切后台不挂死**。表面销毁后上屏回调会在 wait_window() 无限等新表面 ⇒
          // 帧循环整个停住、看门狗 90 秒判死（死状与真卡点难辨）。无窗口时跳过本帧出图、
@@ -5242,7 +5294,52 @@ static void xbg_present_texture_now(const win_t *window,const tex_t *texture){st
          //   stall). Without a window, skip presenting this frame and keep the game running (presenting
          //   resumes automatically when the surface returns); submission path unchanged.
          if(!mtl_has_window()){static int sn=0;if(sn++<3)xbg_logf("【后台】无上屏表面 —— 跳过出图，游戏继续跑（第 %d 次）",sn);return;}
-         uint64_t present_begin=timing_clock();Image &im=get_image(texture,false);need(im.gpu_written,"Game tried to present a texture never rendered");Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);c.finish();submit_slots(false);int r;{CPU_SCOPE(Present);
+         uint64_t present_begin=timing_clock();Image &im=get_image(texture,false);need(im.gpu_written,"Game tried to present a texture never rendered");
+         // np665：上屏源图自检（见 present_probe_report 的注释）。只做一次，读回那张**正要上屏**的纹理。
+         // np665: presented-source self-check (see present_probe_report). One shot, reads back the exact
+         //   texture that is about to be presented.
+         const int probe_n=present_probe_target();
+         static bool probe_done=false;
+         const bool probe_now = (probe_n>0 && !probe_done && stats.presents.load()>=uint64_t(probe_n)) || present_probe_due();
+         Buffer probe_buf;
+         Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+         if(probe_now && im.bpp>=4 && im.samples==VK_SAMPLE_COUNT_1_BIT && (im.aspects&VK_IMAGE_ASPECT_COLOR_BIT)){
+             probe_buf=readback_buffer(size_t(im.width)*im.height*4);
+             // np668：**自检的对照**。DM_PRESENT_PROBE_FILL=1 时先把源图整张涂绿再读回：
+             //   读回是绿的 ⇒ 读回通路本身没问题，之前读到的全 0 是真的"源图黑"；
+             //   读回还是 0 ⇒ 坏的是读回通路（copy 没生效/读错内存），之前的结论要作废。
+             // np668: control for the probe. With DM_PRESENT_PROBE_FILL=1 the source image is cleared to green
+             //   before the readback: green comes back => the readback path is sound and the zeros were real;
+             //   still zeros => the readback path is broken and the earlier conclusion must be discarded.
+             static int probe_fill=-1;if(probe_fill<0){const char *e=getenv("DM_PRESENT_PROBE_FILL");probe_fill=(e&&*e=='1')?1:0;if(probe_fill)xbg_logf("[上屏] 自检对照开启：读回前先涂绿");}
+             if(probe_fill){
+                 VkImageSubresourceRange rr{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+                 VkImageMemoryBarrier tb{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};tb.srcQueueFamilyIndex=tb.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;tb.image=im.image;tb.subresourceRange=rr;
+                 tb.oldLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;tb.newLayout=VK_IMAGE_LAYOUT_GENERAL;tb.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT;tb.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+                 vkCmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&tb);
+                 VkClearColorValue gc{};gc.float32[1]=1.f;
+                 vkCmdClearColorImage(c.command,im.image,VK_IMAGE_LAYOUT_GENERAL,&gc,1,&rr);
+                 tb.oldLayout=VK_IMAGE_LAYOUT_GENERAL;tb.newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;tb.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;tb.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+                 vkCmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&tb);
+             }
+             VkBufferImageCopy pr{};pr.bufferOffset=probe_buf.offset;
+             pr.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};pr.imageExtent={im.width,im.height,1};
+             vkCmdCopyImageToBuffer(c.command,im.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,probe_buf.buffer,1,&pr);
+             VkBufferMemoryBarrier ph{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};ph.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;ph.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
+             ph.srcQueueFamilyIndex=ph.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;ph.buffer=probe_buf.buffer;ph.offset=probe_buf.offset;ph.size=probe_buf.size;
+             vkCmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&ph,0,nullptr);
+             xbg_logf("[上屏] 自检启动：present=%llu 纹理 serial=%llu %ux%u fmt=%#x",(unsigned long long)stats.presents.load(),
+                 (unsigned long long)texture->serial,im.width,im.height,unsigned(im.fmt));
+         }
+         c.finish();submit_slots(false);
+         if(probe_now && probe_buf.buffer){gpu_sync(perf.sync_readback);probe_buf.invalidate();present_probe_report(probe_buf,im.width,im.height,4);
+             xbg_logf("[上屏] 绘制落点：一帧 %llu 次绘制，打到 serial=%llu 的 %llu 次；最后一次目标 serial=%llu image=%p；上屏 image=%p 同一镜像=%d",
+                 (unsigned long long)g_draws_since_present,(unsigned long long)texture->serial,
+                 (unsigned long long)g_draws_to_present_serial,(unsigned long long)g_last_draw_serial,g_last_draw_image,
+                 (void*)im.image,int(g_last_draw_image==(void*)im.image));
+             if(probe_n>0 && stats.presents.load()>=uint64_t(probe_n))probe_done=true;}
+         g_present_serial_hint=texture->serial;g_draws_since_present=0;g_draws_to_present_serial=0;
+         int r;{CPU_SCOPE(Present);
          // np658：reset 恢复窗口内先安静（present 也走队列，同样会喂 render_service 的失败计数）。
          // np658: stay quiet during the recovery window (present also goes through the queue and feeds the counter).
          if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}

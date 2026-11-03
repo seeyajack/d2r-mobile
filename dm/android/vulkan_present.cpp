@@ -257,9 +257,24 @@ int present(void*,void*,VkImage source,VkFormat source_format,uint32_t width,uin
     // finished reading the image (synchronization validation: SYNC-HAZARD-WRITE-AFTER-READ).
     vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&barrier);
     double scale=std::min(double(extent.width)/w,double(extent.height)/h);int dw=std::max(1,int(w*scale)),dh=std::max(1,int(h*scale)),dx=(int(extent.width)-dw)/2,dy=(int(extent.height)-dh)/2;
-    if(dx || dy || dw!=int(extent.width) || dh!=int(extent.height)){   // letterbox bars only where the blit leaves part of the image
+    // np667：**上屏链路自检**。DM_PRESENT_FILL=r,g,b 时不用源图，直接把整张交换链图填成这个颜色。
+    //   判据二选一：屏幕变色 ⇒ 上屏链路（交换链→合成器）通，黑屏是"源图本来就黑"；屏幕仍黑 ⇒ 上屏链路本身不通。
+    //   与上屏源图自检（xbg_game.cpp 的 DM_PRESENT_PROBE_EVERY_MS）配套：一个查源，一个查路。
+    // np667: presentation-path self-test. With DM_PRESENT_FILL=r,g,b skip the source image and fill the whole
+    //   swapchain image with that colour. Screen changes colour => the path (swapchain -> compositor) works and
+    //   the black screen is the source image; still black => the path itself is broken. Pairs with the source
+    //   probe (DM_PRESENT_PROBE_EVERY_MS in xbg_game.cpp): one checks the source, this one checks the road.
+    static int fill_rgb[3]={-1,-1,-1};
+    if(fill_rgb[0]<0){const char *e=getenv("DM_PRESENT_FILL");int r=-1,g=-1,b=-1;
+        if(e&&sscanf(e,"%d,%d,%d",&r,&g,&b)==3 && r>=0 && g>=0 && b>=0){fill_rgb[0]=r;fill_rgb[1]=g;fill_rgb[2]=b;vlog("上屏填充 DM_PRESENT_FILL=%d,%d,%d（跳过 blit）",r,g,b);}
+        else{fill_rgb[0]=-2;}}
+    if(fill_rgb[0]>=0){
+        VkClearColorValue fc{};fc.float32[0]=float(fill_rgb[0])/255.f;fc.float32[1]=float(fill_rgb[1])/255.f;fc.float32[2]=float(fill_rgb[2])/255.f;fc.float32[3]=1.f;
+        vkCmdClearColorImage(cmd,images[index],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&fc,1,&barrier.subresourceRange);
+    }else if(dx || dy || dw!=int(extent.width) || dh!=int(extent.height)){   // letterbox bars only where the blit leaves part of the image
         VkClearColorValue black{};vkCmdClearColorImage(cmd,images[index],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&black,1,&barrier.subresourceRange);
         barrier.oldLayout=barrier.newLayout;barrier.srcAccessMask=barrier.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&barrier);}
+    if(fill_rgb[0]<0){
     VkImageBlit blit{};blit.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};blit.dstSubresource=blit.srcSubresource;blit.srcOffsets[0]={x,y,0};blit.srcOffsets[1]={x+w,y+h,1};blit.dstOffsets[0]={dx,dy,0};blit.dstOffsets[1]={dx+dw,dy+dh,1};
     // 最近邻不要求额外线性过滤能力。鸿蒙：游戏出图比屏幕小、要放大，格式支持时用线性，不然像素发硬、斜边锯齿。
     // Nearest needs no extra linear-filter support. HarmonyOS: the game image is smaller than the screen and gets upscaled; use linear when the format supports it, otherwise pixels look blocky and diagonals jagged.
@@ -268,6 +283,7 @@ int present(void*,void*,VkImage source,VkFormat source_format,uint32_t width,uin
     if(sp.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)filter=VK_FILTER_LINEAR;
 #endif
     vkCmdBlitImage(cmd,source,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,images[index],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&blit,filter);
+    }
     // 同队列后续写入必须等源图读取完成；即使下一次图像布局未改变也建立 WAR 执行依赖。
     // Order subsequent same-queue writes after the source read, including reuse without a layout change.
     VkMemoryBarrier source_read{VK_STRUCTURE_TYPE_MEMORY_BARRIER};source_read.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT;source_read.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
