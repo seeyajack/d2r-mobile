@@ -200,6 +200,10 @@ static void wait_unlink(thr_t *t) {
 // 按内核顺序挑等待者：优先级数值小者优先，同优先级先登记者优先（持 G）。kind 1 按锁地址、2 按条件键、3 按地址匹配
 // Pick a waiter in kernel order: numerically lower priority first, at equal priority the earlier registered first (holding G). kind 1 matches by lock address, 2 by condition key, 3 by address
 static uint64_t g_wseq;
+// np701：wait-in 环形缓冲（最近 64 行）——定义见 block_inner 里的注释。svc_thread_dump（死亡转储）读它。
+// np701: the wait-in ring of the last 64 rows (rationale in block_inner); svc_thread_dump (the death dump) reads it.
+static struct { uint32_t h; int k; uint64_t a, key, at; long long ns; } g_waitin_ring[64];
+static unsigned g_waitin_rn;
 static thr_t *pick(int kind, uint64_t a) {
     thr_t *b = NULL;
     for (thr_t *t = g_wait; t; t = t->next) {
@@ -267,6 +271,21 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
         if (!dup && n < 400) { ++n;
             LOG("[wait-in] h=%#x kind=%d addr=%#llx key=%#llx ns=%lld", t->handle, kind,
                 (unsigned long long)t->waddr, (unsigned long long)t->wkey, (long long)ns); }
+        // np701：**wait-in 环形缓冲（最近 64 行）**。np663 的"job 环变体"假定性谳就是引用了一条开机期
+        //   wait-in 行（400 行预算在开机头 3 秒用完 ⇒ 死亡现场在 hilog 里永远没有 wait-in）。预算治不了
+        //   这个：行还是会打、还是会被误引。环治本：每行带记录时刻，死亡转储（svc_thread_dump）打最近
+        //   64 行并给"距此刻 X 秒"——开机行被后来的自然挤出，死亡现场必有最近证据，且时间戳自证新旧。
+        //   铁律 32 的落地：有预算的仪器按"发生即记"必把预算花在开机期；按"最近 N 条"则永远覆盖当下。
+        // np701: a wait-in ring of the LAST 64 rows. np663's bogus "job-ring variant" cited a boot-time row
+        //   (the 400-line budget burned in the first 3 s, so a death scene never has a wait-in line in hilog).
+        //   A bigger budget would not fix that: the rows still print and still get miscited. The ring fixes the
+        //   root: every row carries its record time, the death dump (svc_thread_dump) prints the last 64 with
+        //   "X s ago" -- boot rows are pushed out naturally, the death scene always has fresh evidence, and the
+        //   timestamps self-certify. Iron rule 32, landed: budgeted instruments record-on-event and spend the
+        //   budget during boot; record-the-last-N and the present is always covered.
+        { struct timespec rts; clock_gettime(CLOCK_MONOTONIC, &rts);
+          g_waitin_ring[g_waitin_rn % 64] = (typeof(g_waitin_ring[0])){t->handle, kind, t->waddr, t->wkey, (uint64_t)rts.tv_sec, ns};
+          g_waitin_rn++; }
         // np557：主线程一旦开始**无限等锁**，立刻把全线程状态打一遍（此刻正持 G，读数一致）。
         //   为什么要在这个时刻打：np556 里连 16 ms 的音频时钟线程都停了 ⇒ 说明有线程攥着 G 不放，
         //   于是"每 5 秒打一次"的节拍根本没机会跑。改成由**等待者**在登记时打，就一定打得出。
@@ -761,6 +780,18 @@ void svc_thread_dump(void) {
     // 探针计数（diag.c）：卡住时把"入口被调了几次、返回点被调了几次"一次打全——差值就是阻塞所在的那一段。
     // Probe counts (diag.c): on a stall print how many times each entry and each return point was reached — the gap is the blocked segment.
     { void dm_probe_dump_counts(void); dm_probe_dump_counts(); }
+    // np701：wait-in 环（最近 64 行，旧→新）。死亡现场的 wait-in 证据不再依赖 hilog 预算——开机行已被
+    //   自然挤出，每行带"距此刻 X 秒"自证新旧（np663 的误定性引用的就是分不清新旧的 hilog 行）。
+    // np701: the wait-in ring (last 64 rows, oldest first). The death scene's wait-in evidence no longer
+    //   depends on the hilog budget -- boot rows were pushed out naturally, and each row's "X s ago"
+    //   self-certifies its age (np663's bogus conclusion cited a hilog row whose age was unknown).
+    { struct timespec rts; clock_gettime(CLOCK_MONOTONIC, &rts); uint64_t now = (uint64_t)rts.tv_sec;
+      unsigned n = g_waitin_rn < 64 ? g_waitin_rn : 64;
+      fprintf(stderr, "[dm] wait-in 环最近 %u 行（旧→新）：\n", n);
+      for (unsigned i = 0; i < n; i++) { const typeof(g_waitin_ring[0]) *r = &g_waitin_ring[(g_waitin_rn - n + i) % 64];
+          fprintf(stderr, "[dm] wait-in %llus 前 h=%#x kind=%d addr=%#llx key=%#llx ns=%lld\n",
+                  r->at <= now ? (unsigned long long)(now - r->at) : 0ull, r->h, r->k,
+                  (unsigned long long)r->a, (unsigned long long)r->key, r->ns); } }
 }
 
 // np343 对齐 nxnative：占进程线程资源上限名额的游戏线程数——已创建（无论是否 started）且未退出（hle_svc.c GetInfo FreeThreadCount 用）。
