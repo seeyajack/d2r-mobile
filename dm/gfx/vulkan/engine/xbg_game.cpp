@@ -122,6 +122,13 @@ extern "C" __attribute__((weak)) int nvn_pool_flags(const void *addr,size_t len)
 static void (*g_ui_rect_fn)(double *y,double *h);
 static double g_ui_moff;static uint64_t g_ui_moff_addr;
 extern "C" void xbg_set_ui_rect_fn(void (*fn)(double *y,double *h)){g_ui_rect_fn=fn;}
+// np676：帧中自检的**钩子指针**。end_pass 在文件很早的位置、且在匿名命名空间里，而探针实现要等到
+//   能用 readback_buffer/Commands/gpu_sync 之后——直接前置声明会把两个名字落进**不同的匿名命名空间**，
+//   链接期就是 undefined symbol（实测踩过）。用全局函数指针绕开作用域问题。
+// np676: hook pointer for the mid-frame probe. end_pass sits early in the file inside the unnamed namespace while
+//   the probe needs readback_buffer/Commands/gpu_sync; a plain forward declaration puts the two names in
+//   *different* unnamed namespaces and the linker reports an undefined symbol. A global function pointer avoids it.
+static void (*g_winpass_hook)() = nullptr;
 namespace {
 xbg_game_config cfg{};
 std::recursive_mutex mutex;
@@ -836,7 +843,17 @@ void begin_occlusion_query(VkCommandBuffer cmd,VkQueryPool pool,uint32_t index){
     vkCmdBeginQuery(cmd,pool,index,VK_QUERY_CONTROL_PRECISE_BIT);open_occlusion={cmd,pool,index};++occlusion_queries_started;
 }
 void end_open_pass(){if(open_pass.cmd){end_occlusion_query();vkCmdEndRenderPass(open_pass.cmd);if(open_pass.depth_attached && !open_pass.depth_used){++depth_idle_passes;pass_prof_depth_idle(open_pass.cmd);}pass_prof_end(open_pass.cmd);open_pass=OpenPass{};++pass_end_by[cur_op<64?cur_op:63];++pass_end_cause[pass_end_cause_now&7];}}
-void end_pass(int cause){pass_end_cause_now=cause;end_open_pass();pass_end_cause_now=0;}   // np641：带"谁关的"编号的 end_open_pass | np641: end_open_pass tagged with the call site
+// np676：**帧中自检**——在"刚画完窗口那张图"的瞬间读回它左上 64x64，区分两种完全不同的病：
+//   A 读到有内容 ⇒ 绘制确实落进了这张图，present 之前/之中被清掉或被另一张图顶替；
+//   B 读到全 0   ⇒ 这些 draw 根本没在这张图上产生像素（渲染执行层）。
+//   与 present 时刻的自检配对（一个查"最终值"，一个查"刚写完的值"）。实现放在 present 探针旁边。
+// np676: mid-frame probe -- right after the pass that draws into the presented image is closed, read back its
+//   top-left 64x64. A: non-zero => the draws landed and something clears/replaces it before present.
+//   B: all zero => those draws never produced pixels in that image. Definition lives next to the present probe.
+static Image *g_winpass_last=nullptr;
+void end_pass(int cause){pass_end_cause_now=cause;
+    g_winpass_last=open_pass.images.n?open_pass.images.v[0]:nullptr;
+    end_open_pass();pass_end_cause_now=0;if(g_winpass_hook)g_winpass_hook();}   // np641：带"谁关的"编号的 end_open_pass | np641: end_open_pass tagged with the call site
 void full_barrier(VkCommandBuffer cmd){VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&b,0,nullptr,0,nullptr);barrier_seq=write_seq;++barrier_by[cur_op<64?cur_op:63];}
 // np640：**pass 内合法的内存屏障**。render pass 内部不能出现 pass 之外的阶段（ALL_COMMANDS 会带进来，
 //   验证层报 VUID），所以 pass 开着时把阶段掩码收窄到图形阶段；pass 没开就保持 ALL_COMMANDS 的原语义。
@@ -5258,6 +5275,33 @@ static int present_probe_target(){static int v=-2;if(v==-2){const char *e=getenv
 // np666: sample by wall clock (DM_PRESENT_PROBE_EVERY_MS=T, at most 8 shots). Present-count triggering
 //   often never fires because the run dies somewhere between 1600 and 2550 presents; a time series also
 //   yields "how the presented brightness evolves" (loading -> in game).
+static void winpass_probe_check(){
+    static int target=-2;
+    if(target==-2){const char *e=getenv("DM_WINPASS_PROBE");target=e?atoi(e):0;if(target>0)xbg_logf("[上屏] 帧中自检 DM_WINPASS_PROBE=%d（窗口 pass 关掉后立刻读回）",target);}
+    if(target<=0)return;
+    static int seen=0,dbg=0;
+    if(dbg<6){++dbg;
+        if(g_winpass_last)xbg_logf("[上屏] 帧中候选 last serial=%llu %ux%u hint=%llu seen=%d",
+            (unsigned long long)g_winpass_last->source.serial,g_winpass_last->width,g_winpass_last->height,
+            (unsigned long long)g_present_serial_hint,seen);
+        else xbg_logf("[上屏] 帧中候选 last=null hint=%llu seen=%d",(unsigned long long)g_present_serial_hint,seen);}
+    if(!g_winpass_last)return;
+    Image &im=*g_winpass_last;
+    if(!g_present_serial_hint || im.source.serial!=g_present_serial_hint)return;
+    if(++seen<target)return;
+    uint32_t w=std::min<uint32_t>(64,im.width),h=std::min<uint32_t>(64,im.height);
+    if(!w||!h||im.bpp<4)return;
+    Buffer b=readback_buffer(size_t(w)*h*4);
+    {Commands q;VkBufferImageCopy r{};r.bufferOffset=b.offset;r.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};r.imageExtent={w,h,1};
+     vkCmdCopyImageToBuffer(q.command,im.image,im.layout,b.buffer,1,&r);q.finish();}
+    submit_slots(false);gpu_sync(perf.sync_readback);b.invalidate();
+    const uint8_t *pp=static_cast<const uint8_t*>(b.mapped)+b.offset;uint64_t npx=uint64_t(w)*h,nz=0;uint64_t sum[3]={0,0,0};
+    for(uint64_t i=0;i<npx;i++){const uint8_t *q=pp+i*4;for(int k=0;k<3;k++)sum[k]+=q[k];if(q[0]|q[1]|q[2])++nz;}
+    xbg_logf("[上屏] 帧中：serial=%llu %ux%u 左上%ux%u 均值 %.1f/%.1f/%.1f 非黑 %llu/%llu = %.1f%% 布局=%d",
+        (unsigned long long)im.source.serial,im.width,im.height,w,h,double(sum[0])/double(npx),double(sum[1])/double(npx),double(sum[2])/double(npx),
+        (unsigned long long)nz,(unsigned long long)npx,100.0*double(nz)/double(npx),int(im.layout));
+}
+static bool g_winpass_hook_armed=(g_winpass_hook=&winpass_probe_check,true);
 static bool present_probe_due(){    static int every=-2;if(every==-2){const char *e=getenv("DM_PRESENT_PROBE_EVERY_MS");every=e?atoi(e):0;if(every>0)xbg_logf("上屏自检 每 %d ms 采样一次（最多 8 次）",every);}
     if(every<=0)return false;
     static uint64_t t0=0,next=0;static int shots=0;
@@ -5284,6 +5328,42 @@ static void present_probe_report(const Buffer &buf,uint32_t w,uint32_t h,uint32_
             for(uint32_t y=y0;y<y1;y++)for(uint32_t x=x0;x<x1;x++){const uint8_t *q=p+(uint64_t(y)*w+x)*bpp;acc+=(uint64_t(q[0])*3+q[1]*6+q[2]);++cnt;}
             unsigned v=cnt?unsigned(acc/cnt/10):0u;line[rx]=ramp[v>9?9:v];}
         line[cols]=0;xbg_logf("[上屏] |%s|",line);}
+}
+// np673：**别的渲染目标里到底有没有内容**。判"整条渲染没产出"还是"只缺最后合成进窗口"：
+//   DM_PRESENT_PROBE_SERIALS=222,6224 时，把这几张纹理在同一时刻读回，只打统计（不打 ASCII 图）。
+// np673: is anything in the *other* render targets? Distinguishes "the whole render produces nothing" from
+//   "only the final composite into the window is missing". DM_PRESENT_PROBE_SERIALS=222,6224 reads those
+//   images back at the same instant and logs stats only.
+static void present_probe_other_serials(){
+    static int inited=0;
+    if(!inited){inited=1;const char *e0=getenv("DM_PRESENT_PROBE_SERIALS");if(!e0||!*e0){inited=2;return;}xbg_logf("[上屏] 旁证：同刻读回 serial 列表 = %s",e0);}
+    if(inited!=1)return;
+    const char *e=getenv("DM_PRESENT_PROBE_SERIALS");if(!e)return;
+    std::string list(e);size_t pos=0;int n=0;
+    while(pos<=list.size() && n<6){
+        size_t comma=list.find(',',pos);if(comma==std::string::npos)comma=list.size();
+        std::string tok=list.substr(pos,comma-pos);pos=comma+1;if(tok.empty())continue;++n;
+        uint64_t serial=strtoull(tok.c_str(),nullptr,10);
+        auto it=images.find(serial);
+        if(it==images.end() || !it->second){xbg_logf("[上屏] 旁证 serial=%llu 不存在",(unsigned long long)serial);continue;}
+        Image &oi=*it->second;
+        if(oi.samples!=VK_SAMPLE_COUNT_1_BIT || oi.aspects!=VK_IMAGE_ASPECT_COLOR_BIT || oi.bpp<4 || !oi.width || !oi.height){
+            xbg_logf("[上屏] 旁证 serial=%llu 跳过（samples=%d aspects=%d bpp=%u %ux%u）",(unsigned long long)serial,int(oi.samples),int(oi.aspects),oi.bpp,oi.width,oi.height);continue;}
+        Buffer b=readback_buffer(size_t(oi.width)*oi.height*4);
+        {Commands q; VkImageLayout saved=oi.layout;oi.transition(q.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+         VkBufferImageCopy r{};r.bufferOffset=b.offset;r.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};r.imageExtent={oi.width,oi.height,1};
+         vkCmdCopyImageToBuffer(q.command,oi.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,b.buffer,1,&r);
+         VkBufferMemoryBarrier h{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};h.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;h.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
+         h.srcQueueFamilyIndex=h.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;h.buffer=b.buffer;h.offset=b.offset;h.size=b.size;
+         vkCmdPipelineBarrier(q.command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&h,0,nullptr);
+         oi.transition(q.command,saved);q.finish();}
+        gpu_sync(perf.sync_readback);b.invalidate();
+        const uint8_t *pp=static_cast<const uint8_t*>(b.mapped)+b.offset;uint64_t npx=uint64_t(oi.width)*oi.height,nz=0;uint64_t sum[3]={0,0,0};
+        for(uint64_t i=0;i<npx;i++){const uint8_t *q=pp+i*4;for(int k=0;k<3;k++)sum[k]+=q[k];if(q[0]|q[1]|q[2])++nz;}
+        xbg_logf("[上屏] 旁证 serial=%llu %ux%u 均值 %.1f/%.1f/%.1f 非黑 %llu/%llu = %.1f%% 布局=%d",
+            (unsigned long long)serial,oi.width,oi.height,double(sum[0])/double(npx),double(sum[1])/double(npx),double(sum[2])/double(npx),
+            (unsigned long long)nz,(unsigned long long)npx,100.0*double(nz)/double(npx),int(oi.layout));
+    }
 }
 static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();{SiteScope site(SITE_PRESENT);cur_op=61;TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");
          // np662：**切后台不挂死**。表面销毁后上屏回调会在 wait_window() 无限等新表面 ⇒
@@ -5337,6 +5417,10 @@ static void xbg_present_texture_now(const win_t *window,const tex_t *texture){st
                  (unsigned long long)g_draws_since_present,(unsigned long long)texture->serial,
                  (unsigned long long)g_draws_to_present_serial,(unsigned long long)g_last_draw_serial,g_last_draw_image,
                  (void*)im.image,int(g_last_draw_image==(void*)im.image));
+             xbg_logf("[上屏] 溯源：gpu_written=%d provenance_site=%u provenance_epoch=%llu last_write=%llu layout=%d checksub=%llu",
+                 int(im.gpu_written),im.provenance_write_site,(unsigned long long)im.provenance_epoch,
+                 (unsigned long long)im.last_write,int(im.layout),(unsigned long long)im.checked_submission);
+             present_probe_other_serials();
              if(probe_n>0 && stats.presents.load()>=uint64_t(probe_n))probe_done=true;}
          g_present_serial_hint=texture->serial;g_draws_since_present=0;g_draws_to_present_serial=0;
          int r;{CPU_SCOPE(Present);
