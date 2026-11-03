@@ -11,6 +11,7 @@ extern "C" int xbg_completion_wait_selftest(char *report,size_t bytes);
 #include "xbg_draw_timing.h"
 #include "xbg_provenance.h"
 #include "xbg_pipeline_key.h"
+#include "xbg_deathsite.h"
 #include "xbg_vulkan.h"
 
 // np597：`set_levels=1 且 nlevels=0` 的视图在真机上会出现（实测 depth 附件 mip=0/0），而
@@ -56,6 +57,9 @@ __attribute__((weak)) void nvn_dirty_protect(const void *addr,size_t len);
 __attribute__((weak)) uint64_t nvn_dirty_now(void);
 __attribute__((weak)) int nvn_dirty_since(const void *addr,size_t len,uint64_t stamp);
 __attribute__((weak)) void nvn_dirty_slot_stats(int *live,int *used_slots,uint64_t *adds_total);
+// np701：宿主看门狗的图形侧等待点注册（dm/host/crash.c）；弱：不链宿主的图形单测静默跳过。
+// np701: the watchdog wait-point registration (dm/host/crash.c); weak: silently skipped without the host.
+extern "C" __attribute__((weak)) void crash_set_wait_dump(void (*fn)(void));
 // 3D 画面加亮的曝光 k（宿主 dm/host/dm_bright.c）；弱：不链宿主的图形单测不加亮
 // Exposure k of the 3D picture brightening (the host's dm/host/dm_bright.c); weak: graphics unit tests without the host do not brighten
 __attribute__((weak)) float dm_bright_k(void);
@@ -726,6 +730,11 @@ int shader_reuse=0;uint64_t shaders_reused=0,shader_reuse_mismatches=0;
 // for that job, so vkResetFences never overlaps the thread's wait (concurrent waits are allowed), and reusing the slot skips
 // its reset. Marker gfx-async-pool-reset = 1 / 0, else DM_GFX_ASYNC_POOL_RESET (the Android app sets 1); A/B target
 // poolreset, decided per submission. NVN PERF poolreset: resets queued, retirements that had to wait for one, and how long.
+// np701：VkSite 前置声明——poolreset 的 fence 等待（下方）也要挂守卫，而 deathguard 命名空间在
+//   pass_end_cause（第 833 行）之后才展开。类型在此给全（成员函数体在命名空间里补定义）。
+// np701: forward VkSite -- poolreset's fence wait below needs the guard, but the deathguard namespace
+//   opens after pass_end_cause (line 833). The type is complete here; member bodies come later.
+namespace deathguard{struct VkSite{int slot;VkSite(unsigned site,uint64_t ctx=0);~VkSite();};}
 namespace poolreset {
 bool enabled=false,stop=false;std::thread *worker=nullptr;std::mutex mu;std::condition_variable cv;   // never destroyed: a joinable std::thread left at exit would terminate
 struct Job{Slot *slot;VkFence fence;VkCommandPool pool;};std::vector<Job> jobs;
@@ -733,7 +742,7 @@ uint64_t queued=0,waits=0,wait_ns=0;   // render thread only
 void run(){
     for(;;){Job j;{std::unique_lock<std::mutex> l(mu);cv.wait(l,[]{return stop || !jobs.empty();});if(jobs.empty())return;j=jobs.front();jobs.erase(jobs.begin());}
         const uint64_t timeout=std::max<uint64_t>(cfg.fence_timeout_ns,10000000000ull);
-        VkResult r=vkWaitForFences(cfg.device,1,&j.fence,VK_TRUE,timeout);
+        VkResult r;{deathguard::VkSite site(XBG_SITE_FENCE_POOLRESET);r=vkWaitForFences(cfg.device,1,&j.fence,VK_TRUE,timeout);}
         // 栅栏一直不亮而驱动又不报 DEVICE_LOST 时，这里只剩 VK_TIMEOUT；把它说清楚，别让崩在后面的检查里只留下一个 2。
         // When the fence never signals and the driver does not report DEVICE_LOST, all that is left here is VK_TIMEOUT; say so,
         // so the fatal check later does not leave just a 2 in the crash report.
@@ -838,6 +847,207 @@ uint64_t prep_read_end;   // np641：prepare_read 里断 pass 的次数（每帧
 // np643: this frame's pass-open order, for run-length encoding. 512 entries cover the scene frame's ~440 opens.
 struct PassSeqEnt{uint64_t fb;uint32_t w,h,att;};
 PassSeqEnt pass_seq[512];unsigned pass_seq_n=0;
+// np701：**判死证据链**。np664 定谳的终局是"提交线程卡在不返回的驱动调用里"，但死亡图只给得出
+//   "pc 落在 ld-musl 区间"——回答不了卡在哪个引擎调用（submit？fence？建管线？），更没有停帧前
+//   那一帧的 pass/shader/管线清单（离线半程的原料）。这里补齐三件，全部**只记账不拖速**：
+//   ① **调用点标定**：每个阻塞驱动调用（submit/fence/pipeline/acquire/present/queue-idle）用 VkSite
+//      守卫登记 线程+站点+起始时刻+上下文（建管线=着色器键前 8 字节）。⚠ 所有"超时上限"（fence 10s、
+//      acquire 50ms）都由同一个会挂死的驱动执行——真挂死时上限只是理论，所以守卫要挂满全部阻塞站点。
+//   ② **deathguard 监视线程**：每秒一拍，某线程阻塞在同一驱动调用超过 DM_DEATHGUARD_MS（缺省 30000，
+//      远小于看门狗 90s；大于合法窗口——驱动 reset 自愈 ~8s、fence 名义上限 10s）就打一行【判死】并
+//      把证据落盘（两次落盘至少隔 120s，误报不吞真报）。**不退出**：看门狗 90s 的全线程转储照旧当
+//      执行者，我们只是把"无名的 90 秒等死"变成"30 秒出全套现场"。
+//   ③ **停帧清单常备**：逐 pass 形状（serial/尺寸/附件/深度/绘制数）、本帧绑定过的着色器、本帧建过
+//      的管线键（miss/bypass 都算——np700 的 bypass 风暴靠它现形）。present 封存上一帧，转储带
+//      sealed（上一完整帧）+ current（进行中帧）。定长 POD、无堆分配；转储线程不持引擎锁，读到
+//      撕裂数字就是垃圾值，不会崩。
+//   判据（np701）：真机自然死亡时 gfx-death.txt 在 ~30s 出现且点名卡点；gfx-lastframe.txt 的 pass
+//   条数与 digest_ring 尾条对账；正常跑 ≥6 分钟零误报。
+// np701: the death-evidence chain. np664's endgame was "the submit thread stuck in a driver call that never
+//   returns", yet the death map only says "pc inside the ld-musl range" -- which engine call (submit? fence?
+//   pipeline build?) stayed unknown, and the last frame's pass/shader/pipeline manifest (the offline half's
+//   raw material) was never written. Three additions, all bookkeeping at recording speed:
+//   1. Call-site labelling: every blocking driver call gets a VkSite guard (thread + site + start + context,
+//      the first 8 key bytes for pipeline builds). Every "timeout" (fence 10 s, acquire 50 ms) is enforced by
+//      the very driver that hangs -- on a real hang they are fiction, so the guards cover ALL blocking sites.
+//   2. The deathguard thread (1 s tick): a thread blocked in the same call for over DM_DEATHGUARD_MS
+//      (default 30000 -- well under the watchdog's 90 s, above every legal window: a driver reset recovers
+//      in ~8 s, the fences' nominal cap is 10 s) logs one line and writes the evidence files (at most one
+//      dump per 120 s, so a false alarm cannot swallow a real one). It does NOT exit: the watchdog keeps its
+//      role at 90 s; a nameless 90-second wait becomes a full scene at 30.
+//   3. The last-frame manifest, always resident: per-pass shapes, the frame's bound shaders, its built
+//      pipeline keys (misses and bypasses alike -- np700's bypass storm would have been visible here).
+//      The previous frame is sealed at present; a dump carries sealed + current. Bounded POD, no allocation;
+//      the dump thread takes no engine lock -- a torn read yields a garbage number, never a crash.
+namespace deathguard{
+// 阻塞站点：编号的单一真源在 xbg_deathsite.h（vulkan_present.cpp 共用），名字给人看；
+// 新增站点必须同时给名字，否则转储打出 "site=?"。
+// Blocking sites: the numbers' single source of truth is xbg_deathsite.h (shared with
+// vulkan_present.cpp); every site needs a name or the dump prints "site=?".
+enum Site:unsigned{NONE=XBG_SITE_NONE,SUBMIT=XBG_SITE_SUBMIT,SUBMIT_SPLIT=XBG_SITE_SUBMIT_SPLIT,FENCE_RETIRE=XBG_SITE_FENCE_RETIRE,FENCE_POOLRESET=XBG_SITE_FENCE_POOLRESET,PIPE_GRAPHICS=XBG_SITE_PIPE_GRAPHICS,PIPE_COMPUTE=XBG_SITE_PIPE_COMPUTE,PIPE_OTHER=XBG_SITE_PIPE_OTHER,QUEUE_WAIT_IDLE=XBG_SITE_QUEUE_WAIT_IDLE,ACQUIRE=XBG_SITE_ACQUIRE,PRESENT=XBG_SITE_PRESENT,PRESENT_SUBMIT=XBG_SITE_PRESENT_SUBMIT,PRESENT_FENCE=XBG_SITE_PRESENT_FENCE,SITE_COUNT};
+inline const char *site_name(unsigned s){static const char *n[]={"none","vkQueueSubmit","vkQueueSubmit(split)","vkWaitForFences(retire)","vkWaitForFences(poolreset)","vkCreateGraphicsPipelines","vkCreateComputePipelines","vkCreate*Pipeline(other)","vkQueueWaitIdle","vkAcquireNextImageKHR","vkQueuePresentKHR","vkQueueSubmit(present)","vkWaitForFences(present)"};return s<sizeof(n)/sizeof(*n)?n[s]:"site=?";}
+struct Entry{std::atomic<uint64_t> t0;std::atomic<unsigned> site;std::atomic<uint32_t> tid;std::atomic<uint64_t> ctx;std::atomic<int> used;};
+constexpr unsigned MAX_THREADS=64;
+static Entry table[MAX_THREADS];
+// 每线程自己的槽位：第一次进站点时登记（满 64 则该线程在转储里缺席，可接受）。
+// One slot per thread, claimed on first use; a full table just means that thread shows no line.
+static thread_local int my_slot=-1;
+static int claim(){
+    if(my_slot>=0)return my_slot;
+    for(unsigned i=0;i<MAX_THREADS;i++){int expect=0;if(table[i].used.compare_exchange_strong(expect,1)){my_slot=int(i);table[i].tid.store(uint32_t(pthread_self()&0xffffffffu));return my_slot;}}
+    return -1;
+}
+// RAII 守卫：先 t0 后 site（监视线程见 site!=none 而 t0==0 就跳过这一拍），出站点清 site。
+// 类型定义已前置（poolreset 的守卫要用）；成员函数体在这里补。
+// VkSite guard: t0 first, then site; cleared site-first on the way out. The type was forward-declared
+// for poolreset's guard; the member bodies are defined here.
+VkSite::VkSite(unsigned s,uint64_t ctx){slot=claim();if(slot<0)return;table[slot].t0.store(timing_clock());table[slot].ctx.store(ctx);table[slot].site.store(s);}
+VkSite::~VkSite(){if(slot>=0)table[slot].site.store(NONE);}
+// 站点上下文：字符串（管线键）前 8 字节折成 u64，转储按 hex 打。
+static uint64_t ctx_of(const char *s){uint64_t v=0;if(s)for(int i=0;i<8&&s[i];i++)v|=uint64_t(uint8_t(s[i]))<<(i*8);return v;}
+// ---------- 停帧清单（当前帧 + 封存的上一帧；录制线程写、转储线程读，无锁） ----------
+// draws 用 pass_prof_draws 差值（第 4373 行处无条件每 draw ++）。pass 环写满后停记（保前面的），
+// build 环写满后计数溢出（溢出本身就是 np700 型风暴的读数）。
+struct PassRec{uint32_t w,h,att,samples,draws;uint64_t serial0;uint32_t depth,draws0;};
+struct ShaderSeen{uint32_t stage;char key[17];uint32_t pad;uint64_t count;};
+struct BuildRec{char key[65];uint64_t ms;};
+constexpr unsigned MAX_PASSES=4096,MAX_SHADERS=4096,MAX_BUILDS=1024;
+struct FrameManifest{
+    uint64_t serial=0;unsigned pass_n=0,shader_n=0,build_n=0;uint64_t build_overflow=0;
+    PassRec pass[MAX_PASSES];
+    ShaderSeen shader[MAX_SHADERS];
+    BuildRec build[MAX_BUILDS];
+};
+static FrameManifest cur,sealed;
+static const void *last_prog[6];   // 相邻 draw 常重复同一着色器：先比指针，变了才进环里扫（每帧开头清零）
+static void frame_seal(){
+    sealed=cur;
+    cur=FrameManifest{};cur.serial=stats.presents.load();
+    for(auto &p:last_prog)p=nullptr;
+}
+static void pass_begin(uint32_t w,uint32_t h,uint32_t att,uint32_t samples,uint64_t serial0,bool depth){
+    if(cur.pass_n>=MAX_PASSES)return;
+    PassRec &r=cur.pass[cur.pass_n];r.w=w;r.h=h;r.att=att;r.samples=samples;r.draws=0;r.serial0=serial0;r.depth=depth?1u:0u;r.draws0=uint32_t(pass_prof_draws);
+    ++cur.pass_n;
+}
+static void pass_end(){
+    if(!cur.pass_n)return;
+    PassRec &r=cur.pass[cur.pass_n-1];r.draws=uint32_t(pass_prof_draws)-r.draws0;
+}
+static void shader_used(unsigned stage,const void *prog,const char *key){
+    if(stage>=6||!prog||!key)return;
+    if(last_prog[stage]==prog)return;   // 相邻 draw 常重复同一着色器：先比指针，变了才扫环
+    last_prog[stage]=prog;
+    for(unsigned i=0;i<cur.shader_n;i++){ShaderSeen &s=cur.shader[i];if(s.stage==stage&&!memcmp(s.key,key,16)){s.count++;return;}}
+    if(cur.shader_n>=MAX_SHADERS)return;
+    ShaderSeen &s=cur.shader[cur.shader_n];s.stage=stage;unsigned j=0;for(;j<16&&key[j];j++)s.key[j]=key[j];for(;j<16;j++)s.key[j]=0;s.key[16]=0;s.count=1;
+    ++cur.shader_n;
+}
+static void pipeline_built(const char *bytes,uint64_t ms){
+    if(cur.build_n>=MAX_BUILDS){cur.build_overflow++;return;}
+    BuildRec &r=cur.build[cur.build_n];unsigned j=0;for(;j<64&&bytes[j];j++)r.key[j]=bytes[j];r.key[j]=0;r.ms=ms;
+    ++cur.build_n;
+}
+static void write_lastframe(FILE *f,const char *tag,const FrameManifest &m){
+    fprintf(f,"[%s] serial=%llu passes=%u shaders=%u builds=%u builds_overflow=%llu\n",
+        tag,(unsigned long long)m.serial,m.pass_n,m.shader_n,m.build_n,(unsigned long long)m.build_overflow);
+    unsigned np=m.pass_n;if(np>MAX_PASSES)np=MAX_PASSES;
+    for(unsigned i=0;i<np;i++){const PassRec &r=m.pass[i];
+        fprintf(f,"P %s %u w=%u h=%u att=%u samples=%u serial0=%llu depth=%u draws=%u\n",tag,i,r.w,r.h,r.att,r.samples,(unsigned long long)r.serial0,r.depth,r.draws);}
+    unsigned ns=m.shader_n;if(ns>MAX_SHADERS)ns=MAX_SHADERS;
+    for(unsigned i=0;i<ns;i++){const ShaderSeen &s=m.shader[i];fprintf(f,"S %s %s stage=%u n=%llu\n",tag,s.key,s.stage,(unsigned long long)s.count);}
+    unsigned nb=m.build_n;if(nb>MAX_BUILDS)nb=MAX_BUILDS;
+    for(unsigned i=0;i<nb;i++){const BuildRec &r=m.build[i];fprintf(f,"B %s %s ms=%llu\n",tag,r.key,(unsigned long long)r.ms);}
+}
+static std::atomic<uint64_t> last_dump_ms;
+static void dump_files(const char *why){
+    uint64_t now=timing_clock();
+    uint64_t last=last_dump_ms.load();
+    if(last && now-last<120000000000ull)return;   // 两次落盘至少隔 120s：误报不吞真报
+    last_dump_ms.store(now);
+    std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');std::string base=cut==std::string::npos?dir:dir.substr(0,cut);
+    fprintf(stderr,"[dm] 判死证据落盘 %s\n",why);
+    // gfx-lastframe.txt：停帧清单（sealed = 上一完整帧，current = 进行中帧）。
+    if(FILE *f=fopen((base+"/gfx-lastframe.txt").c_str(),"wb")){
+        fprintf(f,"DM-FRAME-MANIFEST v=1 pid=%d build=%s %s why=%s\n",getpid(),__DATE__,__TIME__,why);
+        write_lastframe(f,"sealed",sealed);write_lastframe(f,"current",cur);fclose(f);}
+    // gfx-death.txt：判死快照——线程站点表 + 提交摘要环 + lost 窗口 + pass 关闭原因直方图 + 管线计数。
+    if(FILE *f=fopen((base+"/gfx-death.txt").c_str(),"wb")){fprintf(f,"DM-DEATH v=1 pid=%d build=%s %s why=%s\n",getpid(),__DATE__,__TIME__,why);
+        for(unsigned i=0;i<MAX_THREADS;i++){const Entry &e=table[i];if(!e.used.load())continue;unsigned s=e.site.load();long long age=0;
+            if(s){uint64_t t0=e.t0.load();if(t0&&t0<=now)age=(long long)((now-t0)/1000000);}
+            fprintf(f,"T slot=%u tid=%u site=%u(%s) age_ms=%lld ctx=%016llx\n",i,e.tid.load(),s,site_name(s),age,(unsigned long long)e.ctx.load());}
+        fprintf(f,"digest ring (newest first):\n");
+        for(unsigned i=0;i<16;i++){const SubDigest &d=digest_ring[(digest_at+15u-i)&15u];if(!d.serial)continue;
+            fprintf(f,"D serial=%llu draws=%u passes=%u disp=%u\n",(unsigned long long)d.serial,d.draws,d.passes,d.dispatches);}
+        {std::lock_guard<std::mutex> l(g_lost_mu);
+         fprintf(f,"lost armed=%s ago_ms=%lld cooldown_left_ms=%u\n",g_lost_ns?"yes":"no",
+             g_lost_ns?(long long)((timing_clock()-g_lost_ns)/1000000):0LL,lost_cooldown_ms());}
+        fprintf(f,"pass_end_cause:");
+        for(unsigned i=0;i<8;i++)fprintf(f," %u=%llu",i,(unsigned long long)pass_end_cause[i]);
+        fprintf(f,"\npipeline_counts hits=%llu misses=%llu bypass=%llu evictions=%llu\n",
+            (unsigned long long)pipeline_counts.hits,(unsigned long long)pipeline_counts.misses,(unsigned long long)pipeline_counts.bypass,(unsigned long long)pipeline_counts.evictions);
+        write_lastframe(f,"sealed",sealed);write_lastframe(f,"current",cur);fclose(f);}
+}
+// 监视线程：1s 一拍，只读原子与 POD；判死后进程不退（看门狗 90s 兜底照旧）。
+static void *monitor_main(void *){
+    uint64_t threshold_ms=30000;if(const char *e=getenv("DM_DEATHGUARD_MS")){long v=atol(e);if(v>=15000)threshold_ms=uint64_t(v);}
+    xbg_logf("NVN deathguard 已启动（阈值 %llu 秒，DM_DEATHGUARD_MS 可调；判死只落盘不退出）",(unsigned long long)(threshold_ms/1000));
+    for(;;){
+        usleep(1000000);
+        uint64_t now=timing_clock();unsigned worst_site=NONE;int worst_slot=-1;long long worst_age=0;uint64_t worst_ctx=0;
+        for(unsigned i=0;i<MAX_THREADS;i++){const Entry &e=table[i];if(!e.used.load())continue;unsigned s=e.site.load();if(s==NONE)continue;
+            uint64_t t0=e.t0.load();if(!t0||t0>now)continue;long long age=(long long)((now-t0)/1000000);
+            if(age>(long long)threshold_ms&&age>worst_age){worst_age=age;worst_site=s;worst_slot=int(i);worst_ctx=e.ctx.load();}}
+        if(worst_slot<0)continue;
+        char why[192];snprintf(why,sizeof why,"线程 tid=%u 卡在 %s 已 %lld 秒 ctx=%016llx（阈值 %llu 秒）",
+            table[worst_slot].tid.load(),site_name(worst_site),worst_age/1000,(unsigned long long)worst_ctx,(unsigned long long)(threshold_ms/1000));
+        xbg_logf("【判死】%s —— 证据落盘（进程不退，看门狗 90 秒兜底照旧）",why);
+        dump_files(why);
+    }
+    return nullptr;
+}
+void start(){
+    static int begun;if(begun)return;begun=1;
+    pthread_t t;if(pthread_create(&t,nullptr,monitor_main,nullptr)==0)pthread_detach(t);
+    else xbg_logf("【红】deathguard 监视线程启动失败（判死证据链降级为仅 wait_dump）");
+}
+// 看门狗 stall/判死转储的图形侧等待点状态（crash_set_wait_dump 注册，弱——不链宿主时注册不了）。
+// 无锁、只读原子与 POD，每行有界：线程表最多 64 行 + 摘要 16 行 + 清单两段。
+void wait_dump(){
+    fprintf(stderr,"[dm-wait] 线程站点表：\n");
+    for(unsigned i=0;i<MAX_THREADS;i++){const Entry &e=table[i];if(!e.used.load())continue;unsigned s=e.site.load();long long age=0;
+        if(s){uint64_t t0=e.t0.load();uint64_t now=timing_clock();if(t0&&t0<=now)age=(long long)((now-t0)/1000000);}
+        fprintf(stderr,"[dm-wait] T slot=%u tid=%u site=%s age_ms=%lld ctx=%016llx\n",i,e.tid.load(),site_name(s),age,(unsigned long long)e.ctx.load());}
+    fprintf(stderr,"[dm-wait] 提交摘要环（新→旧）：\n");
+    for(unsigned i=0;i<16;i++){const SubDigest &d=digest_ring[(digest_at+15u-i)&15u];if(!d.serial)continue;
+        fprintf(stderr,"[dm-wait] D serial=%llu draws=%u passes=%u disp=%u\n",(unsigned long long)d.serial,d.draws,d.passes,d.dispatches);}
+    fprintf(stderr,"[dm-wait] 停帧清单（内存，sealed=上一完整帧 current=进行中帧）：\n");
+    write_lastframe(stderr,"sealed",sealed);write_lastframe(stderr,"current",cur);
+}
+// 跨编译单元入口（xbg_deathsite.h 契约）：同线程进出配对，支持嵌套（栈深 4 够用——present 回调里最多一层）。
+// Cross-TU entry (the xbg_deathsite.h contract): enter/leave pairs per thread, nesting supported (depth 4).
+struct XSite{int slot;unsigned prev;uint64_t prev_ctx;};
+static thread_local XSite xstack[4];static thread_local int xdepth=0;
+void x_enter(unsigned site,uint64_t ctx){
+    int slot=claim();if(slot<0||xdepth>=4)return;
+    XSite &x=xstack[xdepth++];x.slot=slot;x.prev=table[slot].site.load();x.prev_ctx=table[slot].ctx.load();
+    table[slot].t0.store(timing_clock());table[slot].ctx.store(ctx);table[slot].site.store(site);
+}
+void x_leave(){
+    if(!xdepth)return;
+    XSite &x=xstack[--xdepth];
+    if(x.prev==NONE)table[x.slot].site.store(NONE);
+    else{table[x.slot].site.store(x.prev);table[x.slot].t0.store(timing_clock());table[x.slot].ctx.store(x.prev_ctx);}
+}
+// draw_bound 读 state（第 2486 行才定义），函数体在那一行之后补定义；这里只留声明。
+void draw_bound();
+}   // namespace deathguard
+// ⚠ xbg_death_site_enter/leave 是 vulkan_present.cpp（另一编译单元）要链接的契约符号——
+//   匿名命名空间里 extern "C" 会变成内部链接 ⇒ 定义移到本匿名命名空间闭合之后（下方 "~3040 行"处）。
+//   crash_set_wait_dump 的 weak 声明同理上移到文件头部全局作用域。
+// ⚠ xbg_death_site_enter/leave are contract symbols linked from vulkan_present.cpp (another TU) --
+//   extern "C" inside an anonymous namespace gets internal linkage, so the definitions live after
+//   this anonymous namespace closes (below); crash_set_wait_dump's weak decl moved to file head.
 // Samples-passed counting: one precise occlusion query per run of counted draws inside a pass (Metal counts per pass,
 // nvn_mtl.m), not one per draw. A run ends with its pass, at a counter reset, and at a report (which ends the pass), so a
 // report still sums exactly the draws since its reset. ~2200 begin/end pairs per D2R camp frame cost the Adreno 730
@@ -870,7 +1080,7 @@ void end_open_pass(){if(open_pass.cmd){
         VkClearAttachment a{};a.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;a.colorAttachment=0;
         a.clearValue.color.float32[0]=0.f;a.clearValue.color.float32[1]=0.f;a.clearValue.color.float32[2]=1.f;a.clearValue.color.float32[3]=1.f;
         VkClearRect r{};r.rect.extent={8192,8192};r.layerCount=1;vkCmdClearAttachments(open_pass.cmd,1,&a,1,&r);}}
-    end_occlusion_query();vkCmdEndRenderPass(open_pass.cmd);if(open_pass.depth_attached && !open_pass.depth_used){++depth_idle_passes;pass_prof_depth_idle(open_pass.cmd);}pass_prof_end(open_pass.cmd);open_pass=OpenPass{};++pass_end_by[cur_op<64?cur_op:63];++pass_end_cause[pass_end_cause_now&7];}}
+    end_occlusion_query();vkCmdEndRenderPass(open_pass.cmd);if(open_pass.depth_attached && !open_pass.depth_used){++depth_idle_passes;pass_prof_depth_idle(open_pass.cmd);}pass_prof_end(open_pass.cmd);deathguard::pass_end();open_pass=OpenPass{};++pass_end_by[cur_op<64?cur_op:63];++pass_end_cause[pass_end_cause_now&7];}}
 // np676：**帧中自检**——在"刚画完窗口那张图"的瞬间读回它左上 64x64，区分两种完全不同的病：
 //   A 读到有内容 ⇒ 绘制确实落进了这张图，present 之前/之中被清掉或被另一张图顶替；
 //   B 读到全 0   ⇒ 这些 draw 根本没在这张图上产生像素（渲染执行层）。
@@ -962,7 +1172,7 @@ void retire_slot(Slot &s){
     if(!s.pending)return;
     poolreset::finish(s);
     {CPU_SCOPE(Fence);bool busy=vkGetFenceStatus(cfg.device,s.fence)==VK_NOT_READY;uint64_t b0=busy?timing_clock():0;
-     VkResult wr=vkWaitForFences(cfg.device,1,&s.fence,VK_TRUE,std::max<uint64_t>(cfg.fence_timeout_ns,10000000000ull));
+     VkResult wr;{deathguard::VkSite site(deathguard::FENCE_RETIRE);wr=vkWaitForFences(cfg.device,1,&s.fence,VK_TRUE,std::max<uint64_t>(cfg.fence_timeout_ns,10000000000ull));}
      // np633：**fence 死等兜底**。真 device lost 时提交被驱动"成功接收"但实际丢弃 ⇒ fence 永不 signal
      // ⇒ 10 秒超时返回 -4，原 VK() 直接 FATAL（np630run2 看门狗现场就是它）。改成：不 FATAL，
      // vkResetFences 后当完成处理（丢一帧画面，进程活着）；每 3 次报一行。DM_FENCE_SKIP=0 恢复严格。
@@ -1101,15 +1311,17 @@ void submit_split_segment(){
       // np658：同款冷却（切段路径也要在恢复窗口内保持安静）。
       // np658: same cooldown (the split path must stay quiet during recovery too).
       if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}
-      VkResult sr=vkQueueSubmit(cfg.queue,1,&si,fence);
+      // np701：守卫只包住**单次** vkQueueSubmit（重试之间的冷却睡眠不算站龄——56 次重试的合法序列远超阈值）。
+      // np701: the guard wraps ONE vkQueueSubmit (the sleeps between retries are not site age).
+      VkResult sr;{deathguard::VkSite site(deathguard::SUBMIT_SPLIT);sr=vkQueueSubmit(cfg.queue,1,&si,fence);}
       // np632b：切段路径同款重试（np632 实测主路径三次穿透全兜住，切段路径也要兜）。
       if(sr!=VK_SUCCESS && retry_submit_enabled()){
          for(int attempt=0;attempt<6 && sr!=VK_SUCCESS;++attempt){usleep(3000u<<attempt);
             if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}  // np661：同款冷却（切段路径）。
-            sr=vkQueueSubmit(cfg.queue,1,&si,fence);}
+            {deathguard::VkSite site(deathguard::SUBMIT_SPLIT);sr=vkQueueSubmit(cfg.queue,1,&si,fence);}}
          for(int attempt=0;attempt<50 && sr!=VK_SUCCESS;++attempt){usleep(100000u);
             if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}  // np661：同款冷却（切段路径长宽限）。
-            sr=vkQueueSubmit(cfg.queue,1,&si,fence);}
+            {deathguard::VkSite site(deathguard::SUBMIT_SPLIT);sr=vkQueueSubmit(cfg.queue,1,&si,fence);}}
          static int ok3=0;if(sr==VK_SUCCESS && ok3++<3)xbg_logf("【宽限】切段重试成功（段 %u）",split_seg);
       }
       if(sr!=VK_SUCCESS){xbg_logf("【红】二分段 %u 提交失败 %d —— 驱动在本段翻脸",split_seg,int(sr));
@@ -1181,7 +1393,9 @@ void submit_slots(bool wait){
          // np658：reset 恢复窗口内不敲队列（防 Submit commandlist fail 攒账被连坐杀）。
          // np658: keep quiet inside the driver recovery window (avoids piling up Submit commandlist fail).
          if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}
-         VkResult sr=vkQueueSubmit(cfg.queue,1,&si,s.fence);
+         // np701：守卫只包住单次 vkQueueSubmit（重试之间的睡眠不算站龄）。
+         // np701: the guard wraps ONE vkQueueSubmit (sleeps between retries are not site age).
+         VkResult sr;{deathguard::VkSite site(deathguard::SUBMIT);sr=vkQueueSubmit(cfg.queue,1,&si,s.fence);}
          // np631：**冷路径首提交重试**。vkQueueSubmit -4 时等 3ms 重试一次（默认开，DM_RETRY_SUBMIT=0 关）。
          // 依据：① 驱动自带恢复（系统日志 "Gpu is reset when queue submit. Recover queue error now."）；
          //       ② np630run3 的模式：挂点总在"新类型工作第一次提交"处 ⇒ 冷路径首次分配失败最像，
@@ -1197,7 +1411,7 @@ void submit_slots(bool wait){
                 // np661: each retry attempt is also inside the cooldown window -- sleep the remainder first
                 //   (np660: CQ failures dropped 37->14 but not zero; the rest came from the retry loop).
                 if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}
-                sr=vkQueueSubmit(cfg.queue,1,&si,s.fence);
+                {deathguard::VkSite site(deathguard::SUBMIT);sr=vkQueueSubmit(cfg.queue,1,&si,s.fence);}
                 static int ok=0;if(sr==VK_SUCCESS && ok++<6)xbg_logf("【重试】第 %d 次尝试成功（%ums）",attempt+1,3u<<attempt);
             }
             // np632：**长宽限**——6 次快退避全败（np631b 实测：驱动打 "Recover error end and return
@@ -1208,7 +1422,7 @@ void submit_slots(bool wait){
                 // np661：长宽限同款（5 秒 × 每 100ms 一发 = 恢复窗口内最多 50 发，全部喂给记账）。
                 // np661: same for the long grace loop (5 s x every 100 ms = up to 50 knocks inside the window).
                 if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}
-                sr=vkQueueSubmit(cfg.queue,1,&si,s.fence);
+                {deathguard::VkSite site(deathguard::SUBMIT);sr=vkQueueSubmit(cfg.queue,1,&si,s.fence);}
                 static int ok2=0;if(sr==VK_SUCCESS && ok2++<3)xbg_logf("【宽限】长宽限第 %d 次尝试成功",ok2);
                 else if(attempt%10==9)xbg_logf("【宽限】已等待 %d 次（%ums）仍 -4",attempt+1,(attempt+1)*100);
             }
@@ -2484,6 +2698,11 @@ struct State {
     VkViewport viewport{0,0,1,1,0,1};VkRect2D scissor{{0,0},{UINT32_MAX,UINT32_MAX}};float blend_color[4]{},bias[3]{};uint32_t stencil_compare[2]{~0u,~0u},stencil_write[2]{~0u,~0u},stencil_ref[2]{};int64_t copy_stride=0,copy_image_stride=0;uint32_t patch_size=3;
     xbg_depth_bounds bounds{0,0,1};bool count_samples=false;uint64_t samples_passed=0;
 } state;
+// np701：每 draw 记本帧绑定过的着色器（判死停帧清单）。便宜：6 次空判 + 6 次指针比较。
+// np701: record the frame's bound shaders per draw (death manifest). Cheap: 6 null checks + 6 pointer compares.
+void deathguard::draw_bound(){
+    for(unsigned st=0;st<6;st++)if(state.shader[st])shader_used(st,state.shader[st],state.shader[st]->key.c_str());
+}
 // Pipeline memo (gfx-pipe-memo): every input the draw's VkGraphicsPipelineCreateInfo is built from. When a draw's inputs
 // equal the previous draw's, it gets the previous draw's pipeline without serializing the create info into a key and
 // looking it up (xbg_graphics_pipeline_key with its module-id lookups was ~6% of the game thread on Adreno 730). Raw
@@ -2811,6 +3030,10 @@ const std::array<Shader*,6> &program_shaders(const prog_t *prog){
 }
 } // namespace
 
+// np701：跨编译单元契约符号（xbg_deathsite.h；vulkan_present.cpp 链接）——必须在全局作用域。
+// np701: cross-TU contract symbols (xbg_deathsite.h, linked by vulkan_present.cpp) -- global scope required.
+extern "C" void xbg_death_site_enter(unsigned site,unsigned long long ctx){deathguard::x_enter(site,ctx);}
+extern "C" void xbg_death_site_leave(void){deathguard::x_leave();}
 extern "C" void xbg_logf(const char *fmt,...){CPU_SCOPE(Log);char text[1024];va_list a;va_start(a,fmt);vsnprintf(text,sizeof(text),fmt,a);va_end(a);if(cfg.log)cfg.log(cfg.userdata,text);else fprintf(stderr,"[xbg] %s\n",text);}
 extern "C" __attribute__((noreturn)) void xbg_fatalf(const char *fmt,...){va_list a;va_start(a,fmt);vsnprintf(error_text,sizeof(error_text),fmt,a);va_end(a);failed=true;xbg_logf("FATAL: %s",error_text);if(cfg.fatal)cfg.fatal(cfg.userdata,error_text);abort();}
 extern "C" int xbg_backend_failed(){return failed;}
@@ -2972,7 +3195,8 @@ bool build(const Rec &rec){
     if(depth_clamp_on()){clipst.depthClipEnable=VK_FALSE;clipst.pNext=rs.pNext;rs.pNext=&clipst;}
     ci.stageCount=ns;ci.pStages=st;ci.pVertexInputState=&v;ci.pInputAssemblyState=&a;ci.pTessellationState=ht?&t:nullptr;ci.pViewportState=&vp;ci.pRasterizationState=&rs;ci.pMultisampleState=&m;ci.pDepthStencilState=&d;ci.pColorBlendState=&b;ci.pDynamicState=&dy;ci.layout=layout;ci.renderPass=pass;
     const std::string guard=pipeguard::graphics_key(rec.keys);if(pipeguard::skipped(guard))return false;
-    uint64_t c0=timing_clock();VkPipeline pl;pipeguard::begin(guard);const VkResult made=vkCreateGraphicsPipelines(cfg.device,pipeline_cache,1,&ci,nullptr,&pl);pipeguard::end(guard,made==VK_SUCCESS);
+    uint64_t c0=timing_clock();VkPipeline pl;pipeguard::begin(guard);const VkResult made=[&]{deathguard::VkSite site(deathguard::PIPE_GRAPHICS,deathguard::ctx_of(guard.c_str()));return vkCreateGraphicsPipelines(cfg.device,pipeline_cache,1,&ci,nullptr,&pl);}();pipeguard::end(guard,made==VK_SUCCESS);
+    deathguard::pipeline_built(guard.c_str(),(timing_clock()-c0)/1000000ull);
     if(made!=VK_SUCCESS){char why[64];snprintf(why,sizeof why,"failed to build (result=%d)",int(made));pipeguard::record(guard,why);return false;}
     if(timing_clock()-c0>=compile_ns)++compiled;
     std::string bytes(reinterpret_cast<const char*>(rec.words.data()),rec.words.size()*4);
@@ -3144,10 +3368,11 @@ void pipeline_lookup(PipelineLease &out,const XbgPipelineKey &key,bool cacheable
     else if(graphics && cacheable && may_skip && warm::async_request(*graphics,key,bytes)){out.pipeline=VK_NULL_HANDLE;out.transient=true;++warm::async_skips;return;}
     else if(graphics){std::vector<std::string> keys;{std::lock_guard<std::mutex> l(warm::mu);for(uint32_t i=0;i<graphics->stageCount;i++){auto it=warm::ids.find(graphics->pStages[i].module);keys.push_back(it==warm::ids.end()?std::string():warm::id_keys[it->second]);}}
         const std::string guard=pipeguard::graphics_key(keys);if(pipeguard::skipped(guard)){out.pipeline=VK_NULL_HANDLE;out.transient=true;return;}
-        uint64_t t0=timing_clock();VkGraphicsPipelineCreateInfo g=*graphics;if(pipe_stats)g.flags|=VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;pipeguard::begin(guard);const VkResult made=vkCreateGraphicsPipelines(cfg.device,pipeline_cache,1,&g,nullptr,&out.pipeline);pipeguard::end(guard,made==VK_SUCCESS);
+        uint64_t t0=timing_clock();VkGraphicsPipelineCreateInfo g=*graphics;if(pipe_stats)g.flags|=VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;pipeguard::begin(guard);const VkResult made=[&]{deathguard::VkSite site(deathguard::PIPE_GRAPHICS,deathguard::ctx_of(guard.c_str()));return vkCreateGraphicsPipelines(cfg.device,pipeline_cache,1,&g,nullptr,&out.pipeline);}();pipeguard::end(guard,made==VK_SUCCESS);
+        deathguard::pipeline_built(guard.c_str(),(timing_clock()-t0)/1000000ull);
         if(made!=VK_SUCCESS){char why[64];snprintf(why,sizeof why,"failed to build (result=%d)",int(made));pipeguard::record(guard,why);out.pipeline=VK_NULL_HANDLE;out.transient=true;return;}
         if(pipe_stats)pstat_log(out.pipeline);uint64_t dt=timing_clock()-t0;if(dt>=compile_ns)++pipelines_unsaved;++warm::creates;warm::create_ns+=dt;++hud::pipelines;hud::pipeline_ns+=dt;warm::create_max_ns=std::max(warm::create_max_ns,dt);if(cacheable)warm::record(*graphics,key);}
-    else{uint64_t t0=timing_clock();VkComputePipelineCreateInfo cc=*compute;if(pipe_stats)cc.flags|=VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;const std::string shader_key=pipeguard::compute_key(state.shader[5]->key);pipeguard::begin(shader_key);const VkResult made=vkCreateComputePipelines(cfg.device,pipeline_cache,1,&cc,nullptr,&out.pipeline);pipeguard::end(shader_key,made==VK_SUCCESS);if(made!=VK_SUCCESS){char why[64];snprintf(why,sizeof why,"failed to build (result=%d)",int(made));pipeguard::record(shader_key,why);out.pipeline=VK_NULL_HANDLE;out.transient=true;return;}++pipelines_unsaved;++hud::pipelines;hud::pipeline_ns+=timing_clock()-t0;if(pipe_stats)pstat_log(out.pipeline);}
+    else{uint64_t t0=timing_clock();VkComputePipelineCreateInfo cc=*compute;if(pipe_stats)cc.flags|=VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;const std::string shader_key=pipeguard::compute_key(state.shader[5]->key);pipeguard::begin(shader_key);const VkResult made=[&]{deathguard::VkSite site(deathguard::PIPE_COMPUTE,deathguard::ctx_of(shader_key.c_str()));return vkCreateComputePipelines(cfg.device,pipeline_cache,1,&cc,nullptr,&out.pipeline);}();pipeguard::end(shader_key,made==VK_SUCCESS);deathguard::pipeline_built(shader_key.c_str(),(timing_clock()-t0)/1000000ull);if(made!=VK_SUCCESS){char why[64];snprintf(why,sizeof why,"failed to build (result=%d)",int(made));pipeguard::record(shader_key,why);out.pipeline=VK_NULL_HANDLE;out.transient=true;return;}++pipelines_unsaved;++hud::pipelines;hud::pipeline_ns+=timing_clock()-t0;if(pipe_stats)pstat_log(out.pipeline);}
     if(!cacheable){out.transient=true;return;}
     if(pipeline_objects.size()==pipeline_object_limit){
         // All prior draws/dispatches waited their fence. This lookup occurs
@@ -4032,7 +4257,7 @@ void pass_prof_draw(VkCommandBuffer cmd){Slot &s=slots[slot_index];if(!s.prof ||
 int pass_prof_compute_begin(VkCommandBuffer cmd,const p_dispatch &p){int index=pass_prof_reserve(cmd);if(index<0)return index;
     auto &r=slots[slot_index].prof_recs[index];r.compute=true;r.first=state.shader[5]->key;r.last=r.first;r.x=uint32_t(p.x);r.y=uint32_t(p.y);r.z=uint32_t(p.z);return index;
 }
-void begin_pass(Pass &p,Commands &c){pass_prof_begin(p,c.command);VkRenderPassBeginInfo b{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};b.renderPass=p.pass;b.framebuffer=p.framebuffer;b.renderArea.extent={p.width,p.height};vkCmdBeginRenderPass(c.command,&b,VK_SUBPASS_CONTENTS_INLINE);}
+void begin_pass(Pass &p,Commands &c){deathguard::pass_begin(p.width,p.height,p.images.n,uint32_t(p.samples),p.images.n&&p.images.v[0]?p.images.v[0]->source.serial:0ull,state.rt.depth!=nullptr);pass_prof_begin(p,c.command);VkRenderPassBeginInfo b{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};b.renderPass=p.pass;b.framebuffer=p.framebuffer;b.renderArea.extent={p.width,p.height};vkCmdBeginRenderPass(c.command,&b,VK_SUBPASS_CONTENTS_INLINE);}
 void capture_pass(Pass &pass){
     if(!capture.active)return;
     capture_log("PASS width=%u height=%u samples=%u viewport=%g,%g,%g,%g scissor=%d,%d,%u,%u mask=%#x blendEnable=%#x cull=%u front=%u depthTest=%u depthWrite=%u depthFunc=%u stencil=%u",pass.width,pass.height,unsigned(pass.samples),state.viewport.x,state.viewport.y,state.viewport.width,state.viewport.height,state.scissor.offset.x,state.scissor.offset.y,state.scissor.extent.width,state.scissor.extent.height,state.mask.mask,state.color.blend_en,state.poly.cull,state.poly.front,unsigned(state.ds.dt),unsigned(state.ds.dw),unsigned(state.ds.df),unsigned(state.ds.st));
@@ -4370,7 +4595,7 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
                 xbg_logf("[顶点]   索引 size=%zu 前%zu字节: %s",ib->size,nb,hex);}
         }}}
     if(indexed){if(bc.ib!=ib->buffer || bc.ibo!=ib->offset || bc.it!=index_type){vkCmdBindIndexBuffer(c.command,ib->buffer,ib->offset,index_type);bc.ib=ib->buffer;bc.ibo=ib->offset;bc.it=index_type;}else ++binds_skipped;vkCmdDrawIndexed(c.command,count,indexed->instances,0,indexed->base_vertex,indexed->base_instance);}else vkCmdDraw(c.command,count,instances,first,first_instance);
-    if(!occlusion_batch_enabled)end_occlusion_query();c.finish();++perf.draws;++pass_prof_draws;pass_prof_verts+=uint64_t(uint32_t(count))*instances;
+    if(!occlusion_batch_enabled)end_occlusion_query();c.finish();++perf.draws;++pass_prof_draws;pass_prof_verts+=uint64_t(uint32_t(count))*instances;deathguard::draw_bound();
     // np629：提交二分的切点。只在 pass 边界切（本 draw 刚 finish、若无 open pass 就是边界）；
     // N=0 关闭。切点动作在 submit_split_segment()（见 submit_slots 上方）。
     // np629: the cut point. Only at pass boundaries (this draw just finished; no open pass = boundary).
@@ -4430,7 +4655,7 @@ bool prepare(){
     VK(vkAllocateDescriptorSets(cfg.device,&ai,&sets[0][0]));
     VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};mi.codeSize=sizeof(xbg_bright_lut_cs);mi.pCode=xbg_bright_lut_cs;VkShaderModule module{};VK(vkCreateShaderModule(cfg.device,&mi,nullptr,&module));
     VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};ci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;ci.stage.module=module;ci.stage.pName="main";ci.layout=layout;
-    VkResult r=vkCreateComputePipelines(cfg.device,pipeline_cache,1,&ci,nullptr,&pipeline);vkDestroyShaderModule(cfg.device,module,nullptr);
+    VkResult r;{deathguard::VkSite site(deathguard::PIPE_OTHER);r=vkCreateComputePipelines(cfg.device,pipeline_cache,1,&ci,nullptr,&pipeline);}vkDestroyShaderModule(cfg.device,module,nullptr);
     if(r!=VK_SUCCESS){pipeline={};xbg_logf("NVN bright: off (compute pipeline result=%d)",int(r));return false;}
     xbg_logf("NVN bright: ready (color table rewrite, exposure from dm_bright_k)");return true;
 }
@@ -4538,7 +4763,7 @@ struct MaskedClear {
         std::vector<VkPipelineColorBlendAttachmentState> colors(p.color_slots,color);VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};blend.attachmentCount=colors.size();blend.pAttachments=colors.data();
         VkDynamicState dyn[2]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};dynamic.dynamicStateCount=2;dynamic.pDynamicStates=dyn;
         VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};ci.stageCount=cm?2:1;ci.pStages=stages;ci.pVertexInputState=&vi;ci.pInputAssemblyState=&ia;ci.pViewportState=&vp;ci.pRasterizationState=&rs;ci.pMultisampleState=&ms;ci.pDepthStencilState=&ds;ci.pColorBlendState=&blend;ci.pDynamicState=&dynamic;ci.layout=layout;ci.renderPass=p.pass;
-        VK(vkCreateGraphicsPipelines(cfg.device,pipeline_cache,1,&ci,nullptr,&pipeline));
+        {deathguard::VkSite site(deathguard::PIPE_OTHER);VK(vkCreateGraphicsPipelines(cfg.device,pipeline_cache,1,&ci,nullptr,&pipeline));}
     }
     void encode(Commands &c,const Pass &p,const VkRect2D &rect,const void *color){
         bind_cache_reset();VkViewport viewport{0,0,float(p.width),float(p.height),0,1};vkCmdBindPipeline(c.command,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);vkCmdSetViewport(c.command,0,1,&viewport);vkCmdSetScissor(c.command,0,1,&rect);
@@ -5161,6 +5386,10 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
      {FILE *q=fopen((base+"/gfx-shader-reuse").c_str(),"rb");shader_reuse=0;if(q){int c=fgetc(q);shader_reuse=c=='0'?0:c=='2'?2:1;fclose(q);}else if(const char *e=getenv("DM_GFX_SHADER_REUSE"))shader_reuse=atoi(e);
       warm::keep_rewritten=shader_reuse!=0;xbg_logf("NVN shader loads take the warm-up's rewritten SPIR-V=%d (marker gfx-shader-reuse; 2 also rewrites and compares)",shader_reuse);}}
     pipeguard::load();xbg_module_id_hook=warm::module_id;{std::string lp=warm::list_path();FILE *nw=fopen((lp.substr(0,lp.find_last_of('/'))+"/gfx-no-warm").c_str(),"rb");warm::enabled=!nw;if(nw)fclose(nw);}warm::start();
+    // np701：判死证据链上线——监视线程 + 看门狗转储的图形侧等待点（弱符号：不链宿主时静默跳过）。
+    // np701: bring up the death-evidence chain -- the monitor thread and the wait-point dump for the
+    //   watchdog (weak symbol: silently skipped when the host isn't linked in).
+    deathguard::start();if(crash_set_wait_dump)crash_set_wait_dump(&deathguard::wait_dump);
     wtrack::enabled=false;state=State{};state.color.logic_op=3;state.color.alpha_func=8;for(unsigned i=0;i<8;i++)state.blend[i]={i,2,1,2,1,1,1};stats.reset();timing=XbgCpuTiming(timing_clock);pipeline_counts={};pipeline_before={};pipeline_tick=0;timing_active=false;timing_first=timing_last=0;live_profile_used=false;descriptor_detail=false;descriptor_timing=XbgDescriptorTiming{};descriptor_root=nullptr;draw_detail=false;draw_timing=XbgDrawTiming{};draw_root=nullptr;completed=0;last_attachment_trace=UINT64_MAX;sampler_mirror_clamp_enabled=VK_FALSE;failed=false;error_text[0]=0;initialized=true;
     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-submit").c_str(),"rb");bool sync_submit=false;if(m){sync_submit=fgetc(m)=='1';fclose(m);}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-async-pool-reset").c_str(),"rb");poolreset::enabled=false;if(w){poolreset::enabled=fgetc(w)!='0';fclose(w);}else if(const char *e=getenv("DM_GFX_ASYNC_POOL_RESET"))poolreset::enabled=atoi(e)!=0;poolreset::start();xbg_logf("NVN async command pool reset=%d (marker gfx-async-pool-reset)",int(poolreset::enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-bindcache").c_str(),"rb");if(w){bind_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-imgcache").c_str(),"rb");if(w){img_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pass-profile").c_str(),"rb");if(w){pass_prof_enabled=true;unsigned long long from=0,period=0,count=0;if(fscanf(w,"%llu %llu %llu",&from,&period,&count)>=2){pass_prof_next=from;pass_prof_period=period?period:1;if(count)pass_prof_until=from+count;}fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-descmemo").c_str(),"rb");if(w){desc_memo_enabled=false;fclose(w);}xbg_logf("NVN descmemo enabled=%d",int(desc_memo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-dynpartial").c_str(),"rb");if(w){dyn_partial_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-xmemo").c_str(),"rb");if(w){xmemo_enabled=false;fclose(w);}xbg_logf("NVN cross-frame memo enabled=%d",int(xmemo_enabled));}{auto marker=[&](const char *name){FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+name).c_str(),"rb");int c=-1;if(w){c=fgetc(w);fclose(w);}return c;};persistent_fb_enabled=marker("/gfx-no-persistent-fb")<0;slot_pools_enabled=marker("/gfx-no-slot-pools")<0;readback_cached=marker("/gfx-readback-cached")=='1' || (marker("/gfx-readback-cached")<0 && getenv("DM_GFX_READBACK_CACHED") && *getenv("DM_GFX_READBACK_CACHED")=='1');texel_memo_enabled=marker("/gfx-no-texel-memo")<0;no_occlusion_queries=marker("/gfx-no-occlusion")=='1';samples_report_seen=false;open_occlusion=OpenOcclusion{};occlusion_queries_started=0;occlusion_batch_enabled=marker("/gfx-query-per-draw")!='1' && marker("/gfx-no-query-batch")<0;heavy_timestamps=marker("/gfx-heavy-timestamps")=='1';xbg_logf("NVN persistent framebuffers=%d slot command pools=%d cached readback=%d texel memo=%d (markers gfx-no-persistent-fb, gfx-no-slot-pools, gfx-readback-cached, gfx-no-texel-memo)",int(persistent_fb_enabled),int(slot_pools_enabled),int(readback_cached),int(texel_memo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-wtrack").c_str(),"rb");wtrack::marker=-1;if(w){wtrack::marker=fgetc(w)=='1'?1:0;fclose(w);}wtrack::enabled=wtrack::marker==1;}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-wtrack").c_str(),"rb");if(w){wtrack::enabled=false;wtrack::marker=0;fclose(w);}xbg_logf("NVN wtrack enabled=%d (markers gfx-no-wtrack, gfx-wtrack=0)",int(wtrack::enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-mutable-images").c_str(),"rb");no_mutable_images=true;if(w){no_mutable_images=fgetc(w)!='1';fclose(w);}xbg_logf("NVN mutable-format images=%d (marker gfx-mutable-images)",int(!no_mutable_images));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-mutable-test").c_str(),"rb");mutable_test=0;if(w){if(fscanf(w,"%u",&mutable_test)!=1)mutable_test=0;fclose(w);}if(mutable_test)xbg_logf("NVN mutable upgrade test every %u images (marker gfx-mutable-test)",mutable_test);}
      /* Android: no guest memory remapping probe. */
@@ -5269,7 +5498,7 @@ extern "C" int xbg_game_profile_cpu(uint64_t first_frame,uint32_t frame_count){
     xbg_logf("NVN CPU_TIMING armed first=%llu count=%u maxSeconds=60 clock=steady elapsed-not-thread-cpu",(unsigned long long)first_frame,frame_count);
     if(first_frame==1)timing_start();return 0;
 }
-extern "C" int xbg_game_shutdown(){gfx_drain();gfx_async_stop();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return 0;timing_report("shutdown-partial");provenance_close("SHUTDOWN");resolve_pending();submit_slots(true);save_pipeline_cache();pending_writebacks.clear();pending_reports.clear();pending_events.clear();recording_events.clear();epochs.clear();VkResult r=vkQueueWaitIdle(cfg.queue);if(r!=VK_SUCCESS)return r;wtrack::release();destroy_slots();clear_pipeline_objects();cache_save_join();warm::shutdown();bright::shutdown();clear_descriptor_caches();clear_render_pass_cache();images.clear();++images_epoch;for(auto &f:persistent_framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);persistent_framebuffers.clear();image_index.clear();image_index_dirty=true;program_cache.clear();shaders.clear();textures.clear();texture_pool_cache=nullptr;samplers.clear();null_textures.clear();texture_pool_cache=nullptr;pools.clear();host_segments.clear();host_ranges.clear();host_bytes=0;cmd_range_lo=0;cmd_range_bytes=0;vkDestroyPipelineCache(cfg.device,pipeline_cache,nullptr);pipeline_cache=VK_NULL_HANDLE;vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;initialized=false;return 0;}
+extern "C" int xbg_game_shutdown(){gfx_drain();gfx_async_stop();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return 0;timing_report("shutdown-partial");provenance_close("SHUTDOWN");resolve_pending();submit_slots(true);save_pipeline_cache();pending_writebacks.clear();pending_reports.clear();pending_events.clear();recording_events.clear();epochs.clear();VkResult r;{deathguard::VkSite site(deathguard::QUEUE_WAIT_IDLE);r=vkQueueWaitIdle(cfg.queue);}if(r!=VK_SUCCESS)return r;wtrack::release();destroy_slots();clear_pipeline_objects();cache_save_join();warm::shutdown();bright::shutdown();clear_descriptor_caches();clear_render_pass_cache();images.clear();++images_epoch;for(auto &f:persistent_framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);persistent_framebuffers.clear();image_index.clear();image_index_dirty=true;program_cache.clear();shaders.clear();textures.clear();texture_pool_cache=nullptr;samplers.clear();null_textures.clear();texture_pool_cache=nullptr;pools.clear();host_segments.clear();host_ranges.clear();host_bytes=0;cmd_range_lo=0;cmd_range_bytes=0;vkDestroyPipelineCache(cfg.device,pipeline_cache,nullptr);pipeline_cache=VK_NULL_HANDLE;vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;initialized=false;return 0;}
 extern "C" void xbg_game_get_stats(xbg_game_stats *out){if(out)*out={stats.submissions.load(),stats.draws.load(),stats.dispatches.load(),stats.presents.load(),stats.shader_loads.load()};}
 extern "C" void xbg_game_frame_counters(xbg_frame_counters *out){if(out)*out={hud::pipelines.load(),hud::pipeline_ns.load(),hud::shaders.load(),hud::shader_ns.load(),hud::uploads.load(),hud::reuploads.load(),hud::upload_bytes.load(),hud::upload_ns.load()};}
 extern "C" void xbg_game_set_frame(uint64_t frame){hud::frame.store(frame,std::memory_order_relaxed);}
@@ -5383,7 +5612,7 @@ extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
     resolve_known_reports();if(pending_writebacks.empty()&&pending_reports.empty()){publish_completed(submitted);}
     return fence<=completed;
 }
-extern "C" void xbg_legacy_finish(){gfx_drain();std::lock_guard<std::recursive_mutex> lock(mutex);need(initialized,"Queue finish before Vulkan initialization");++perf.why_finish;complete_all();VK(vkQueueWaitIdle(cfg.queue));}
+extern "C" void xbg_legacy_finish(){gfx_drain();std::lock_guard<std::recursive_mutex> lock(mutex);need(initialized,"Queue finish before Vulkan initialization");++perf.why_finish;complete_all();{deathguard::VkSite site(deathguard::QUEUE_WAIT_IDLE);VK(vkQueueWaitIdle(cfg.queue));}}
 // np665：**上屏源图自检**。要回答的是一个二选一：屏幕全黑是"源图本来就黑"（渲染侧）还是"上屏没生效"
 //   （呈现侧）。做法：在第 N 次 present 时（DM_PRESENT_PROBE=N）把**正要上屏的那张纹理**读回 CPU，
 //   打一行统计 + 一张 32x18 的 ASCII 亮度图。走日志而不落盘——本平台大 I/O 会楔死客体线程（铁律：1.1MB
@@ -5495,7 +5724,7 @@ static void present_probe_other_serials(){
             (unsigned long long)nz,(unsigned long long)npx,100.0*double(nz)/double(npx),int(oi.layout));
     }
 }
-static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();{SiteScope site(SITE_PRESENT);cur_op=61;TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");
+static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();deathguard::frame_seal();{SiteScope site(SITE_PRESENT);cur_op=61;TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");
          // np662：**切后台不挂死**。表面销毁后上屏回调会在 wait_window() 无限等新表面 ⇒
          // 帧循环整个停住、看门狗 90 秒判死（死状与真卡点难辨）。无窗口时跳过本帧出图、
          // 游戏照常跑（回前台自动恢复出图）；提交侧照旧（冷却逻辑不变）。
