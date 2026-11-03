@@ -4269,6 +4269,14 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     for(auto &b:vertex_buffers){VkDeviceSize off=b.second->offset;if(b.first<16 && bc.vb[b.first]==b.second->buffer && bc.vbo[b.first]==off){++binds_skipped;continue;}
         vkCmdBindVertexBuffers(c.command,b.first,1,&b.second->buffer,&off);if(b.first<16){bc.vb[b.first]=b.second->buffer;bc.vbo[b.first]=off;}}
     pass_prof_draw(c.command);
+    // np686：**绘制状态一次性体检**（DM_DRAW_STATE=1）。屏幕全黑而 clear 能上屏 ⇒ 先看 draw 提交时这些
+    //   决定"会不会产生像素"的状态：通道掩码 / blend 开关 / 深度测试与写 / 裁剪 / 顶点数。
+    //   掩码为 0、顶点数为 0、深度函数非法，都会让整屏一个像素都没有，而 clear 照样生效（clear 不吃掩码）。
+    // np686: one-shot draw-state check. Mask 0 / zero vertices / bad depth func all give "no pixels at all"
+    //   while clears still land (clears ignore the channel mask).
+    {static int want=-1;if(want<0){const char *e=getenv("DM_DRAW_STATE");want=(e&&*e=='1')?0:-2;}
+     if(want==0){static int n=0;if(n++<20)xbg_logf("[绘制] #%d prim=%d count=%d indexed=%d instances=%d mask=%#x blendEn=%#x dt=%d dw=%d df=%d st=%d cull=%d vp=%gx%g sc=%ux%u",
+        n,prim,count,indexed?1:0,indexed?indexed->instances:instances,state.mask.mask,state.color.blend_en,int(state.ds.dt),int(state.ds.dw),int(state.ds.df),int(state.ds.st),state.poly.cull,state.viewport.width,state.viewport.height,unsigned(scissor(p).extent.width),unsigned(scissor(p).extent.height));}}
     if(indexed){if(bc.ib!=ib->buffer || bc.ibo!=ib->offset || bc.it!=index_type){vkCmdBindIndexBuffer(c.command,ib->buffer,ib->offset,index_type);bc.ib=ib->buffer;bc.ibo=ib->offset;bc.it=index_type;}else ++binds_skipped;vkCmdDrawIndexed(c.command,count,indexed->instances,0,indexed->base_vertex,indexed->base_instance);}else vkCmdDraw(c.command,count,instances,first,first_instance);
     if(!occlusion_batch_enabled)end_occlusion_query();c.finish();++perf.draws;++pass_prof_draws;pass_prof_verts+=uint64_t(uint32_t(count))*instances;
     // np629：提交二分的切点。只在 pass 边界切（本 draw 刚 finish、若无 open pass 就是边界）；
