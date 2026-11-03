@@ -4849,7 +4849,13 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
         case OP_STENCIL:{auto a=payload<p_stencil>(p,n);need(a.face>=0 && a.face<=3 && a.which>=0 && a.which<=2,"Invalid stencil state");for(unsigned i=0;i<2;i++)if(a.face&(1<<i)){if(a.which==0)state.stencil_compare[i]=a.value_mask;else if(a.which==1)state.stencil_write[i]=a.mask;else state.stencil_ref[i]=a.ref;}break;}
         case OP_POLY_OFFSET:{auto a=payload<p_poly_offset>(p,n);state.bias[0]=a.factor;state.bias[1]=a.units;state.bias[2]=a.clamp;break;}
         case OP_DRAW:{auto a=payload<p_draw>(p,n);draw(a.prim,a.first,a.count,nullptr);break;}
-        case OP_DRAW_IDX:{auto a=payload<p_draw_idx>(p,n);draw(a.prim,0,a.count,&a);break;}
+        case OP_DRAW_IDX:{auto a=payload<p_draw_idx>(p,n);
+            // np662：ibuf==0 = DrawArraysInstanced 的"非索引"约定（hle_nvn.c 同日新增）——
+            // 走非索引实例化路径，不碰索引缓冲。
+            // np662: ibuf==0 marks the non-indexed DrawArraysInstanced convention (added same day in
+            //   hle_nvn.c) -- route to the non-indexed instanced path, don't touch the index buffer.
+            if(!a.ibuf){draw(a.prim,a.first,a.count,nullptr,uint32_t(a.instances>0?a.instances:1));break;}
+            draw(a.prim,0,a.count,&a);break;}
         case OP_DISPATCH:dispatch(payload<p_dispatch>(p,n));break;
         // np637：**内存屏障不再断 pass**。这一句原来是 `Commands c`——它的非 draw 构造与 `finish()` 各调一次
         //   `end_open_pass()`，于是游戏每个 `nvnCommandBufferBarrier` 都把 8 附件 1600x900 的 pass 关掉重开。
@@ -5223,7 +5229,16 @@ extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
     return fence<=completed;
 }
 extern "C" void xbg_legacy_finish(){gfx_drain();std::lock_guard<std::recursive_mutex> lock(mutex);need(initialized,"Queue finish before Vulkan initialization");++perf.why_finish;complete_all();VK(vkQueueWaitIdle(cfg.queue));}
-static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();{SiteScope site(SITE_PRESENT);cur_op=61;TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");uint64_t present_begin=timing_clock();Image &im=get_image(texture,false);need(im.gpu_written,"Game tried to present a texture never rendered");Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);c.finish();submit_slots(false);int r;{CPU_SCOPE(Present);
+static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();{SiteScope site(SITE_PRESENT);cur_op=61;TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");
+         // np662：**切后台不挂死**。表面销毁后上屏回调会在 wait_window() 无限等新表面 ⇒
+         // 帧循环整个停住、看门狗 90 秒判死（死状与真卡点难辨）。无窗口时跳过本帧出图、
+         // 游戏照常跑（回前台自动恢复出图）；提交侧照旧（冷却逻辑不变）。
+         // np662: don't hang when backgrounded. After surface destruction the present callback blocks
+         //   forever in wait_window() -> frame loop stalls -> watchdog kill (indistinguishable from a real
+         //   stall). Without a window, skip presenting this frame and keep the game running (presenting
+         //   resumes automatically when the surface returns); submission path unchanged.
+         if(!mtl_has_window()){static int sn=0;if(sn++<3)xbg_logf("【后台】无上屏表面 —— 跳过出图，游戏继续跑（第 %d 次）",sn);return;}
+         uint64_t present_begin=timing_clock();Image &im=get_image(texture,false);need(im.gpu_written,"Game tried to present a texture never rendered");Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);c.finish();submit_slots(false);int r;{CPU_SCOPE(Present);
          // np658：reset 恢复窗口内先安静（present 也走队列，同样会喂 render_service 的失败计数）。
          // np658: stay quiet during the recovery window (present also goes through the queue and feeds the counter).
          if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}

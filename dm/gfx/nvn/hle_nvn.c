@@ -1212,6 +1212,14 @@ NVN(nvnCommandBufferSetDepthRange, void, NVNcommandBuffer *c, float n, float f) 
 //   0 = clamping disabled, nonzero = clamp fragment depth to [0,1]. Host pipelines are already
 //   depthClampEnable=VK_FALSE so the 0 case matches; nonzero is logged for now.
 NVN(nvnCommandBufferSetDepthClamp, void, NVNcommandBuffer *c, uint32_t mask) { (void)c; if (mask) ONCE_LOG("[nvn] SetDepthClamp mask=%#x：宿主暂不支持深度钳位（按禁用处理）", mask); }
+// np662：tile 缓存尺寸（tile GPU 的提示性优化，宿主由驱动自管）——接受并留痕，无行为。
+// np662: tiled-cache tile size (a tile-GPU hint; the host driver manages tiling itself) -- accept and log only.
+NVN(nvnCommandBufferSetTiledCacheTileSize, void, NVNcommandBuffer *c, int w, int h) { (void)c; (void)w; (void)h; ONCE_LOG("[nvn] SetTiledCacheTileSize %dx%d：宿主由驱动自管 tiling（忽略）", w, h); }
+// np662：光栅化丢弃（x1 非 0 = 丢光栅化，只跑顶点阶段；常见于 transform-feedback/遮挡预处理）。
+// 宿主实现：置 state 标志 ⇒ draw 侧跳过光栅化路径。当前先留痕（np661 里 x1=0 = 不丢弃，行为一致）。
+// np662: rasterizer discard (nonzero = discard rasterization, vertex stage only; typical for
+//   transform-feedback / occlusion prepass). For now log only -- np661 saw x1=0 (=enabled), same behavior.
+NVN(nvnCommandBufferSetRasterizerDiscard, void, NVNcommandBuffer *c, uint32_t discard) { (void)c; if (discard) ONCE_LOG("[nvn] SetRasterizerDiscard=%u：宿主暂不支持丢弃光栅化（按开启处理）", discard); }
 NVN(nvnCommandBufferBindProgram, void, NVNcommandBuffer *c, const NVNprogram *p, int stages) {
     *REC(c, OP_BIND_PROGRAM, p_bind_program) = (p_bind_program){snap_prog(p), stages};
 }
@@ -1290,6 +1298,16 @@ NVN(nvnCommandBufferSetPolygonOffsetClamp, void, NVNcommandBuffer *c, float fa, 
     *REC(c, OP_POLY_OFFSET, p_poly_offset) = (p_poly_offset){fa, un, cl};
 }
 NVN(nvnCommandBufferDrawArrays, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, int first, int n) { *REC(c, OP_DRAW, p_draw) = (p_draw){pr, first, n}; }
+// np662：实例化非索引绘制（np661 末段游戏首次调用）。复用 p_draw_idx 携带 instances（ibuf=0 表示非索引）
+// ⇒ 回放侧 case OP_DRAW_IDX 走 draw()，但 ibuf=0 时 draw 内部不能按索引走 —— 改为直接落在 OP_DRAW 的
+// 扩展：这里用 OP_DRAW + instances 记进 p_draw 的第三参不行（p_draw 无 instances 字段），故新增
+// 复用 OP_DRAW_IDX 但 ibuf=0 的约定 ⇒ 回放侧判 ibuf==0 时走 vkCmdDraw 非索引分支。
+// np662: instanced non-indexed draw (first-ever call seen late in np661). Reuse OP_DRAW_IDX to carry
+//   instances with ibuf=0 as the "non-indexed" marker; the replay side routes ibuf==0 to vkCmdDraw.
+NVN(nvnCommandBufferDrawArraysInstanced, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, int first, int n, int inst) {
+    if (inst == 1) { *REC(c, OP_DRAW, p_draw) = (p_draw){pr, first, n}; return; }   // inst=1 退化为普通 DrawArrays
+    *REC(c, OP_DRAW_IDX, p_draw_idx) = (p_draw_idx){pr, 0, n, 0, 0, inst, 0};      // ibuf=0 = 非索引
+}
 NVN(nvnCommandBufferDrawElementsInstanced, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, int n, NVNbufferAddress ib,
     int bv, int bi, int inst) {
     *REC(c, OP_DRAW_IDX, p_draw_idx) = (p_draw_idx){pr, it, n, bv, bi, inst, ib};
