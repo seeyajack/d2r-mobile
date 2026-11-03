@@ -1215,6 +1215,13 @@ NVN(nvnCommandBufferSetDepthClamp, void, NVNcommandBuffer *c, uint32_t mask) { (
 // np662：tile 缓存尺寸（tile GPU 的提示性优化，宿主由驱动自管）——接受并留痕，无行为。
 // np662: tiled-cache tile size (a tile-GPU hint; the host driver manages tiling itself) -- accept and log only.
 NVN(nvnCommandBufferSetTiledCacheTileSize, void, NVNcommandBuffer *c, int w, int h) { (void)c; (void)w; (void)h; ONCE_LOG("[nvn] SetTiledCacheTileSize %dx%d：宿主由驱动自管 tiling（忽略）", w, h); }
+// np701：tile 缓存动作（Begin/End，语义 = 在 pass 边界冲刷 tile 缓存——tile GPU 的性能提示）。
+// 之前一直落在【红】通用未实现桩上（np661 实测每帧都被调，与 SetTiledCacheTileSize 成对出现）；
+// 与姊妹接口一致改为命名桩：接受并留痕，无行为。判据：【红】未实现行消失。
+// np701: tiled-cache action (Begin/End -- flush the tile cache at pass boundaries, a tiling hint). It used to
+//   fall through to the generic unimplemented stub (np661 saw it every frame, paired with TileSize); make it a
+//   named stub like its sibling: accept and log only. Criterion: the red unimplemented line disappears.
+NVN(nvnCommandBufferSetTiledCacheAction, void, NVNcommandBuffer *c, NVNtiledCacheAction a) { (void)c; (void)a; ONCE_LOG("[nvn] SetTiledCacheAction=%d：宿主由驱动自管 tiling（忽略）", (int)a); }
 // np662：光栅化丢弃（x1 非 0 = 丢光栅化，只跑顶点阶段；常见于 transform-feedback/遮挡预处理）。
 // 宿主实现：置 state 标志 ⇒ draw 侧跳过光栅化路径。当前先留痕（np661 里 x1=0 = 不丢弃，行为一致）。
 // np662: rasterizer discard (nonzero = discard rasterization, vertex stage only; typical for
