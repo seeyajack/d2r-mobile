@@ -921,6 +921,7 @@ struct FrameManifest{
 static FrameManifest cur,sealed;
 static const void *last_prog[6];   // 相邻 draw 常重复同一着色器：先比指针，变了才进环里扫（每帧开头清零）
 static void frame_seal(){
+    cur.serial=stats.presents.load();   // np702 修正：先记号再封存——否则 sealed.serial 永远是旧值 0
     sealed=cur;
     cur=FrameManifest{};cur.serial=stats.presents.load();
     for(auto &p:last_prog)p=nullptr;
@@ -979,9 +980,16 @@ static void dump_files(const char *why){
         fprintf(f,"digest ring (newest first):\n");
         for(unsigned i=0;i<16;i++){const SubDigest &d=digest_ring[(digest_at+15u-i)&15u];if(!d.serial)continue;
             fprintf(f,"D serial=%llu draws=%u passes=%u disp=%u\n",(unsigned long long)d.serial,d.draws,d.passes,d.dispatches);}
-        {std::lock_guard<std::mutex> l(g_lost_mu);
+        {std::lock_guard<std::mutex> l(g_lost_mu);unsigned cd_left=0;
+         // ⚠ np702 首跑的学费：这里原来调 lost_cooldown_ms()——它内部也锁 g_lost_mu（非递归），
+         //   监视线程当场自死锁：death 文件缓冲永不刷盘（0 字节）、锁还被攥着 ⇒ 之后任何提交
+         //   调 lost_cooldown_ms() 全部挂住。冷路径数学就地展开（lost_cooldown_ms_env() 无锁）。
+         //   The first run's lesson: lost_cooldown_ms() re-locks g_lost_mu inside this guard --
+         //   instant self-deadlock (0-byte file, monitor stuck holding the lock, every later
+         //   submit hangs on its own lost_cooldown_ms()). Inline the math instead.
+         if(g_lost_ns){uint64_t elapsed=(timing_clock()-g_lost_ns)/1000000u;unsigned cd=lost_cooldown_ms_env();cd_left=elapsed>=cd?0u:cd-(unsigned)elapsed;}
          fprintf(f,"lost armed=%s ago_ms=%lld cooldown_left_ms=%u\n",g_lost_ns?"yes":"no",
-             g_lost_ns?(long long)((timing_clock()-g_lost_ns)/1000000):0LL,lost_cooldown_ms());}
+             g_lost_ns?(long long)((timing_clock()-g_lost_ns)/1000000):0LL,cd_left);}
         fprintf(f,"pass_end_cause:");
         for(unsigned i=0;i<8;i++)fprintf(f," %u=%llu",i,(unsigned long long)pass_end_cause[i]);
         fprintf(f,"\npipeline_counts hits=%llu misses=%llu bypass=%llu evictions=%llu\n",
