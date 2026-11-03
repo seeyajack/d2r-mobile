@@ -129,6 +129,9 @@ extern "C" void xbg_set_ui_rect_fn(void (*fn)(double *y,double *h)){g_ui_rect_fn
 //   the probe needs readback_buffer/Commands/gpu_sync; a plain forward declaration puts the two names in
 //   *different* unnamed namespaces and the linker reports an undefined symbol. A global function pointer avoids it.
 static void (*g_winpass_hook)() = nullptr;
+// np693: set by the host when VK_EXT_depth_clip_control was enabled at device creation (dm/android/vulkan_present.cpp)
+extern int dm_depth_clip_control_on;
+extern int dm_depth_clip_enable_on;    // np694: VK_EXT_depth_clip_enable was enabled at device creation
 // np682：窗口纹理 serial（pass 内涂蓝判别用）| np682: window texture serial (for the in-pass fill test)
 static uint64_t g_winfill_serial=0;
 // np684：**窗口缓冲 serial 集合**。双缓冲下"本轮 pass 的目标"和"上次 present 的 serial"天然错开一格，
@@ -1256,6 +1259,28 @@ void save_pipeline_cache(){
     if(sync_cache_save){write_pipeline_cache(unsaved);return;}
     cache_save_join();cache_save_busy=true;
     cache_saver=std::thread([unsaved]{setpriority(PRIO_PROCESS,0,10);write_pipeline_cache(unsaved);cache_save_busy=false;});
+}
+// np693: NVN/GL 的裁剪空间是 -w..w。客户着色器按这个约定写（全屏 quad 就放在 z=-w），Vulkan 的 0..w 会把它们
+//   整片裁掉。`DM_CLIP_NEG_ONE=0` 可关掉做 A/B；不设则跟随设备是否支持。
+// np693: NVN/GL clip space is -w..w and the guest shaders use it (the full-screen quad sits at z=-w); Vulkan's
+//   0..w clips that away. `DM_CLIP_NEG_ONE=0` turns it off for A/B; unset follows device support.
+// np694: GL 的 depth clamp。设备没有 depth_clip_control 时的替代方案：把 z 的裁剪换成钳制，
+//   这样 z=-w 的几何不再被整片裁掉。`DM_DEPTH_CLAMP=0` 关掉做 A/B；不设则跟随设备支持。
+// np694: GL-style depth clamp. The fallback when the device lacks depth_clip_control: turn z clipping into
+//   clamping so geometry at z=-w survives. `DM_DEPTH_CLAMP=0` disables it for A/B; unset follows support.
+static bool depth_clamp_on(){
+    static int v=-1;
+    if(v<0){const char *e=getenv("DM_DEPTH_CLAMP");
+        v = e && *e ? (*e=='1') : (dm_depth_clip_enable_on?1:0);
+        xbg_logf("NVN caps depthClamp dev=%d use=%d",dm_depth_clip_enable_on,v);}
+    return v!=0;
+}
+static bool clip_neg_one(){
+    static int v=-1;
+    if(v<0){const char *e=getenv("DM_CLIP_NEG_ONE");
+        v = e && *e ? (*e=='1') : (dm_depth_clip_control_on?1:0);
+        xbg_logf("NVN caps depthClipControl dev=%d use=%d",dm_depth_clip_control_on,v);}
+    return v!=0;
 }
 extern bool tex_dirty;extern uint64_t tex_dirty_tracked,tex_dirty_checks,tex_dirty_changed;   // texture checks through the dirty tracker (get_image)
 // 3D 画面加亮的读数（定义在 dispatch 前的 namespace bright）
@@ -4190,8 +4215,14 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};vi.vertexBindingDescriptionCount=bindings.size();vi.pVertexBindingDescriptions=bindings.data();vi.vertexAttributeDescriptionCount=attributes.size();vi.pVertexAttributeDescriptions=attributes.data();
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};ia.topology=topology(prim);
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};vp.viewportCount=vp.scissorCount=1;
+    // np693: guest pipelines run with GL clip-space depth (-w..w) so z=-w survives instead of being clipped.
+    VkPipelineViewportDepthClipControlCreateInfoEXT clipctl{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT};
+    clipctl.negativeOneToOne=VK_TRUE;clipctl.pNext=vp.pNext;if(clip_neg_one())vp.pNext=&clipctl;
     VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};rs.polygonMode=state.poly.mode==2?VK_POLYGON_MODE_FILL:state.poly.mode==1?VK_POLYGON_MODE_LINE:VK_POLYGON_MODE_POINT;need(rs.polygonMode==VK_POLYGON_MODE_FILL || cfg.enabled_core.fillModeNonSolid,"Non-solid polygon mode disabled");rs.cullMode=state.poly.cull;rs.frontFace=state.poly.front?VK_FRONT_FACE_COUNTER_CLOCKWISE:VK_FRONT_FACE_CLOCKWISE;rs.lineWidth=1;rs.depthBiasEnable=state.poly.offset_en!=0;rs.depthBiasConstantFactor=state.bias[1]*(state.rt.depth && state.rt.depth->d.format==0x32 && depth16_as_d24?256.0f:1.0f);
-    rs.depthBiasSlopeFactor=state.bias[0];rs.depthBiasClamp=state.bias[2];need(!rs.depthBiasClamp || cfg.enabled_core.depthBiasClamp,"Depth bias clamp disabled");   // constant bias units: 2^-16 for D16, 2^-24 for the X8_D24 stand-in; slope and clamp do not depend on the format
+    rs.depthBiasSlopeFactor=state.bias[0];rs.depthBiasClamp=state.bias[2];need(!rs.depthBiasClamp || cfg.enabled_core.depthBiasClamp,"Depth bias clamp disabled");
+    // np694: guest pipelines disable depth clipping (GL depth clamp) so z=-w is clamped, not discarded.
+    VkPipelineRasterizationDepthClipStateCreateInfoEXT clipst{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT};
+    clipst.depthClipEnable=VK_FALSE;clipst.pNext=rs.pNext;if(depth_clamp_on())rs.pNext=&clipst;   // constant bias units: 2^-16 for D16, 2^-24 for the X8_D24 stand-in; slope and clamp do not depend on the format
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};ms.rasterizationSamples=p.samples;ms.alphaToCoverageEnable=state.ms.a2c;need(!state.ms.sl_en,"Custom sample locations unsupported");need(!state.ms.samples || state.ms.samples==uint32_t(p.samples),"NVN sample count differs from attachments");need(p.samples==VK_SAMPLE_COUNT_1_BIT || state.ms.enable,"Disabled multisampling on multisample target needs coverage emulation");
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};ds.depthTestEnable=state.ds.dt;ds.depthWriteEnable=state.ds.dw;ds.depthCompareOp=VkCompareOp(state.ds.df-1);ds.stencilTestEnable=state.ds.st;ds.front=stencil(false);ds.back=stencil(true);ds.depthBoundsTestEnable=state.bounds.enable;ds.minDepthBounds=state.bounds.minimum;ds.maxDepthBounds=state.bounds.maximum;need(!ds.depthBoundsTestEnable || cfg.enabled_core.depthBounds,"Depth bounds feature disabled");
     need(!(ds.depthTestEnable || ds.stencilTestEnable) || state.rt.depth,"Depth/stencil state requires attachment");
@@ -4293,6 +4324,35 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
                 xbg_logf("[顶点]   流%zu binding=%u size=%zu 前%zu字节: %s",i,vertex_buffers[i].first,vb->size,nb,hex);}
             if(state.shader[0])xbg_logf("[顶点]   顶点着色器 key=%s 声明输入=%zu 类=%zu 属性数=%zu",state.shader[0]->key.c_str(),state.shader[0]->inputs.size(),state.shader[0]->input_classes.size(),attributes.size());
             else xbg_logf("[顶点]   顶点着色器为空（属性数=%zu）",attributes.size());
+            // np691: the vertex shader's uniform content. The vertex stream is a well-formed +-0.5 quad and every
+            //   state bit is right, yet nothing is produced; cb_extent says this shader reads 80 bytes of slot 0.
+            //   An all-zero CB (zero matrix/scale) collapses every vertex to the origin.
+            for(size_t i=0;i<state.shader[0]->bindings.size() && i<6;i++){const xbg_shader_binding &b=state.shader[0]->bindings[i];
+                if(b.source!=XBG_SOURCE_UNIFORM){xbg_logf("[顶点]   绑定#%zu binding=%u type=%u source=%u slot=%u bytes=%u",i,b.binding,b.type,b.source,b.slot,b.bytes);continue;}
+                unsigned slot=b.slot;if(slot>=16){xbg_logf("[顶点]   绑定#%zu slot=%u out of range",i,slot);continue;}
+                auto r=state.ub[nvn_stage[0]][slot];
+                if(!r.address){xbg_logf("[顶点]   uniform slot=%u not set (address=0)",slot);continue;}
+                // np691c: cb_extent says this shader reads bytes 0..79 (vec4 0..4) of vp_c3, and the disassembly
+                //   confirms it only touches vec4 slots 1..4 (x1..x4 times the input x, plus .y/.z/.w of each).
+                //   Print those five vec4s as floats: an all-zero block (or a degenerate rect) collapses the
+                //   quad to a single point, which is exactly "state all correct, no pixels".
+                const size_t need_bytes=5*16;
+                if(r.size<need_bytes){xbg_logf("[顶点]   uniform slot=%u address=%p size=%zu (< %zu needed)",slot,(void*)r.address,size_t(r.size),need_bytes);continue;}
+                const float *fb=reinterpret_cast<const float*>(r.address);
+                for(unsigned e=0;e<5;e++)xbg_logf("[顶点]   vp_c3[%u] = %.6g %.6g %.6g %.6g",e,fb[e*4],fb[e*4+1],fb[e*4+2],fb[e*4+3]);}
+            // np692: the shader's own name is vp_c3 (constant buffer 3) but its descriptor says slot 0, and the block
+            //   we read from slot 0 gives an all-degenerate transform (every vertex ends up with y=0). Dump every
+            //   vertex uniform slot with a valid range so we can see which one actually holds the blit transform.
+            {static int shown=0;if(shown<2){++shown;
+                xbg_logf("[顶点]   ---- 顶点 uniform 各槽（前 4 个 vec4）----");
+                for(unsigned sl=0;sl<8;sl++){auto q=state.ub[nvn_stage[0]][sl];
+                    if(!q.address){xbg_logf("[顶点]   槽%u 未设置",sl);continue;}
+                    if(q.size<64){xbg_logf("[顶点]   槽%u addr=%p size=%zu (<64)",sl,(void*)q.address,size_t(q.size));continue;}
+                    const float *fq=reinterpret_cast<const float*>(q.address);
+                    xbg_logf("[顶点]   槽%u addr=%p size=%zu: [%.6g %.6g %.6g %.6g] [%.6g %.6g %.6g %.6g] [%.6g %.6g %.6g %.6g] [%.6g %.6g %.6g %.6g]",
+                        sl,(void*)q.address,size_t(q.size),
+                        fq[0],fq[1],fq[2],fq[3],fq[4],fq[5],fq[6],fq[7],
+                        fq[8],fq[9],fq[10],fq[11],fq[12],fq[13],fq[14],fq[15]);}}}
             for(size_t i=0;i<bindings.size() && i<4;i++)xbg_logf("[顶点]   绑定%zu binding=%u stride=%u rate=%d",i,bindings[i].binding,bindings[i].stride,int(bindings[i].inputRate));
             for(size_t i=0;i<attributes.size() && i<8;i++)xbg_logf("[顶点]   属性%zu loc=%u binding=%u fmt=%d off=%u",i,attributes[i].location,attributes[i].binding,int(attributes[i].format),attributes[i].offset);
             if(ib){char hex[3*12+1]={0};size_t nb=ib->size<12?ib->size:12;const uint8_t *q=static_cast<const uint8_t*>(ib->mapped);
@@ -5369,11 +5429,16 @@ static void present_probe_report(const Buffer &buf,uint32_t w,uint32_t h,uint32_
     if(!buf.mapped || !w || !h || bpp<3)return;
     const uint8_t *p=static_cast<const uint8_t*>(buf.mapped)+buf.offset;
     uint64_t sum[3]={0,0,0},nz=0,n=uint64_t(w)*h;unsigned lo[3]={255,255,255},hi[3]={0,0,0};
-    for(uint64_t i=0;i<n;i++){const uint8_t *q=p+i*bpp;for(int k=0;k<3;k++){unsigned v=q[k];sum[k]+=v;if(v<lo[k])lo[k]=v;if(v>hi[k])hi[k]=v;}if(q[0]|q[1]|q[2])++nz;}
-    xbg_logf("[上屏] 源图 %ux%u bpp=%u 均值 %.1f/%.1f/%.1f 非黑像素 %llu/%llu = %.1f%% 范围 R%u-%u G%u-%u B%u-%u",
+    // np691: alpha separates "nothing was written" from "black was written". RGB alone cannot: a draw that never
+    //   lands and a draw that outputs (0,0,0,1) both read back as RGB 0.
+    uint64_t sum_a=0,na=0;
+    for(uint64_t i=0;i<n;i++){const uint8_t *q=p+i*bpp;for(int k=0;k<3;k++){unsigned v=q[k];sum[k]+=v;if(v<lo[k])lo[k]=v;if(v>hi[k])hi[k]=v;}if(q[0]|q[1]|q[2])++nz;
+        if(bpp>=4){unsigned a=q[3];sum_a+=a;if(a)++na;}}
+    xbg_logf("[上屏] 源图 %ux%u bpp=%u 均值 %.1f/%.1f/%.1f 非黑像素 %llu/%llu = %.1f%% 范围 R%u-%u G%u-%u B%u-%u 均值A=%.1f A非0=%llu(%.1f%%)",
         w,h,bpp,double(sum[0])/double(n),double(sum[1])/double(n),double(sum[2])/double(n),
         (unsigned long long)nz,(unsigned long long)n,100.0*double(nz)/double(n),
-        lo[0],hi[0],lo[1],hi[1],lo[2],hi[2]);
+        lo[0],hi[0],lo[1],hi[1],lo[2],hi[2],
+        bpp>=4?double(sum_a)/double(n):-1.0,(unsigned long long)na,bpp>=4?100.0*double(na)/double(n):-1.0);
     static const char ramp[]=" .:-=+*#%@";const int cols=32,rows=18;
     for(int ry=0;ry<rows;ry++){char line[cols+1];
         for(int rx=0;rx<cols;rx++){

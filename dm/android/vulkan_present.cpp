@@ -22,6 +22,8 @@
 #include <sched.h>
 #include <unistd.h>
 #include <time.h>
+int dm_depth_clip_control_on = 0;   // np693: set when VK_EXT_depth_clip_control was enabled
+int dm_depth_clip_enable_on = 0;    // np694: set when VK_EXT_depth_clip_enable was enabled
 extern "C" double dm_present_period(void);
 // 错过上屏节拍的帧数（晚于「上次期望时刻 + 周期」2 ms 以上）；自适应出图档按它降档 / 试升
 // Frames that missed their display slot (more than 2 ms later than "previous desired time + period"); the adaptive present tier steps down / probes up by it
@@ -357,6 +359,34 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
     if(custom_border){VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};f2.pNext=&cbf;vkGetPhysicalDeviceFeatures2(physical,&f2);}
     if(custom_border && cbf.customBorderColors){cbf.pNext=draw.pNext;draw.pNext=&cbf;dext.push_back(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);}
     vlog("Device customBorderColor ext=%d colors=%u withoutFormat=%u",int(custom_border),unsigned(cbf.customBorderColors),unsigned(cbf.customBorderColorWithoutFormat));
+
+    // np693: **VK_EXT_depth_clip_control** —— NVN/GL 的裁剪空间是 -w..w，Vulkan 是 0..w。游戏的 Shader 会把
+    //   全屏 quad 放在 z=-w（GL 的近平面），没有这一个开关，那片几何在 Vulkan 里会被整片裁掉：状态全对、
+    //   一个像素都不写（真机实测 alpha 全 0）。扩展必须在设备创建时启用，所以在这里判断并挂到 pNext 上。
+    //   只有客户着色器的管线会用它（引擎侧 xbg_game.cpp），我们自己的 clear 管线仍按 Vulkan 的 0..1。
+    // np693: VK_EXT_depth_clip_control. NVN/GL clip space is -w..w while Vulkan is 0..w. The game puts its
+    //   full-screen quad at z = -w (GL's near plane); without this the quad is clipped away entirely -- every
+    //   state bit correct and not one pixel written (measured: alpha all zero). The extension must be enabled at
+    //   device creation. Only guest-shader pipelines use it; our own clear pipeline stays on Vulkan's 0..1.
+    VkPhysicalDeviceDepthClipControlFeaturesEXT dcc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
+    bool has_dcc=false;
+    for(auto &e:available)if(std::string(e.extensionName)==VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME)has_dcc=true;
+    if(has_dcc){VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};f2.pNext=&dcc;vkGetPhysicalDeviceFeatures2(physical,&f2);}
+    if(has_dcc && dcc.depthClipControl){dcc.pNext=draw.pNext;draw.pNext=&dcc;dext.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);dm_depth_clip_control_on=1;}
+    vlog("Device depthClipControl ext=%d supported=%u enabled=%d",int(has_dcc),unsigned(dcc.depthClipControl),dm_depth_clip_control_on);
+
+    // np694: 这台机器（Maleoon）**没有** VK_EXT_depth_clip_control，但有 VK_EXT_depth_clip_enable。
+    //   后者能把 z 的"裁剪"换成"钳制"（等价 GL 的 depth clamp）：z=-w 的几何不再被整片裁掉，而是钳到
+    //   视口深度范围。先用它把"z 裁剪是不是唯一障碍"这件事验证清楚；长期正解仍是把 GL 的 z 约定做对。
+    // np694: this device (Maleoon) has no VK_EXT_depth_clip_control but does have VK_EXT_depth_clip_enable,
+    //   which turns z *clipping* into *clamping* (GL's depth clamp): geometry at z=-w survives, clamped to the
+    //   viewport depth range. Use it to prove whether z clipping is the only blocker.
+    VkPhysicalDeviceDepthClipEnableFeaturesEXT dce{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT};
+    bool has_dce=false;
+    for(auto &e:available)if(std::string(e.extensionName)==VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME)has_dce=true;
+    if(has_dce){VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};f2.pNext=&dce;vkGetPhysicalDeviceFeatures2(physical,&f2);}
+    if(has_dce && dce.depthClipEnable){dce.pNext=draw.pNext;draw.pNext=&dce;dext.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);dm_depth_clip_enable_on=1;}
+    vlog("Device depthClipEnable ext=%d supported=%u enabled=%d",int(has_dce),unsigned(dce.depthClipEnable),dm_depth_clip_enable_on);
     // Diagnostic (marker gfx-pipe-stats): the driver's per-pipeline statistics (VK_KHR_pipeline_executable_properties).
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pef{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
     if(FILE *ps=[&]{std::string dir=path;size_t cut=dir.find_last_of('/');return fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pipe-stats").c_str(),"rb");}()){fclose(ps);dext.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);pef.pipelineExecutableInfo=VK_TRUE;pef.pNext=draw.pNext;draw.pNext=&pef;}
