@@ -1390,6 +1390,20 @@ void submit_slots(bool wait){
             ++big_n;
          }
          cur_digest.serial=slot_serial;digest_ring[digest_at++&15u]=cur_digest;cur_digest=SubDigest{};
+         // np702：**判死链路自检钩子**。每轮验证的成本大头是"等随机死亡"（33 分钟不死就陪跑 33 分钟）；
+         //   闭环判死链路不该靠运气：DM_DEATHGUARD_TEST=<秒> 让首次提交在 VkSite(SUBMIT) 守卫内故意停
+         //   N 秒（>30 即可）⇒ deathguard 30 秒必打【判死】并落盘两份证据 ⇒ 3 分钟确定性闭环
+         //   （装机 + 起客 + 停 35s + 拉文件）。upstream 的 DM_GFX_PIPE_CRASH_TEST 同款思路：
+         //   用测试钩子制造现场，不等真实故障。默认关；触发一次后自动失效（armed→-1）。
+         // np702: the death-evidence self-test hook. The expensive part of a verification round is waiting
+         //   for a random death (a 33-minute survivor costs 33 minutes). Closing the evidence loop should not
+         //   depend on luck: DM_DEATHGUARD_TEST=<s> stalls the first submit inside a VkSite(SUBMIT) guard for
+         //   N seconds (>30) ⇒ the deathguard logs 【判死】 at 30 s and writes both files ⇒ a deterministic
+         //   3-minute round (install + start + stall 35 s + pull files). Same idea as upstream's
+         //   DM_GFX_PIPE_CRASH_TEST: make the scene with a test hook instead of waiting for the real fault.
+         //   Off by default; disarms itself after firing (armed→-1).
+         {static int armed=-2;if(armed==-2){const char *e=getenv("DM_DEATHGUARD_TEST");armed=e?atoi(e):0;if(armed>0)xbg_logf("【自检】DM_DEATHGUARD_TEST=%d：首次提交处停 %d 秒验证判死落盘",armed,armed);}
+          if(armed>0){int secs=armed;armed=-1;deathguard::VkSite site(deathguard::SUBMIT);xbg_logf("【自检】开始停 %d 秒——deathguard 应在 30 秒时判死并落盘",secs);usleep(unsigned(secs)*1000000u);xbg_logf("【自检】停毕恢复正常；证据文件应在沙箱 files/gfx-death.txt / gfx-lastframe.txt");}}
          // np658：reset 恢复窗口内不敲队列（防 Submit commandlist fail 攒账被连坐杀）。
          // np658: keep quiet inside the driver recovery window (avoids piling up Submit commandlist fail).
          if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}
