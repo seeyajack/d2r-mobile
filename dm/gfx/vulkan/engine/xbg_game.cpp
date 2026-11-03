@@ -129,6 +129,14 @@ extern "C" void xbg_set_ui_rect_fn(void (*fn)(double *y,double *h)){g_ui_rect_fn
 //   the probe needs readback_buffer/Commands/gpu_sync; a plain forward declaration puts the two names in
 //   *different* unnamed namespaces and the linker reports an undefined symbol. A global function pointer avoids it.
 static void (*g_winpass_hook)() = nullptr;
+// np682：窗口纹理 serial（pass 内涂蓝判别用）| np682: window texture serial (for the in-pass fill test)
+static uint64_t g_winfill_serial=0;
+// np684：**窗口缓冲 serial 集合**。双缓冲下"本轮 pass 的目标"和"上次 present 的 serial"天然错开一格，
+//   拿单值比较会永远不命中（实测如此）。这里把历史上 present 过的 serial 都记下来，按集合匹配。
+// np684: set of window-buffer serials. With double buffering the pass target and the last presented serial are
+//   always one apart, so comparing against a single value never matches (measured). Match against the set.
+static uint64_t g_win_serials[8];static int g_win_n=0;
+static bool win_serial_match(uint64_t s){for(int i=0;i<g_win_n;i++)if(g_win_serials[i]==s)return true;return false;}
 namespace {
 xbg_game_config cfg{};
 std::recursive_mutex mutex;
@@ -758,7 +766,7 @@ struct ImageList{Image *v[9];uint32_t n=0;void push_back(Image *i){if(n<9)v[n++]
     size_t size()const{return n;}bool empty()const{return !n;}Image *operator[](size_t i)const{return v[i];}};
 // depth_attached / depth_used (NVN PERF pass_ends depth_idle, NVN GPASS dz=1): a pass that carries a depth attachment no
 // draw tests and no clear touches; a tiler loads and stores that attachment for nothing.
-struct OpenPass {VkRenderPass pass{};VkFramebuffer framebuffer{};VkCommandBuffer cmd{};ImageList images;bool depth_attached=false,depth_used=false;} open_pass;
+struct OpenPass {VkRenderPass pass{};VkFramebuffer framebuffer{};VkCommandBuffer cmd{};ImageList images;bool depth_attached=false,depth_used=false;uint64_t serial0=0;} open_pass;   // serial0: 附件 0 的纹理 serial（np682）| serial0: serial of attachment 0
 // Framebuffers of cached render passes, kept across frames (creating and destroying one per pass per frame was ~5% of the
 // render thread on Adreno 730). Each attachment Image lists the keys of the framebuffers that use its views; the first of
 // them to be destroyed (all GPU work that used it is complete by then) takes the framebuffer along. gfx-no-persistent-fb
@@ -842,7 +850,24 @@ void begin_occlusion_query(VkCommandBuffer cmd,VkQueryPool pool,uint32_t index){
     need(!open_occlusion.cmd,"Nested occlusion query");
     vkCmdBeginQuery(cmd,pool,index,VK_QUERY_CONTROL_PRECISE_BIT);open_occlusion={cmd,pool,index};++occlusion_queries_started;
 }
-void end_open_pass(){if(open_pass.cmd){end_occlusion_query();vkCmdEndRenderPass(open_pass.cmd);if(open_pass.depth_attached && !open_pass.depth_used){++depth_idle_passes;pass_prof_depth_idle(open_pass.cmd);}pass_prof_end(open_pass.cmd);open_pass=OpenPass{};++pass_end_by[cur_op<64?cur_op:63];++pass_end_cause[pass_end_cause_now&7];}}
+void end_open_pass(){if(open_pass.cmd){
+    // np682：**pass 内涂蓝**。窗口那张图每帧都被绑成 index=0 附件、视口裁剪全尺寸、绘制也挂在同一镜像上，
+    //   可读回全是 0。这里在**同一个 pass 内部**直接 vkCmdClearAttachments 涂成蓝色：
+    //   屏幕变蓝 ⇒ pass→这张图的通路是通的，问题在"客体的 draw 没产生像素"；
+    //   屏幕不变 ⇒ 这条 pass 的附件根本不是我们读/上屏的那张图（fb 层身份问题）。
+    //   不额外提交、不动 layout，风险远低于帧中读回那版（那版会崩）。
+    // np682: in-pass fill. The image is bound every frame with full viewport/scissor and the draws reference the
+    //   same image, yet it reads back as zero. Clear it to blue *inside the same pass*: blue on screen => the
+    //   pass->image path works and the guest's draws are what produce nothing; unchanged => this pass's
+    //   attachments are not the image we read/present (an identity problem at the framebuffer level).
+    {static int fill=-1;if(fill<0){const char *e=getenv("DM_WINPASS_FILL");fill=(e&&*e=='1')?1:0;if(fill)xbg_logf("[上屏] 窗口 pass 内涂蓝 DM_WINPASS_FILL=1");}
+     static int seen=0,nfired=0;
+     if(seen<20){++seen;xbg_logf("[上屏] pass 关 serial0=%llu 上屏serial=%llu 涂蓝=%d",(unsigned long long)open_pass.serial0,(unsigned long long)g_winfill_serial,fill);}
+     if(fill && win_serial_match(open_pass.serial0)){if(++nfired<=5)xbg_logf("[上屏] 涂蓝第 %d 次（serial=%llu）",nfired,(unsigned long long)open_pass.serial0);
+        VkClearAttachment a{};a.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;a.colorAttachment=0;
+        a.clearValue.color.float32[0]=0.f;a.clearValue.color.float32[1]=0.f;a.clearValue.color.float32[2]=1.f;a.clearValue.color.float32[3]=1.f;
+        VkClearRect r{};r.rect.extent={8192,8192};r.layerCount=1;vkCmdClearAttachments(open_pass.cmd,1,&a,1,&r);}}
+    end_occlusion_query();vkCmdEndRenderPass(open_pass.cmd);if(open_pass.depth_attached && !open_pass.depth_used){++depth_idle_passes;pass_prof_depth_idle(open_pass.cmd);}pass_prof_end(open_pass.cmd);open_pass=OpenPass{};++pass_end_by[cur_op<64?cur_op:63];++pass_end_cause[pass_end_cause_now&7];}}
 // np676：**帧中自检**——在"刚画完窗口那张图"的瞬间读回它左上 64x64，区分两种完全不同的病：
 //   A 读到有内容 ⇒ 绘制确实落进了这张图，present 之前/之中被清掉或被另一张图顶替；
 //   B 读到全 0   ⇒ 这些 draw 根本没在这张图上产生像素（渲染执行层）。
@@ -4214,7 +4239,7 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
         // Proven full overwrite: begin with the color-DONT_CARE twin; open_pass keeps p.pass, so later draws continue this pass.
         if(p.pass_noload && quad_indices.empty() && !ab_off("noload") && ui_uy==0 && ui_vs==1 && first_draw_covers(p,prim,first,count,indexed,vertex_buffers,ib,index_type)){VkRenderPass keep=p.pass;p.pass=p.pass_noload;begin_pass(p,c);p.pass=keep;++noload_passes;}
         else begin_pass(p,c);
-        open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;open_pass.depth_attached=state.rt.depth!=nullptr;++perf.passes;}
+        open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;open_pass.serial0=p.images.n&&p.images.v[0]?p.images.v[0]->source.serial:0;open_pass.depth_attached=state.rt.depth!=nullptr;++perf.passes;}
     if(state.ds.dt || state.ds.st || state.bounds.enable)open_pass.depth_used=true;
     if(new_run){end_occlusion_query();begin_occlusion_query(c.command,occlusion,occlusion_index);}
     BindCache &bc=bind_cache;if(!bind_cache_enabled || bc.cmd!=c.command || pipeline.transient){bc=BindCache{};bc.cmd=c.command;}
@@ -4446,7 +4471,7 @@ void clear_attachment(const p_clear_color *color,const p_clear_ds *depth,int sca
         if(!needs_preserve || ti.gpu_written || ti.uploaded){
             Commands c(true);Pass p;
             if(create_pass(p,c,-1,false,true)){
-                if(open_pass.cmd!=c.command || open_pass.pass!=p.pass || open_pass.framebuffer!=p.framebuffer){++pass_open_by[!open_pass.cmd?0:(open_pass.cmd!=c.command?1:(open_pass.pass!=p.pass?2:3))];if(p.framebuffer)pass_open_fbs.insert(uint64_t(uintptr_t(p.framebuffer)));end_pass(7);begin_pass(p,c);open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;open_pass.depth_attached=state.rt.depth!=nullptr;++perf.passes;}
+                if(open_pass.cmd!=c.command || open_pass.pass!=p.pass || open_pass.framebuffer!=p.framebuffer){++pass_open_by[!open_pass.cmd?0:(open_pass.cmd!=c.command?1:(open_pass.pass!=p.pass?2:3))];if(p.framebuffer)pass_open_fbs.insert(uint64_t(uintptr_t(p.framebuffer)));end_pass(7);begin_pass(p,c);open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;open_pass.serial0=p.images.n&&p.images.v[0]?p.images.v[0]->source.serial:0;open_pass.depth_attached=state.rt.depth!=nullptr;++perf.passes;}
                 if(depth)open_pass.depth_used=true;
                 VkClearRect r{scissor(p),0,1};if(r.rect.extent.width && r.rect.extent.height)vkCmdClearAttachments(c.command,1,&a,1,&r);
                 ++perf.folded_clears;return;
@@ -5422,7 +5447,9 @@ static void xbg_present_texture_now(const win_t *window,const tex_t *texture){st
                  (unsigned long long)im.last_write,int(im.layout),(unsigned long long)im.checked_submission);
              present_probe_other_serials();
              if(probe_n>0 && stats.presents.load()>=uint64_t(probe_n))probe_done=true;}
-         g_present_serial_hint=texture->serial;g_draws_since_present=0;g_draws_to_present_serial=0;
+         g_present_serial_hint=texture->serial;g_winfill_serial=texture->serial;
+         {bool known=false;for(int i=0;i<g_win_n;i++)if(g_win_serials[i]==texture->serial)known=true;
+          if(!known && g_win_n<8){g_win_serials[g_win_n++]=texture->serial;xbg_logf("[上屏] 登记窗口缓冲 serial=%llu（共 %d 个）",(unsigned long long)texture->serial,g_win_n);}}g_draws_since_present=0;g_draws_to_present_serial=0;
          int r;{CPU_SCOPE(Present);
          // np658：reset 恢复窗口内先安静（present 也走队列，同样会喂 render_service 的失败计数）。
          // np658: stay quiet during the recovery window (present also goes through the queue and feeds the counter).
