@@ -18,7 +18,14 @@ import io, os, re, sys, json, shutil, subprocess, gzip, glob
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-PY = r'C://Users//Administrator//.workbuddy//binaries//python//envs//default//Scripts//python.exe'
+# np708：.workbuddy python 已不存在（np700 在 device_one_shot.ps1 修过同款问题，这里漏了）——
+#   改候选列表逐个探测；找不到就回退裸 python（由调用方环境兜底）。
+# np708: the .workbuddy python is gone (device_one_shot.ps1 got the same fix at np700; this script missed it) --
+#   probe a candidate list; fall back to bare 'python' when nothing exists.
+PY = next((p for p in (
+    r'C:\Users\Administrator\AppData\Roaming\uv\python\cpython-3.12.13-windows-x86_64-none\python.exe',
+    r'C:\Users\Administrator\.venv-html-to-docx\Scripts\python.exe',
+) if os.path.exists(p)), 'python')
 DMTOOLS = r'C://Users//Administrator//dm-tools'
 BASE = os.path.join(DMTOOLS, 'synth')
 EXTRA_DSTS = [
