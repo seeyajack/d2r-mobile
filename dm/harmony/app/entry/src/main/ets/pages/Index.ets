@@ -135,6 +135,7 @@ struct Index {
 
   // 手柄状态（只有变化时才推进宿主，避免每帧刷）
   private buttons: number = 0;
+  private padHold: boolean = false;   // np710：起客后手柄区要常驻夺焦（XComponent 建窗口会抢走）
   private lx: number = 0;
   private ly: number = 0;
   private rx: number = 0;
@@ -669,6 +670,19 @@ struct Index {
             }
             dms2.start(dir, log, marker, envs);
             trace(ctx, 'start returned');
+            // np710：起客后焦点归还手柄区。用户实测（真手柄）：起客前按键能导航 UI，起客后
+            //   按键变成 UI 焦点遍历、A 键把焦点送进「运行目录」输入框——XComponent 建游戏
+            //   窗口时异步夺走了焦点。立即归还 + 三次延迟重试盖住建窗时机；onBlur 兜底常驻。
+            // np710: hand focus back to the pad area after guest start. User-tested with a real
+            //   gamepad: before start, buttons navigate the UI; after start they become focus
+            //   traversal and A lands in the run-dir TextInput -- the XComponent steals focus
+            //   asynchronously when it builds the game window. Immediate + 3 delayed retries
+            //   cover that window; onBlur keeps it grabbed for the rest of the run.
+            this.padHold = true;
+            this.getUIContext().getFocusController().requestFocus('padArea');
+            for (const d of [500, 1500, 3000]) {
+              setTimeout(() => { this.getUIContext().getFocusController().requestFocus('padArea'); }, d);
+            }
           } catch (e) {
             this.status = 'start 抛异常：' + e;
             trace(getContext(this) as common.UIAbilityContext, '❌ 抛异常：' + e);
@@ -685,6 +699,11 @@ struct Index {
       // ---- 手柄：常驻焦点收键事件；方向键不外溢（官方对"只用方向键做游戏操作"的建议）----
       Button('手柄焦点区（连上手柄后按几下）')
         .defaultFocus(true)
+        .id('padArea')
+        .onBlur(() => {
+          // np710：起客后焦点被夺就走 onBlur——只要在跑就把焦点抢回来（按键别再变成遍历）
+          if (this.padHold) { this.getUIContext().getFocusController().requestFocus('padArea'); }
+        })
         .width('100%')
         .focusScopeId('pad', true, false)
         .onKeyEvent((event: KeyEvent) => {
@@ -694,6 +713,7 @@ struct Index {
           if (event.type === KEY_DOWN) this.buttons |= bit;
           else if (event.type === KEY_UP) this.buttons &= ~bit;
           this.pushPad('键');
+          return true;   // np710：已映射键消费掉——不返回 true 时焦点遍历照样发生（用户实测 A 键跳输入框）
         })
         .onFocusAxisEvent((event: FocusAxisEvent) => {
           if (!event || !event.axisMap) return;
