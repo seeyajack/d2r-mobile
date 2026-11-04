@@ -1116,7 +1116,20 @@ static Image *g_winpass_last=nullptr;
 void end_pass(int cause){pass_end_cause_now=cause;
     g_winpass_last=open_pass.images.n?open_pass.images.v[0]:nullptr;
     end_open_pass();pass_end_cause_now=0;if(g_winpass_hook)g_winpass_hook();}   // np641：带"谁关的"编号的 end_open_pass | np641: end_open_pass tagged with the call site
-void full_barrier(VkCommandBuffer cmd){VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&b,0,nullptr,0,nullptr);barrier_seq=write_seq;++barrier_by[cur_op<64?cur_op:63];}
+// np712：屏障站点标注——PERF 行按调用点计数（barrier sites），找出 478/帧 的真实出处。
+// np712: barrier site tagging -- the PERF line counts by call site to locate the 478/frame barriers.
+static const char *g_barrier_site="other";
+// np712b：冗余屏障跳过。游戏每帧发 ~780 个 nvnCommandBufferBarrier（标题相位实测），Maleoon 上
+//   每个 ~58µs（45ms/帧）。两个屏障之间若没有任何 GPU 写（draw/dispatch/copy/clear），屏障没有
+//   可保证的可见性 ⇒ 跳过。g_gpu_wrote 由各写入口置位；跳过计数进 PERF（@barrier-skip）。
+// np712b: redundant-barrier skip. The game issues ~780 nvnCommandBufferBarrier per frame (measured in
+//   the title phase), ~58µs each on Maleoon (45ms/frame). Between two barriers with no GPU write
+//   (draw/dispatch/copy/clear) a barrier guarantees nothing ⇒ skip it. g_gpu_wrote is set by every
+//   write entry; the skip count goes to PERF (@barrier-skip).
+static bool g_gpu_wrote=false;static uint64_t g_barrier_skip=0,g_barrier_emit=0;
+static const char *barrier_site_name[32];static uint64_t barrier_site_cnt[32];static unsigned barrier_site_n=0;
+static unsigned barrier_site_id(const char *n){for(unsigned i=0;i<barrier_site_n;i++)if(barrier_site_name[i]==n)return i;if(barrier_site_n<32){barrier_site_name[barrier_site_n]=n;return barrier_site_n++;}return 31;}
+void full_barrier(VkCommandBuffer cmd){VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&b,0,nullptr,0,nullptr);barrier_seq=write_seq;++barrier_by[cur_op<64?cur_op:63];++barrier_site_cnt[barrier_site_id(g_barrier_site)];}
 // np640：**pass 内合法的内存屏障**。render pass 内部不能出现 pass 之外的阶段（ALL_COMMANDS 会带进来，
 //   验证层报 VUID），所以 pass 开着时把阶段掩码收窄到图形阶段；pass 没开就保持 ALL_COMMANDS 的原语义。
 //   用途：不该断 pass 的地方（barrier 回放、storage 回读的拷贝）就地发屏障，别再 end_open_pass()。
@@ -1128,7 +1141,7 @@ void full_barrier_in_pass(VkCommandBuffer cmd){
     VkPipelineStageFlags st=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     if(open_pass.cmd==cmd)st=VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT|VK_PIPELINE_STAGE_VERTEX_INPUT_BIT|VK_PIPELINE_STAGE_VERTEX_SHADER_BIT|VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT|VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT|VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT|VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd,st,st,0,1,&b,0,nullptr,0,nullptr);barrier_seq=write_seq;++barrier_by[cur_op<64?cur_op:63];
+    vkCmdPipelineBarrier(cmd,st,st,0,1,&b,0,nullptr,0,nullptr);barrier_seq=write_seq;++barrier_by[cur_op<64?cur_op:63];++barrier_site_cnt[barrier_site_id(g_barrier_site)];
 }
 struct PerfCounts{size_t pipelines,layouts,samplers,passes,images,host_segments,host_bytes;};
 PerfCounts perf_counts();
@@ -1343,7 +1356,7 @@ void submit_split_segment(){
     unsigned saved=cur_op;cur_op=60;
     if(open_pass.cmd==s.cmd)end_pass(1);   // np629c：大 pass 内部也切（见切点注释）
     // 段尾：栅栏 + 时间戳（与 submit_slots 同款收尾，但不做 query 拷贝——那要等最后一发）
-    full_barrier(s.cmd);
+    g_barrier_site="split-submit";full_barrier(s.cmd);
     VK(vkEndCommandBuffer(s.cmd));
     VkFence fence=VK_NULL_HANDLE;
     {VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};VK(vkCreateFence(cfg.device,&fi,nullptr,&fence));
@@ -1671,6 +1684,8 @@ void perf_frame(){
      for(int i=0;i<64 && at<int(sizeof(line))-24;i++)if(pass_end_by[i])at+=snprintf(line+at,sizeof(line)-at," op%d=%.1f",i,pass_end_by[i]/f);
      at+=snprintf(line+at,sizeof(line)-at," fb_hits=%.1f fb_creates=%.2f fb_live=%zu texel_binds=%.1f distinct=%.1f reused=%.1f resident=%zu/%zu hits=%.1f refresh=%.1f fallback=%.2f evict=%.2f occlusion=%.1f reports=%.1f samples=%.0f ops=%.1f/%.1f/%.1f pending=%zu pipe_fast=%.1f pass_fast=%.1f barriers",fb_hits/f,fb_creates/f,persistent_framebuffers.size(),texel_binds/f,texel_distinct/f,texel_reused/f,texel_resident[0].size(),texel_resident[1].size(),texel_hits/f,texel_refreshes/f,texel_fallbacks/f,texel_evictions/f,occlusion_queries_started/f,samples_reports/f,samples_reported/f,counter_ops[0]/f,counter_ops[1]/f,counter_ops[2]/f,pending_reports.size(),pipeline_fast_hits/f,pass_fast_hits/f);pipeline_fast_hits=0;pass_fast_hits=0;fb_hits=fb_creates=0;occlusion_queries_started=samples_reports=samples_reported=0;for(auto &c:counter_ops)c=0;texel_binds=texel_distinct=texel_reused=0;texel_hits=texel_refreshes=texel_fallbacks=texel_evictions=0;
      for(int i=0;i<64 && at<int(sizeof(line))-24;i++)if(barrier_by[i])at+=snprintf(line+at,sizeof(line)-at," op%d=%.1f",i,barrier_by[i]/f);
+     for(unsigned i=0;i<barrier_site_n && at<int(sizeof(line))-48;i++)if(barrier_site_cnt[i])at+=snprintf(line+at,sizeof(line)-at," @%s=%.1f",barrier_site_name[i],barrier_site_cnt[i]/(double)f);
+     at+=snprintf(line+at,sizeof(line)-at," @skip=%.1f @emit=%.1f",g_barrier_skip/(double)f,g_barrier_emit/(double)f);
      if(at<int(sizeof(line))-24)at+=snprintf(line+at,sizeof(line)-at," depth_idle=%.1f",depth_idle_passes/f);
      // np639：开新 pass 的四个原因（none 没有 pass 开着 / cmd 换命令缓冲 / rp 换 VkRenderPass / fb 换 framebuffer），
      //   以及窗口内"每帧开过多少个不同的 framebuffer"（fb_distinct 接近 pass 数 ⇒ 每个 pass 的附件身份都不同）。
@@ -1683,7 +1698,7 @@ void perf_frame(){
      at+=snprintf(line+at,sizeof(line)-at," pass_end_by_cause 1=%.1f 2=%.1f 3=%.1f 4=%.1f 5=%.1f 6=%.1f 7=%.1f prep_read_end=%.1f",
          pass_end_cause[1]/f,pass_end_cause[2]/f,pass_end_cause[3]/f,pass_end_cause[4]/f,pass_end_cause[5]/f,pass_end_cause[6]/f,pass_end_cause[7]/f,prep_read_end/f);
      at+=snprintf(line+at,sizeof(line)-at," prep_read_feedback=%.1f",prep_read_feedback/f);
-     xbg_logf("%s",line);for(int i=0;i<64;i++)pass_end_by[i]=barrier_by[i]=0;depth_idle_passes=0;
+     xbg_logf("%s",line);for(int i=0;i<64;i++)pass_end_by[i]=barrier_by[i]=0;for(unsigned i=0;i<barrier_site_n;i++)barrier_site_cnt[i]=0;g_barrier_skip=g_barrier_emit=0;depth_idle_passes=0;
      for(int i=0;i<4;i++)pass_open_by[i]=0;pass_open_fbs.clear();for(int i=0;i<8;i++)pass_end_cause[i]=0;prep_read_end=0;prep_read_feedback=0;}
     xbg_logf("NVN PERF cleanup_ms_per_frame queries=%.2f writebacks=%.2f(%.1fMB) views=%.2f retire=%.2f arena_pools=%.2f",cleanup_ns[0]/1e6/f,cleanup_ns[1]/1e6/f,writeback_bytes/1048576.0/f,cleanup_ns[2]/1e6/f,cleanup_ns[3]/1e6/f,cleanup_ns[4]/1e6/f);for(auto &c:cleanup_ns)c=0;writeback_bytes=0;
     xbg_logf("NVN PERF xview views=%.2f races=%.2f guarded=%.2f guarded_kb=%.1f",xviews/f,xview_races/f,xview_guarded/f,xview_guarded_bytes/1024.0/f);xviews=xview_races=xview_guarded=xview_guarded_bytes=0;
@@ -1963,8 +1978,8 @@ struct Commands {
     // Non-draw operations keep the former submit-per-operation semantics: they
     // end any open pass and are fenced by full barriers before and after.
     explicit Commands(bool is_draw=false):draw(is_draw){Slot &s=recording_slot();command=s.cmd;++perf.ops;++s.ops;
-        if(!draw){end_pass(3);full_barrier(command);}}
-    void finish(){if(!draw){end_pass(3);full_barrier(command);}}
+        if(!draw){end_pass(3);g_barrier_site="finish";full_barrier(command);}}
+    void finish(){if(!draw){end_pass(3);g_barrier_site="finish";full_barrier(command);}}
 };
 VkFormat format(int f) {
     static const VkFormat table[]={VK_FORMAT_UNDEFINED,
@@ -2222,7 +2237,7 @@ void prepare_read(Image &im,VkCommandBuffer cmd){
         return;
     }
     ++prep_read_end;
-    end_pass(4);im.transition(cmd,VK_IMAGE_LAYOUT_GENERAL);full_barrier(cmd);
+    end_pass(4);im.transition(cmd,VK_IMAGE_LAYOUT_GENERAL);g_barrier_site="transition";full_barrier(cmd);
 }
 void prepare_attachment(Image &im,VkCommandBuffer cmd){
     bool in_open=open_pass.cmd && std::find(open_pass.images.begin(),open_pass.images.end(),&im)!=open_pass.images.end();
@@ -4049,7 +4064,7 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
             //   restores the tile, which costs more than ending and reopening the pass. The pass is actually closed
             //   by the end_open_pass() inside readback_buffer() (`xbg_game.cpp:4566`), so removing this one changed
             //   little.
-            if(pending_view(base,bytes,1,view)){b=out.keep(readback_buffer(bytes));VkCommandBuffer cmd=recording_slot().cmd;end_pass(6);VkBufferCopy region{view.offset,b->offset,bytes};vkCmdCopyBuffer(cmd,view.buffer,b->buffer,1,&region);full_barrier(cmd);}
+            if(pending_view(base,bytes,1,view)){b=out.keep(readback_buffer(bytes));VkCommandBuffer cmd=recording_slot().cmd;end_pass(6);VkBufferCopy region{view.offset,b->offset,bytes};vkCmdCopyBuffer(cmd,view.buffer,b->buffer,1,&region);g_barrier_site="storage-view-readback";full_barrier(cmd);}
             else{cpu_access(base,bytes,3);b=out.keep(readback_buffer(bytes,reinterpret_cast<void*>(base),bytes));}out.storage.push_back({{base,bytes},b});out.written.push_back({{base,bytes},b});}
         else{snap_site=3;out.storage.push_back({{base,bytes},out.keep(snapshot(base,bytes,properties.limits.minStorageBufferOffsetAlignment))});snap_site=0;}
     }
@@ -4165,7 +4180,7 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                         else desc_memo_texel_fail=true;}   // the set then holds a per-frame view: not memoized
                     if(!res){
                     Buffer *buf=nullptr;uint64_t base=uint64_t(texture.mem),bytes=texture.L.size;
-                    if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){Buffer view;if(pending_view(base,bytes,1,view)){buf=out.keep(readback_buffer(bytes));VkCommandBuffer cmd=recording_slot().cmd;end_pass(6);VkBufferCopy region{view.offset,buf->offset,bytes};vkCmdCopyBuffer(cmd,view.buffer,buf->buffer,1,&region);full_barrier(cmd);}else{cpu_access(base,bytes,8);buf=out.keep(readback_buffer(bytes,texture.mem,bytes));}out.storage.push_back({{base,bytes},buf});out.written.push_back({{base,bytes},buf});}
+                    if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){Buffer view;if(pending_view(base,bytes,1,view)){buf=out.keep(readback_buffer(bytes));VkCommandBuffer cmd=recording_slot().cmd;end_pass(6);VkBufferCopy region{view.offset,buf->offset,bytes};vkCmdCopyBuffer(cmd,view.buffer,buf->buffer,1,&region);g_barrier_site="texel-readback";full_barrier(cmd);}else{cpu_access(base,bytes,8);buf=out.keep(readback_buffer(bytes,texture.mem,bytes));}out.storage.push_back({{base,bytes},buf});out.written.push_back({{base,bytes},buf});}
                     else{snap_site=4;buf=out.keep(snapshot(base,bytes,properties.limits.minTexelBufferOffsetAlignment));snap_site=0;texel_frame_keys.insert((base<<12)^bytes);++texel_binds;}
                     VkBufferViewCreateInfo v{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};v.buffer=buf->buffer;v.offset=buf->offset;v.format=format(texture.d.format);v.range=bytes;VkBufferView bv;{auto &cache=recording_slot().texel_views;std::array<uint64_t,4> key{uint64_t(v.buffer),v.offset,v.range,uint64_t(v.format)};auto f=cache.find(key);if(f!=cache.end())bv=f->second;else{VK(vkCreateBufferView(cfg.device,&v,nullptr,&bv));cache.emplace(key,bv);}}texel_views.push_back(bv);write.pTexelBufferView=&texel_views.back();}}
                 else{if(aspect(texture.d.format)!=VK_IMAGE_ASPECT_COLOR_BIT){auto prior=images.find(texture.serial);if(prior==images.end() || (!prior->second->uploaded && !prior->second->gpu_written))xbg_logf("NVN initial depth descriptor shader=%s stage=%u slot=%u id=%d serial=%llu format=%#x",shader.key.c_str(),ns,slot,id,(unsigned long long)texture.serial,texture.d.format);}
@@ -4487,7 +4502,7 @@ void dispatch_op_trace(unsigned op, unsigned size, unsigned depth) {
 // to the budget or a log wrap, this cannot. extern "C" 是为了让 dm/host/crash.c 能直接按名字取到。
 extern "C" { volatile unsigned dm_last_cmd_op = 0xffffffffu; volatile unsigned dm_last_cmd_size = 0; }
 void dispatch_set_last(unsigned op, unsigned size) { dm_last_cmd_op = op; dm_last_cmd_size = size; }
-void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instances=1,uint32_t first_instance=0){preflight_cpu_reads();CPU_SCOPE(Draw);++cur_digest.draws;DrawRoot draw_timing_root(&cpu_scope);provenance_draw();
+void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instances=1,uint32_t first_instance=0){g_gpu_wrote=true;preflight_cpu_reads();CPU_SCOPE(Draw);++cur_digest.draws;DrawRoot draw_timing_root(&cpu_scope);provenance_draw();
     need(state.rt.n>=0 && state.rt.n<=8,"Invalid draw color target count");
     dtrace("1 enter");
     VkShaderModule modules[5]{};for(unsigned i=0;i<5;i++)if(state.shader[i])modules[i]=state.shader[i]->module;
@@ -4711,7 +4726,7 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
         // (the bind cache replays state on the next draw; the driver just sees one extra pass gap).
         if(split_draw_count>=unsigned(N)){submit_split_segment();split_draw_count=0;}
      }}
-    if(d.needs_writeback() || capture.active){unsigned saved=cur_op;cur_op=62;end_pass(6);full_barrier(c.command);cur_op=saved;VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;vkCmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,nullptr,0,nullptr);}
+    if(d.needs_writeback() || capture.active){unsigned saved=cur_op;cur_op=62;end_pass(6);g_barrier_site="writeback";full_barrier(c.command);cur_op=saved;VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;vkCmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,nullptr,0,nullptr);}
     {DRAW_SCOPE(Writeback);if(capture.active){if(d.needs_writeback())gpu_sync(perf.sync_writeback);d.writeback();}else d.defer_writeback();}stats.draws.fetch_add(1,std::memory_order_relaxed);   // diagnostics only: a seq_cst add (LDADDAL) waits for every earlier store, ~2.7% of the render thread
     // np670：绘制落点记账（见 g_draws_since_present 的注释）| np670: draw landing bookkeeping
     {Image *col=open_pass.images.n?open_pass.images.v[0]:nullptr;++g_draws_since_present;
@@ -4798,20 +4813,20 @@ void after_dispatch(Commands &c){
     if(lut->layout!=VK_IMAGE_LAYOUT_GENERAL)lut->transition(cmd,VK_IMAGE_LAYOUT_GENERAL);
     if(!tmp_general){VkImageMemoryBarrier t{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};t.oldLayout=VK_IMAGE_LAYOUT_UNDEFINED;t.newLayout=VK_IMAGE_LAYOUT_GENERAL;t.image=tmp;t.srcQueueFamilyIndex=t.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
         t.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};t.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&t);tmp_general=true;}
-    full_barrier(cmd);
+    g_barrier_site="bright-copy";full_barrier(cmd);
     VkImageCopy region{};region.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};region.dstSubresource=region.srcSubresource;region.extent={lut->width,lut->height,lut->depth};
     vkCmdCopyImage(cmd,lut->image,VK_IMAGE_LAYOUT_GENERAL,tmp,VK_IMAGE_LAYOUT_GENERAL,1,&region);
-    full_barrier(cmd);
+    g_barrier_site="bright-postcopy";full_barrier(cmd);
     VkDescriptorImageInfo ii[2]{};ii[0]={sampler,tmp_view,VK_IMAGE_LAYOUT_GENERAL};ii[1]={VK_NULL_HANDLE,lut->view(nullptr,false,true),VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet w[2]{};for(int i=0;i<2;i++){w[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;w[i].dstSet=set;w[i].dstBinding=uint32_t(i);w[i].descriptorCount=1;w[i].descriptorType=i?VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;w[i].pImageInfo=&ii[i];}
     vkUpdateDescriptorSets(cfg.device,2,w,0,nullptr);
     vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,layout,0,1,&set,0,nullptr);vkCmdPushConstants(cmd,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&k);
     vkCmdDispatch(cmd,(lut->width+3)/4,(lut->height+3)/4,(lut->depth+3)/4);
-    full_barrier(cmd);
+    g_barrier_site="bright-postdispatch";full_barrier(cmd);
     ++applied;
 }
 }
-void dispatch(const p_dispatch &p){preflight_cpu_reads();CPU_SCOPE(Dispatch);++cur_digest.dispatches;provenance_log("DISPATCH shader=%s",state.shader[5]?state.shader[5]->key.c_str():"null");
+void dispatch(const p_dispatch &p){g_gpu_wrote=true;preflight_cpu_reads();CPU_SCOPE(Dispatch);++cur_digest.dispatches;provenance_log("DISPATCH shader=%s",state.shader[5]?state.shader[5]->key.c_str():"null");
     // np608：**和 draw 的 np598 是同一条**。缺包跳过之后 `g_shader_skip_abort` 每帧重置，而绑定的程序
     // 还留着、下一帧游戏没重绑 ⇒ 这里 state.shader[5] 仍为空，于是 dispatch 以另一种方式 FATAL。
     // 铁律 9：开一个降级模式就要把消费侧**所有**分支改完——draw 改过了（丢无 VS 的 draw），dispatch 这里漏了。
@@ -4958,7 +4973,7 @@ bool guest_texture_write(const tex_t *t,unsigned level,unsigned layer,const NVNc
     }
     return true;
 }
-void copy_texture_buffer(const p_copy_b2t &request,bool to_buffer){preflight_cpu_reads();
+void copy_texture_buffer(const p_copy_b2t &request,bool to_buffer){g_gpu_wrote=true;preflight_cpu_reads();
     need(request.tex,"Null buffer image texture");
     tex_t stable=*request.tex;p_copy_b2t p=request;p.tex=&stable;
     // 同步必须先于Image映射/引用；深度拆平面、BC解码和颜色复制随后才可读源字节。
@@ -5082,7 +5097,7 @@ void copy_texture_buffer(const p_copy_b2t &request,bool to_buffer){preflight_cpu
         }
     }else im.gpu_written=true,provenance_write(im,__LINE__);
 }
-void copy_texture(const p_copy_t2t &p){preflight_cpu_reads();Image &s=get_image(p.src,true),&d=get_image(p.dst,false);{static unsigned n=0;if(n++<60)xbg_logf("NVN COPYT2T src=%llu fmt=%#x %ux%ux%u L%u lv%u -> dst=%llu fmt=%#x %ux%u L%u lv%u decoded=%d/%d region=%d,%d,%d %dx%dx%d -> %d,%d,%d sv=%d/%u/%u dv=%d/%u/%u",(unsigned long long)p.src->serial,p.src->d.format,s.width,s.height,s.depth,s.layers,s.levels,(unsigned long long)p.dst->serial,p.dst->d.format,d.width,d.height,d.layers,d.levels,int(s.decoded),int(d.decoded),p.sr.xoffset,p.sr.yoffset,p.sr.zoffset,p.sr.width,p.sr.height,p.sr.depth,p.dr.xoffset,p.dr.yoffset,p.dr.zoffset,int(p.has_sv),p.has_sv?p.sv.base_level:0,p.has_sv?p.sv.min_layer:0,int(p.has_dv),p.has_dv?p.dv.base_level:0,p.has_dv?p.dv.min_layer:0);}
+void copy_texture(const p_copy_t2t &p){g_gpu_wrote=true;preflight_cpu_reads();Image &s=get_image(p.src,true),&d=get_image(p.dst,false);{static unsigned n=0;if(n++<60)xbg_logf("NVN COPYT2T src=%llu fmt=%#x %ux%ux%u L%u lv%u -> dst=%llu fmt=%#x %ux%u L%u lv%u decoded=%d/%d region=%d,%d,%d %dx%dx%d -> %d,%d,%d sv=%d/%u/%u dv=%d/%u/%u",(unsigned long long)p.src->serial,p.src->d.format,s.width,s.height,s.depth,s.layers,s.levels,(unsigned long long)p.dst->serial,p.dst->d.format,d.width,d.height,d.layers,d.levels,int(s.decoded),int(d.decoded),p.sr.xoffset,p.sr.yoffset,p.sr.zoffset,p.sr.width,p.sr.height,p.sr.depth,p.dr.xoffset,p.dr.yoffset,p.dr.zoffset,int(p.has_sv),p.has_sv?p.sv.base_level:0,p.has_sv?p.sv.min_layer:0,int(p.has_dv),p.has_dv?p.dv.base_level:0,p.has_dv?p.dv.min_layer:0);}
     if(p.has_sv && p.sv.set_format)(void)s.view_format(&p.sv);
     if(p.has_dv && p.dv.set_format)(void)d.view_format(&p.dv);
     // 已知ASTC-pack源是ASTC4x4，目的BC3及既有RGBA BC目标从建图起解码，不迁移已有内容。
@@ -5148,7 +5163,7 @@ void partial_clear_texture(Image &im,const p_clear_tex &request,uint32_t level,u
     }
     im.gpu_written=true,provenance_write(im,__LINE__);
 }
-void clear_texture(const p_clear_tex &input){preflight_cpu_reads();
+void clear_texture(const p_clear_tex &input){g_gpu_wrote=true;preflight_cpu_reads();
     p_clear_tex p=input;
     Image &im=get_image(p.tex,false);need((uint32_t(p.mask)&~15u)==0,"Invalid texture clear mask");if(!p.mask)return;
     uint32_t level=p.has_view&&p.view.set_levels?p.view.base_level:0,layer=p.has_view&&p.view.set_layers?p.view.min_layer:0;
@@ -5201,7 +5216,7 @@ bool gpu_buffer_copy(uint64_t src,uint64_t dst,uint64_t n){preflight_cpu_reads()
     Buffer view;if(!pending_view(src,n,1,view))return false;
     invalidate_cpu_range(dst,n);
     Slot &s=recording_slot();end_pass(6);Buffer b=readback_buffer(n);
-    VkBufferCopy region{view.offset,b.offset,n};vkCmdCopyBuffer(s.cmd,view.buffer,b.buffer,1,&region);full_barrier(s.cmd);
+    VkBufferCopy region{view.offset,b.offset,n};vkCmdCopyBuffer(s.cmd,view.buffer,b.buffer,1,&region);g_barrier_site="copy-buffer";full_barrier(s.cmd);
     pending_writebacks.push_back({dst,n,b,&s});return true;
 }
 void resolve_texture(const p_copy_t2t &p){preflight_cpu_reads();
@@ -5221,7 +5236,7 @@ void resolve_texture(const p_copy_t2t &p){preflight_cpu_reads();
 // and clear it; host segments are freed only at shutdown).
 uintptr_t cmd_range_lo=0;size_t cmd_range_bytes=0;
 size_t command_available(const uint8_t *p){uintptr_t address=uintptr_t(p);if(address-cmd_range_lo<cmd_range_bytes)return cmd_range_bytes-(address-cmd_range_lo);auto it=pools.upper_bound(address);if(it!=pools.begin()){--it;if(address>=it->first && address-it->first<it->second){cmd_range_lo=it->first;cmd_range_bytes=it->second;return it->second-(address-it->first);}}{auto h=host_ranges.upper_bound(address);if(h!=host_ranges.begin()){--h;if(address>=h->first && address-h->first<h->second){cmd_range_lo=h->first;cmd_range_bytes=h->second;return h->second-(address-h->first);}}}xbg_fatalf("NVN command address %#llx is outside registered command pools",(unsigned long long)address);}
-void execute_draw_call(const xbg_draw_call &p){
+void execute_draw_call(const xbg_draw_call &p){g_gpu_wrote=true;
     need(p.index_type>=-1 && p.index_type<=2 && p.first>=0 && p.count>=0 && p.instances>=0 && p.base_instance>=0,"Invalid recorded draw plan");
     if(!p.count || !p.instances)return;
     if(p.index_type<0)draw(p.primitive,p.first,p.count,nullptr,uint32_t(p.instances),uint32_t(p.base_instance));
@@ -5232,7 +5247,7 @@ void execute_draw_call(const xbg_draw_call &p){
         draw(p.primitive,0,p.count,&indexed);
     }
 }
-void execute_indirect(const xbg_indirect &p,bool single){preflight_cpu_reads();
+void execute_indirect(const xbg_indirect &p,bool single){g_gpu_wrote=true;preflight_cpu_reads();
     need(p.arguments && p.max_count>=0 && p.max_count<=1000000,"Invalid indirect draw request");
     uint32_t count=1;
     if(!single){
@@ -5350,7 +5365,11 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
         //   showed op28(BARRIER)=17.5/frame vs op26(DRAW_IDX)=14.0/frame). A memory barrier carries no layout
         //   transition, so issuing it inside a render pass is legal; while a pass is open the stage mask is narrowed
         //   to graphics stages (ALL_COMMANDS includes stages outside the pass and the validation layer complains).
-        case OP_BARRIER:{Slot &s=recording_slot();++perf.ops;++s.ops;full_barrier_in_pass(s.cmd);break;}
+        case OP_BARRIER:{Slot &s=recording_slot();++perf.ops;++s.ops;
+           // np712b：无写则跳——见 g_gpu_wrote 注释。emit 时清标志（可见性已保证）。
+           // np712b: skip when nothing was written (see g_gpu_wrote). Clear the flag on emit.
+           if(!g_gpu_wrote){++g_barrier_skip;break;}
+           g_barrier_site="op28-inpass";full_barrier_in_pass(s.cmd);g_gpu_wrote=false;++g_barrier_emit;break;}
         case OP_SET_TEX_POOL:{auto a=payload<p_set_pool>(p,n);need(a.pool,"Null texture pool");state.texture_pool=*a.pool;break;}
         case OP_SET_SAMP_POOL:{auto a=payload<p_set_pool>(p,n);need(a.pool,"Null sampler pool");state.sampler_pool=*a.pool;break;}
         case OP_COPY_B2T:copy_texture_buffer(payload<p_copy_b2t>(p,n),false);break;
