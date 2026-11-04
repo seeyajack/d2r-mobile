@@ -219,8 +219,14 @@ static int split_draws_env(){static int v=-1;if(v<0){const char *e=getenv("DM_SP
   return v;}
 static unsigned split_draw_count=0;   // 本槽本段已录 draw 数
 static unsigned split_seg=0;          // 本槽已切出的段号（0 = 第一段）
-static VkFence split_fences[64]={};   // 中间段的 fence（环形复用）
+static VkFence split_fences[64]={};   // 中间段的 fence（环形复用；无等待方——np703 核对）
 static unsigned split_fence_at=0;
+// np703：连续丢段计数与上限（丢段重建见 submit_split_segment）。任一段提交成功即清零；
+// 连续到上限 = 队列真死 ⇒ 证据落盘 + FATAL。DM_SPLIT_DROP_LIMIT，缺省 8，0 = 不限。
+// np703: consecutive-drop counter and limit (drop-and-rebuild, see submit_split_segment).
+//   Any successful submit clears it; hitting the limit means the queue is dead.
+static unsigned split_drops=0;
+static unsigned split_drop_limit(){static unsigned v=8;static bool read=false;if(!read){read=true;const char *e=getenv("DM_SPLIT_DROP_LIMIT");if(e)v=(unsigned)atoi(e);}return v;}
 std::map<VkImageView,BufRef> img_slot_refs;   // np628：图像描述符同款登记（键 = VkImageView，一个图像可有多个视图）
 // np603：每个 (阶段,槽) 的绑定次数（见 OP_BIND_UBO 处理处）。只用于"空槽"这条 FATAL 的定性。
 // np603: bind counters per (stage, slot); only used to classify the "empty slot" fatal.
@@ -996,6 +1002,16 @@ static void dump_files(const char *why){
             (unsigned long long)pipeline_counts.hits,(unsigned long long)pipeline_counts.misses,(unsigned long long)pipeline_counts.bypass,(unsigned long long)pipeline_counts.evictions);
         write_lastframe(f,"sealed",sealed);write_lastframe(f,"current",cur);fclose(f);}
 }
+// np703：队列死出口——切段路径连续丢段到上限时由提交线程调（队列被连续拒绝，不是挂死，
+// deathguard 的 30s 站龄检测抓不到这种死法）。落盘与判死同款证据后，调用方 FATAL。
+// np703: the queue-dead exit -- called by the submit thread when the split path hits its drop
+//   limit (the queue is being *rejected*, not hung, so the 30s site-age detector can't see it).
+//   Writes the same evidence as a verdict, then the caller fatals.
+void queue_dead(unsigned seg,VkResult r){
+    char why[160];snprintf(why,sizeof why,"队列死：段 %u 连续丢段到上限（最后错误 %d）——队列被连续拒绝",seg,int(r));
+    xbg_logf("【判死】%s —— 证据落盘",why);
+    dump_files(why);
+}
 // 监视线程：1s 一拍，只读原子与 POD；判死后进程不退（看门狗 90s 兜底照旧）。
 static void *monitor_main(void *){
     uint64_t threshold_ms=30000;if(const char *e=getenv("DM_DEATHGUARD_MS")){long v=atol(e);if(v>=15000)threshold_ms=uint64_t(v);}
@@ -1332,8 +1348,33 @@ void submit_split_segment(){
             {deathguard::VkSite site(deathguard::SUBMIT_SPLIT);sr=vkQueueSubmit(cfg.queue,1,&si,fence);}}
          static int ok3=0;if(sr==VK_SUCCESS && ok3++<3)xbg_logf("【宽限】切段重试成功（段 %u）",split_seg);
       }
-      if(sr!=VK_SUCCESS){xbg_logf("【红】二分段 %u 提交失败 %d —— 驱动在本段翻脸",split_seg,int(sr));
-          xbg_fatalf("split segment %u submit failed: %d",split_seg,int(sr));}}
+      if(sr!=VK_SUCCESS){
+         // np703：**丢段重建**（待办 3，治 np661 型死法——重试 56 次全败后 FATAL 直接退出）。
+         //   重试全败说明队列当下翻脸，但帧循环不该陪葬：本段已录命令整体丢弃（对 NVN 语义 =
+         //   该段跳过，画面缺一块），arm 冷却（np658：恢复窗口内别再敲队列）、重置命令缓冲，
+         //   落到下方公共"重开继续录"路径，帧照常推进。
+         //   split_fences 无等待方（np703 全文件核对：只创建/存环/关停销毁），未 signal 的本段
+         //   fence 不需要任何跳帧记账——11-03 待办里"fence 要走 vkResetFences 跳帧路径"的前提
+         //   不成立。
+         //   连续丢段到上限（DM_SPLIT_DROP_LIMIT，缺省 8；0=不限）= 队列真死 ⇒ 证据落盘
+         //   （deathguard 的队列死出口）再 FATAL，把"无限爬行"变成"带现场的干净退出"。
+         // np703: drop-and-rebuild. All retries failing means the queue turned hostile *right now*;
+         //   the frame loop must not die with it: discard the recorded segment (NVN semantics: the
+         //   segment is skipped, the frame loses a chunk), arm the cooldown (np658: stop knocking
+         //   during the recovery window), reset the command buffer and fall through to the common
+         //   reopen path below. split_fences has no waiter (checked: create/store/destroy only), so
+         //   the unsignaled fence needs no skip-frame bookkeeping. Consecutive drops past the limit
+         //   (DM_SPLIT_DROP_LIMIT, default 8; 0 = unlimited) mean the queue is truly dead: write the
+         //   evidence (the deathguard's queue-dead exit) and FATAL -- a bounded crawl instead of an
+         //   endless one.
+         xbg_logf("【红】二分段 %u 提交失败 %d —— 驱动在本段翻脸，丢段重建（本段内容丢弃）",split_seg,int(sr));
+         lost_arm();
+         VK(vkResetCommandBuffer(s.cmd,0));
+         if(split_drop_limit() && ++split_drops>=split_drop_limit()){
+            deathguard::queue_dead(split_seg,sr);
+            xbg_fatalf("split segment %u dropped %u times in a row: %d (queue dead)",split_seg,unsigned(split_drops),int(sr));}
+         static int dn=0;if(dn++<6 || dn%20==0)xbg_logf("【宽限】已连续丢段 %u 次（上限 %u），帧继续",unsigned(split_drops),split_drop_limit());
+      }else split_drops=0;}   // 任一段提交成功即清零连续丢段计数（本行关 if 与 CPU_SCOPE，下一行关 SubmitInfo 块）
     }
     ++split_seg;cur_digest=SubDigest{};cur_digest.serial=slot_serial;
     // 重开命令缓冲继续录。**必须 bind_cache_reset()**：cache 记的是"旧 cmd 已绑 pipeline/描述符/视口"，
