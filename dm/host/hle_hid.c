@@ -419,7 +419,17 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
       static int t_old = -1; if (t_old < 0) t_old = getenv("DM_TEST_ALONE_NOPAD") != NULL;   // 测试对照：复刻改前的做法（裁决不看手柄键、独占时手柄键照样并进去） | Test control: reproduces the pre-change behavior (the arbitration ignores controller buttons, and controller buttons are still merged in during an exclusive press)
       uint64_t alone = d2r ? dm_ui_alone_take(t_old ? tb : tb | pb) : 0;
       if (alone) s->buttons = t_old ? alone | atomic_load(&g_pad_btn) | atomic_exchange(&g_pad_latch, 0) : alone;   // 独占的一下（dm_cursor.c）：别的键这几帧不交，两条按下沿锁存都不清，之后照常给出 | The exclusive press (dm_cursor.c): other buttons are withheld for these few frames, neither press-edge latch is cleared, and they are delivered as usual afterwards
-      else s->buttons = ((g_in.buttons | atomic_exchange(&g_press_latch, 0)) & ~(d2r ? dm_ui_auto_release() : 0)) | (km & ~(uint64_t)PK_MASK) | (d2r ? dm_ui_auto_buttons() : 0) | atomic_load(&g_pad_btn) | atomic_exchange(&g_pad_latch, 0); }
+      else s->buttons = ((g_in.buttons | atomic_exchange(&g_press_latch, 0)) & ~(d2r ? dm_ui_auto_release() : 0)) | (km & ~(uint64_t)PK_MASK) | (d2r ? dm_ui_auto_buttons() : 0) | atomic_load(&g_pad_btn) | atomic_exchange(&g_pad_latch, 0);
+      // np710b：手柄链路可观测性（验证 App 手柄桥 → 游戏）：每 64 次采样留痕计数与当前手柄键；
+      //   手柄键非零时 1s 限频留痕（按下沿锁存保证至少交付一次，这里记录的是游戏这一读实际收到什么）。
+      // np710b: pad-chain observability (proves the app gamepad bridge reaches the game): every 64th
+      //   sample logs the counter and current pad buttons; non-zero pad buttons log at 1 Hz (the
+      //   press-edge latch guarantees at least one delivery; this records what this read actually got).
+      { uint64_t samp_now = (uint64_t)atomic_load(&g_sampling); long long now_ms = (long long)(now_ns() / 1000000);
+        static _Atomic long long s_last_pad_log;
+        if ((samp_now & 63) == 0 || (pb && now_ms - atomic_load(&s_last_pad_log) >= 1000)) {
+          if (pb) atomic_store(&s_last_pad_log, now_ms);
+          LOG("hid: 游戏取手柄 sampling=%llu pad=0x%llx", (unsigned long long)samp_now, (unsigned long long)pb); } } }
     s->lx = g_in.lx; s->ly = g_in.ly; s->rx = g_in.rx; s->ry = g_in.ry;
     // 摇杆：触屏摇杆有值就用触屏的，否则用手柄的。手柄那边只在手柄模式、且摇杆确实推出来了才给非零值（dm_gamepad.m），放在一边有点漂移的手柄到不了这里
     // Sticks: if the touch stick has a value use it, otherwise use the controller's. The controller side only gives a non-zero value in controller mode and when the
