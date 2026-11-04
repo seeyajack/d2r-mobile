@@ -1316,6 +1316,27 @@ Slot &recording_slot(){
 // np629: submit what the slot has recorded so far as one segment (own fence), then reopen the command
 // buffer and keep recording. Segments execute in queue order, the CPU never waits on intermediate ones --
 // the final state equals a single submission; only what the *driver* sees changes. That is the bisection.
+
+// np705：丢段路径的确定性自检钩子（np702 的 DM_DEATHGUARD_TEST 同款思路——验证不靠等运气）。
+//   DM_SPLIT_DROP_TEST=1：首个切段提交全部失败（含重试，见下）⇒ 丢段重建触发一次后解除
+//     ⇒ 几秒内验证「【丢段重建】+ 进程存活 + 帧继续」。
+//   DM_SPLIT_DROP_TEST=2：切段提交永远失败 ⇒ 连续丢段到上限 ⇒ 验证「queue_dead 判死落盘
+//     （gfx-death.txt 带 why=队列死）+ FATAL」。建议配 DM_SPLIT_DROP_LIMIT=3 缩短爬行。
+//   默认 0 = 关。测试失败是模拟的（不敲队列、不真实提交），fence 未 signal 无害——np703
+//   已核对 split_fences 无等待方（只创建/存环/关停销毁）。
+// np705: deterministic self-test hook for the drop path (same idea as np702's DM_DEATHGUARD_TEST --
+//   verification must not depend on luck). =1: split submits fail until the first drop fires, then
+//   disarm (verifies drop-and-rebuild + survival in seconds). =2: split submits always fail, driving
+//   consecutive drops to the limit (verifies the queue-dead evidence exit). Default 0 = off. Simulated
+//   failures never touch the queue; the unsignaled fence is harmless (np703: split_fences has no waiter).
+static int split_drop_test(){static int v=0;static bool read=false;if(!read){read=true;const char *e=getenv("DM_SPLIT_DROP_TEST");if(e)v=atoi(e);}return v;}
+static unsigned char split_test_fired=0;   // np705：mode 1 在首次丢段后置 1（解除钩子）
+static VkResult split_submit_guarded(VkSubmitInfo *si,VkFence fence){
+   const int mode=split_drop_test();
+   if(mode==2 || (mode==1 && !split_test_fired))return VK_ERROR_DEVICE_LOST;
+   deathguard::VkSite site(deathguard::SUBMIT_SPLIT);
+   return vkQueueSubmit(cfg.queue,1,si,fence);
+}
 void submit_split_segment(){
     Slot &s=slots[slot_index];
     if(!s.recording || !s.cmd)return;
@@ -1335,17 +1356,24 @@ void submit_split_segment(){
       // np658：同款冷却（切段路径也要在恢复窗口内保持安静）。
       // np658: same cooldown (the split path must stay quiet during recovery too).
       if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}
-      // np701：守卫只包住**单次** vkQueueSubmit（重试之间的冷却睡眠不算站龄——56 次重试的合法序列远超阈值）。
-      // np701: the guard wraps ONE vkQueueSubmit (the sleeps between retries are not site age).
-      VkResult sr;{deathguard::VkSite site(deathguard::SUBMIT_SPLIT);sr=vkQueueSubmit(cfg.queue,1,&si,fence);}
+      // np701：守卫只包住**单次**提交调用（重试之间的冷却睡眠不算站龄——56 次重试的合法序列远超阈值）。
+      // np705：守卫随提交一起移进 split_submit_guarded()（三处提交点共用，语义不变）。
+      // np705：提交走自检钩子（守卫移进钩子；测试模式不敲队列直接给失败）。
+      // np705: submit via the self-test hook (the guard moved inside; test mode fails without touching the queue).
+      VkResult sr;sr=split_submit_guarded(&si,fence);
       // np632b：切段路径同款重试（np632 实测主路径三次穿透全兜住，切段路径也要兜）。
-      if(sr!=VK_SUCCESS && retry_submit_enabled()){
+      // np705：测试模式下跳过重试——模拟失败不该被 56 次重试拖住（自然 reset 武装的 8s 冷却会把
+      //   每段拖到分钟级）；丢段重建的入口条件「重试全败」由首败直接达成，与 np661 死法同效。
+      // np705: skip retries in test mode -- a simulated failure must not be dragged through 56 retries
+      //   (natural resets arm the 8s cooldown, minutes per segment); reaching the drop path on first
+      //   failure is the same "all retries failed" entry condition as the np661 death.
+      if(sr!=VK_SUCCESS && retry_submit_enabled() && !split_drop_test()){
          for(int attempt=0;attempt<6 && sr!=VK_SUCCESS;++attempt){usleep(3000u<<attempt);
             if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}  // np661：同款冷却（切段路径）。
-            {deathguard::VkSite site(deathguard::SUBMIT_SPLIT);sr=vkQueueSubmit(cfg.queue,1,&si,fence);}}
+            sr=split_submit_guarded(&si,fence);}
          for(int attempt=0;attempt<50 && sr!=VK_SUCCESS;++attempt){usleep(100000u);
             if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}  // np661：同款冷却（切段路径长宽限）。
-            {deathguard::VkSite site(deathguard::SUBMIT_SPLIT);sr=vkQueueSubmit(cfg.queue,1,&si,fence);}}
+            sr=split_submit_guarded(&si,fence);}
          static int ok3=0;if(sr==VK_SUCCESS && ok3++<3)xbg_logf("【宽限】切段重试成功（段 %u）",split_seg);
       }
       if(sr!=VK_SUCCESS){
@@ -1369,6 +1397,7 @@ void submit_split_segment(){
          //   endless one.
          xbg_logf("【红】二分段 %u 提交失败 %d —— 驱动在本段翻脸，丢段重建（本段内容丢弃）",split_seg,int(sr));
          lost_arm();
+         if(split_drop_test()==1)split_test_fired=1;   // np705：mode 1 首次丢段后解除钩子（只验一次）
          // np703b：reset 失败不 FATAL（np704 学费前移）。device lost 窗口里 vkResetCommandBuffer
          //   合法地可能返回 DEVICE_LOST，而 check() 对非 SUCCESS 一律 xbg_fatalf——那等于在
          //   "不想死"的路径上留了一脚自爆。这里失败只留痕继续：若 cmd 真的不可用，落到下方
