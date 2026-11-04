@@ -1369,7 +1369,15 @@ void submit_split_segment(){
          //   endless one.
          xbg_logf("【红】二分段 %u 提交失败 %d —— 驱动在本段翻脸，丢段重建（本段内容丢弃）",split_seg,int(sr));
          lost_arm();
-         VK(vkResetCommandBuffer(s.cmd,0));
+         // np703b：reset 失败不 FATAL（np704 学费前移）。device lost 窗口里 vkResetCommandBuffer
+         //   合法地可能返回 DEVICE_LOST，而 check() 对非 SUCCESS 一律 xbg_fatalf——那等于在
+         //   "不想死"的路径上留了一脚自爆。这里失败只留痕继续：若 cmd 真的不可用，落到下方
+         //   公共路径的 vkBeginCommandBuffer 会失败并以明确站点 FATAL（那才是合法判差点）。
+         // np703b: don't FATAL on reset failure. vkResetCommandBuffer may legitimately return
+         //   DEVICE_LOST in the storm window, and check() fatals on any non-SUCCESS -- a self-destruct
+         //   on the exact path meant to survive. Log and continue; if the cmd is truly unusable the
+         //   common path's vkBeginCommandBuffer fails with a clear site and that's the legal FATAL.
+         {VkResult rr=vkResetCommandBuffer(s.cmd,0);if(rr!=VK_SUCCESS)xbg_logf("【宽限】丢段后 vkResetCommandBuffer 失败 %d——继续走重开路径",int(rr));}
          if(split_drop_limit() && ++split_drops>=split_drop_limit()){
             deathguard::queue_dead(split_seg,sr);
             xbg_fatalf("split segment %u dropped %u times in a row: %d (queue dead)",split_seg,unsigned(split_drops),int(sr));}
