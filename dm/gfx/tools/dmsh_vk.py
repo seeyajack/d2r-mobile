@@ -193,7 +193,16 @@ def export(key, stage, c1, spv, res):
         vid, tid, sc = by_bind[vbind(b['binding'])]
         off = b['cb_offset'] * 4 if b['cb_slot'] == 0 else None
         if off is None: raise ValueError(f'存储缓冲不在 c0：{b}')
-        if stage == 'cs' and 0x210 <= off <= 0x310 and (off - 0x210) % 16 == 0: nvn = {'kind': 'uniform_pointer', 'slot': (off - 0x210) // 16}
+        # np709：dbf7008 把上界改成含端点 0x310（uniform_pointer slot 16）——真机验证推翻：
+        #   引擎槽表只有 16 项（xbg_game.cpp:4035 need(slot+i<16)），slot 16 必 FATAL
+        #   "Storage descriptor slot out of bounds"。引擎侧地面真相（xbg_game.cpp:3630）：
+        #   cs 的 ub 指针表 = 0x210..0x310 **不含**（16 项），存储表基址恰为 0x310 ⇒
+        #   off==0x310 是 storage slot 0，落 elif（sbase=0x310）即解。
+        # np709: dbf7008's inclusive 0x310 (uniform_pointer slot 16) is refuted on device --
+        #   the engine's slot tables hold 16 entries (need(slot+i<16)), so slot 16 always fatals.
+        #   Engine ground truth (xbg_game.cpp:3630): cs ub-pointer table = 0x210..0x310 EXCLUSIVE,
+        #   the storage table base IS 0x310 => off==0x310 is storage slot 0 via the elif.
+        if stage == 'cs' and 0x210 <= off < 0x310 and (off - 0x210) % 16 == 0: nvn = {'kind': 'uniform_pointer', 'slot': (off - 0x210) // 16}
         elif sbase is not None and 0 <= off - sbase < 0x100 and (off - sbase) % 16 == 0: nvn = {'kind': 'storage_pointer', 'slot': (off - sbase) // 16}
         else: raise ValueError(f'存储缓冲槽解不出：{stage} off={off:#x}')
         descs.append({'name': names.get(vid, ''), 'binding': vbind(b['binding']), 'type': 'storage_buffer', 'count': 1,
