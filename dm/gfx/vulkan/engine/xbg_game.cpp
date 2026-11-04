@@ -1087,6 +1087,22 @@ void begin_occlusion_query(VkCommandBuffer cmd,VkQueryPool pool,uint32_t index){
     need(!open_occlusion.cmd,"Nested occlusion query");
     vkCmdBeginQuery(cmd,pool,index,VK_QUERY_CONTROL_PRECISE_BIT);open_occlusion={cmd,pool,index};++occlusion_queries_started;
 }
+// np713：阴影分辨率开关 DM_GFX_SHADOW_SCALE=<百分比 20..90，缺省 100=关>。识别规则（通用，
+//   不写死游戏）：**单颜色附件 + 正方形 + ≥512** 的 pass（BotW 的线性深度阴影图 896²，30ms/pass、
+//   0.36 频率/帧 ⇒ 均 11ms/帧）。做法：视口/裁剪压到 sw×sh 渲染进左上角，pass 结束后经 tmp 图
+//   NEAREST blit 放大回全图（同图自 blit 的重叠区非法，必须中转；depth-as-color 用 NEAREST——
+//   R32F 无 LINEAR blit 特性）。阴影本来就是模糊语义，块状放大可接受。
+//   判据：GPASS 该 pass 的 us 塌降到 ~scale² 倍 + 探针画面无回归 + fps 上行。
+// np713: shadow-resolution switch. Identification (generic): exactly one color attachment, square, >=512
+//   (BotW's linear-depth shadow map 896^2). Render with viewport/scissor squashed to sw x sh; after the
+//   pass, upscale the corner over the full image through a tmp image with a NEAREST blit.
+void shadow_scale_blit(VkCommandBuffer cmd);   // np713：定义在文件后部（Image 完整定义 + full_barrier 可见处）
+static int shadow_scale_pct=-1;
+static bool g_shadow_armed=false;static Image *g_shadow_img=nullptr;static bool g_shadow_scale_once=false;
+static unsigned g_shadow_sw=0,g_shadow_sh=0,g_shadow_pw=0,g_shadow_ph=0,g_shadow_quad=0;
+static VkImage g_shadow_tmp=nullptr;static VkDeviceMemory g_shadow_tmp_mem=nullptr;
+static unsigned g_shadow_tmp_w=0,g_shadow_tmp_h=0;static unsigned g_shadow_tmp_fmt=0;
+static bool shadow_scale_on(){if(shadow_scale_pct<0){const char *e=getenv("DM_GFX_SHADOW_SCALE");shadow_scale_pct=e?atoi(e):100;if(shadow_scale_pct>0&&shadow_scale_pct<100)xbg_logf("NVN shadow scale=%d%% (DM_GFX_SHADOW_SCALE)",shadow_scale_pct);}return shadow_scale_pct>0&&shadow_scale_pct<100;}
 void end_open_pass(){if(open_pass.cmd){
     // np682：**pass 内涂蓝**。窗口那张图每帧都被绑成 index=0 附件、视口裁剪全尺寸、绘制也挂在同一镜像上，
     //   可读回全是 0。这里在**同一个 pass 内部**直接 vkCmdClearAttachments 涂成蓝色：
@@ -1104,7 +1120,10 @@ void end_open_pass(){if(open_pass.cmd){
         VkClearAttachment a{};a.aspectMask=VK_IMAGE_ASPECT_COLOR_BIT;a.colorAttachment=0;
         a.clearValue.color.float32[0]=0.f;a.clearValue.color.float32[1]=0.f;a.clearValue.color.float32[2]=1.f;a.clearValue.color.float32[3]=1.f;
         VkClearRect r{};r.rect.extent={8192,8192};r.layerCount=1;vkCmdClearAttachments(open_pass.cmd,1,&a,1,&r);}}
-    end_occlusion_query();vkCmdEndRenderPass(open_pass.cmd);if(open_pass.depth_attached && !open_pass.depth_used){++depth_idle_passes;pass_prof_depth_idle(open_pass.cmd);}pass_prof_end(open_pass.cmd);deathguard::pass_end();open_pass=OpenPass{};++pass_end_by[cur_op<64?cur_op:63];++pass_end_cause[pass_end_cause_now&7];}}
+    end_occlusion_query();vkCmdEndRenderPass(open_pass.cmd);
+    // np713：缩放后的阴影放大回全图（shadow_scale_blit 定义在文件后部）
+    if(g_shadow_armed && g_shadow_img)shadow_scale_blit(open_pass.cmd);
+    g_shadow_armed=false;g_shadow_img=nullptr;if(open_pass.depth_attached && !open_pass.depth_used){++depth_idle_passes;pass_prof_depth_idle(open_pass.cmd);}pass_prof_end(open_pass.cmd);deathguard::pass_end();open_pass=OpenPass{};++pass_end_by[cur_op<64?cur_op:63];++pass_end_cause[pass_end_cause_now&7];}}
 // np676：**帧中自检**——在"刚画完窗口那张图"的瞬间读回它左上 64x64，区分两种完全不同的病：
 //   A 读到有内容 ⇒ 绘制确实落进了这张图，present 之前/之中被清掉或被另一张图顶替；
 //   B 读到全 0   ⇒ 这些 draw 根本没在这张图上产生像素（渲染执行层）。
@@ -2239,6 +2258,47 @@ void prepare_read(Image &im,VkCommandBuffer cmd){
     ++prep_read_end;
     end_pass(4);im.transition(cmd,VK_IMAGE_LAYOUT_GENERAL);g_barrier_site="transition";full_barrier(cmd);
 }
+// np713：阴影低分辨率渲染的放大回填（由 end_open_pass 在 pass 关闭后调用）。tmp 中转避免同图
+// 自 blit 的重叠区非法；NEAREST（R32F 无 LINEAR blit 特性）；写标记照 GPU 写记。
+// np713: upscale for the low-res shadow render (called from end_open_pass after the pass closes).
+void shadow_scale_blit(VkCommandBuffer cmd){
+    Image &im=*g_shadow_img;g_barrier_site="shadow-preblit";full_barrier(cmd);
+    if(!g_shadow_tmp || g_shadow_tmp_w!=g_shadow_sw || g_shadow_tmp_h!=g_shadow_sh || g_shadow_tmp_fmt!=uint32_t(im.fmt)){
+        if(g_shadow_tmp){vkDestroyImage(cfg.device,g_shadow_tmp,nullptr);vkFreeMemory(cfg.device,g_shadow_tmp_mem,nullptr);g_shadow_tmp={};}
+        VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};ic.imageType=VK_IMAGE_TYPE_2D;ic.format=VkFormat(im.fmt);
+        ic.extent={g_shadow_sw,g_shadow_sh,1};ic.mipLevels=1;ic.arrayLayers=1;ic.samples=VK_SAMPLE_COUNT_1_BIT;ic.tiling=VK_IMAGE_TILING_OPTIMAL;ic.usage=VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if(vkCreateImage(cfg.device,&ic,nullptr,&g_shadow_tmp)==VK_SUCCESS){
+            VkMemoryRequirements mr;vkGetImageMemoryRequirements(cfg.device,g_shadow_tmp,&mr);
+            VkMemoryAllocateInfo ma{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ma.allocationSize=mr.size;ma.memoryTypeIndex=memory_type(mr.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if(vkAllocateMemory(cfg.device,&ma,nullptr,&g_shadow_tmp_mem)==VK_SUCCESS && vkBindImageMemory(cfg.device,g_shadow_tmp,g_shadow_tmp_mem,0)==VK_SUCCESS){
+                g_shadow_tmp_w=g_shadow_sw;g_shadow_tmp_h=g_shadow_sh;g_shadow_tmp_fmt=uint32_t(im.fmt);
+                VkImageMemoryBarrier t{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};t.oldLayout=VK_IMAGE_LAYOUT_UNDEFINED;t.newLayout=VK_IMAGE_LAYOUT_GENERAL;t.image=g_shadow_tmp;
+                t.srcQueueFamilyIndex=t.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;t.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+                t.srcAccessMask=0;t.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
+                vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&t);
+            }else{vkDestroyImage(cfg.device,g_shadow_tmp,nullptr);g_shadow_tmp={};}
+        }
+    }
+    if(g_shadow_tmp){
+        VkImageCopy cp{};cp.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};cp.dstSubresource=cp.srcSubresource;cp.extent={g_shadow_sw,g_shadow_sh,1};
+        vkCmdCopyImage(cmd,im.image,VK_IMAGE_LAYOUT_GENERAL,g_shadow_tmp,VK_IMAGE_LAYOUT_GENERAL,1,&cp);
+        g_barrier_site="shadow-postcopy";full_barrier(cmd);
+        // np713b：blit → N² 象限 CopyImage（50% = 4 份）。BLIT_DST 在 fmt124 上不保证存在（Maleoon
+        //   首轮后 render_service cppcrash 紧跟 blit，嫌疑未排除），CopyImage 只需 TRANSFER 位，任何
+        //   格式安全。仅支持整倍数缩放（begin_pass 里已卡 pw%sw==0）。
+        // np713b: blit -> N^2 quadrant CopyImage (50% = 4 copies). BLIT_DST is not guaranteed for fmt124
+        //   (first round: render_service cppcrash right after the blit, suspicion unresolved); CopyImage only
+        //   needs TRANSFER bits and is safe for any format. Integer scales only (checked in begin_pass).
+        for(unsigned qy=0;qy<g_shadow_quad;++qy)for(unsigned qx=0;qx<g_shadow_quad;++qx){
+            VkImageCopy q{};q.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};q.dstSubresource=q.srcSubresource;
+            q.srcOffset={0,0,0};q.dstOffset={int32_t(qx*g_shadow_sw),int32_t(qy*g_shadow_sh),0};q.extent={g_shadow_sw,g_shadow_sh,1};
+            vkCmdCopyImage(cmd,g_shadow_tmp,VK_IMAGE_LAYOUT_GENERAL,im.image,VK_IMAGE_LAYOUT_GENERAL,1,&q);}
+        g_barrier_site="shadow-postquads";full_barrier(cmd);
+        im.last_write=++write_seq;im.gpu_written=true;
+        if(!g_shadow_scale_once){g_shadow_scale_once=true;xbg_logf("NVN shadow scale: %ux%u -> %ux%u blit（DM_GFX_SHADOW_SCALE）",g_shadow_pw,g_shadow_ph,g_shadow_sw,g_shadow_sh);}
+    }
+}
+
 void prepare_attachment(Image &im,VkCommandBuffer cmd){
     bool in_open=open_pass.cmd && std::find(open_pass.images.begin(),open_pass.images.end(),&im)!=open_pass.images.end();
     if(im.layout!=VK_IMAGE_LAYOUT_GENERAL && !in_open){end_pass(4);im.transition(cmd,VK_IMAGE_LAYOUT_GENERAL);}
@@ -4372,7 +4432,16 @@ void pass_prof_draw(VkCommandBuffer cmd){Slot &s=slots[slot_index];if(!s.prof ||
 int pass_prof_compute_begin(VkCommandBuffer cmd,const p_dispatch &p){int index=pass_prof_reserve(cmd);if(index<0)return index;
     auto &r=slots[slot_index].prof_recs[index];r.compute=true;r.first=state.shader[5]->key;r.last=r.first;r.x=uint32_t(p.x);r.y=uint32_t(p.y);r.z=uint32_t(p.z);return index;
 }
-void begin_pass(Pass &p,Commands &c){deathguard::pass_begin(p.width,p.height,p.images.n,uint32_t(p.samples),p.images.n&&p.images.v[0]?p.images.v[0]->source.serial:0ull,state.rt.depth!=nullptr);pass_prof_begin(p,c.command);VkRenderPassBeginInfo b{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};b.renderPass=p.pass;b.framebuffer=p.framebuffer;b.renderArea.extent={p.width,p.height};vkCmdBeginRenderPass(c.command,&b,VK_SUBPASS_CONTENTS_INLINE);}
+void begin_pass(Pass &p,Commands &c){deathguard::pass_begin(p.width,p.height,p.images.n,uint32_t(p.samples),p.images.n&&p.images.v[0]?p.images.v[0]->source.serial:0ull,state.rt.depth!=nullptr);pass_prof_begin(p,c.command);
+    // np713：阴影 pass 识别与备战（规则见 shadow_scale_on 注释）
+    g_shadow_armed=false;g_shadow_img=nullptr;
+    unsigned sn=p.width>=512?0:0;
+    if(shadow_scale_on() && p.images.size()==1 && p.width==p.height && p.width>=768 && p.width%unsigned(shadow_scale_pct)==0 && (sn=p.width/unsigned(shadow_scale_pct))>=2){
+        (void)sn;
+        g_shadow_img=p.images.v[0];g_shadow_pw=p.width;g_shadow_ph=p.height;
+        g_shadow_sw=p.width*unsigned(shadow_scale_pct)/100;g_shadow_sh=p.height*unsigned(shadow_scale_pct)/100;
+        g_shadow_armed=true;g_shadow_quad=unsigned(shadow_scale_pct)>0&&(p.width*100)%unsigned(shadow_scale_pct)==0?p.width/g_shadow_sw:0;
+        if(!g_shadow_quad)g_shadow_armed=false;}VkRenderPassBeginInfo b{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};b.renderPass=p.pass;b.framebuffer=p.framebuffer;b.renderArea.extent={p.width,p.height};vkCmdBeginRenderPass(c.command,&b,VK_SUBPASS_CONTENTS_INLINE);}
 void capture_pass(Pass &pass){
     if(!capture.active)return;
     capture_log("PASS width=%u height=%u samples=%u viewport=%g,%g,%g,%g scissor=%d,%d,%u,%u mask=%#x blendEnable=%#x cull=%u front=%u depthTest=%u depthWrite=%u depthFunc=%u stencil=%u",pass.width,pass.height,unsigned(pass.samples),state.viewport.x,state.viewport.y,state.viewport.width,state.viewport.height,state.scissor.offset.x,state.scissor.offset.y,state.scissor.extent.width,state.scissor.extent.height,state.mask.mask,state.color.blend_en,state.poly.cull,state.poly.front,unsigned(state.ds.dt),unsigned(state.ds.dw),unsigned(state.ds.df),unsigned(state.ds.st));
@@ -4636,7 +4705,11 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     VkViewport viewport{};need(xbg_nvn_viewport(&viewport,state.viewport.x,state.viewport.y,state.viewport.width,state.viewport.height*float(ui_vs),state.viewport.minDepth,state.viewport.maxDepth)==0,"Invalid NVN viewport");
     need(viewport.width<=properties.limits.maxViewportDimensions[0] && -viewport.height<=properties.limits.maxViewportDimensions[1] && viewport.x>=properties.limits.viewportBoundsRange[0] && viewport.x+viewport.width<=properties.limits.viewportBoundsRange[1] && viewport.y>=properties.limits.viewportBoundsRange[0] && viewport.y<=properties.limits.viewportBoundsRange[1] && viewport.y+viewport.height>=properties.limits.viewportBoundsRange[0],"NVN viewport exceeds device bounds");
     if(!bc.has_vp || memcmp(&bc.vp,&viewport,sizeof viewport)){vkCmdSetViewport(c.command,0,1,&viewport);bc.vp=viewport;bc.has_vp=true;}else ++binds_skipped;
+    if(g_shadow_armed && open_pass.cmd==c.command && g_shadow_pw){float sx=float(g_shadow_sw)/float(g_shadow_pw),sy=float(g_shadow_sh)/float(g_shadow_ph);
+        viewport.x*=sx;viewport.width*=sx;viewport.y*=sy;viewport.height*=sy;}
     VkRect2D sc=scissor(p);
+    if(g_shadow_armed && open_pass.cmd==c.command && g_shadow_pw){float sx=float(g_shadow_sw)/float(g_shadow_pw),sy=float(g_shadow_sh)/float(g_shadow_ph);
+        sc.offset.x=int32_t(sc.offset.x*sx);sc.offset.y=int32_t(sc.offset.y*sy);sc.extent.width=uint32_t(sc.extent.width*sx);sc.extent.height=uint32_t(sc.extent.height*sy);}
     // np647：**"填充 vs 顶点"判别探针**。`DM_PROBE_TINY_SCISSOR=<n>` 只对**没有颜色附件**的 pass
     //   （阴影/深度预 pass）把 scissor 压到左上 n×n，其它状态一律不动。判据：那一段 pass 的 GPU 时间
     //   塌下来 ⇒ 填充/overdraw 主导；几乎不变 ⇒ 顶点/驱动侧。默认 0 = 关，只用于 A/B。
