@@ -5355,6 +5355,7 @@ static std::vector<uint8_t> flags;                         // 1 = 本 pass 的 S
 static std::vector<uint64_t> prev_keys,prev_hashes,prev_ubo0;
 static size_t idx=0;static bool armed=false;                // 执行期游标
 static uint64_t skipped_ops=0,skipped_passes=0,submits=0,desync=0,planned=0;
+static uint64_t plan_ns=0;   // plan() 的耗时累加（探针自身开销，必须与 execute 分开算）
 static bool enabled(){if(mode<0){const char*e=getenv("DM_FRAME_SKIP");mode=e?atoi(e):0;if(mode)xbg_logf("【跳过】DM_FRAME_SKIP=%d 开启（阶段 2，跳过匹配 pass 的绘制类 op）",mode);}return mode>0;}
 static bool s_op(uint32_t op){
     return op==OP_DRAW||op==OP_DRAW_IDX||op==OP_DISPATCH||op==OP_CLEAR_COLOR||op==OP_CLEAR_DS
@@ -6097,7 +6098,7 @@ static void probe(int n,const uint64_t *handles){
 }
 static void xbg_submit_now(int n,const uint64_t *handles){std::lock_guard<std::recursive_mutex> lock(mutex);
     if(deferred_live_profile && !timing.top){uint64_t current=stats.presents.load();timing=XbgCpuTiming(timing_clock);timing_first=current+2;timing_last=timing_first+deferred_live_profile-1;deferred_live_profile=0;}
-   TimingRoot timing_root;CPU_SCOPE(Other);need(initialized && !failed,"Game Vulkan backend not initialized/healthy");uint64_t begin=timing_clock();snapshot_reset();framedigest::probe(n,handles);if(frameskip::enabled())frameskip::plan(n,handles);frameskip::exec_begin();uint64_t budget=0;for(int i=0;i<n;i++)execute(reinterpret_cast<const uint8_t*>(handles[i]),0,budget);frameskip::exec_report(hud::frame.load(std::memory_order_relaxed));++stats.submissions;++submitted;if(sync_mode)complete_all();perf.submit_cpu_ns+=timing_clock()-begin;}
+   TimingRoot timing_root;CPU_SCOPE(Other);need(initialized && !failed,"Game Vulkan backend not initialized/healthy");uint64_t begin=timing_clock();snapshot_reset();framedigest::probe(n,handles);uint64_t t_plan=timing_clock();if(frameskip::enabled())frameskip::plan(n,handles);frameskip::plan_ns+=timing_clock()-t_plan;frameskip::exec_begin();uint64_t budget=0;for(int i=0;i<n;i++)execute(reinterpret_cast<const uint8_t*>(handles[i]),0,budget);frameskip::exec_report(hud::frame.load(std::memory_order_relaxed));++stats.submissions;++submitted;if(sync_mode)complete_all();perf.submit_cpu_ns+=timing_clock()-begin;}
 extern "C" uint64_t xbg_legacy_last_fence(){return gfx_async?gfx_enqueued.load():[]{std::lock_guard<std::recursive_mutex> lock(mutex);return submitted;}();}
 extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
     // 不取锁的提前返回只用于新写法；旧写法（非鸿蒙缺省）先判 failed，与原来逐条相同
@@ -6338,6 +6339,32 @@ static void present_frame_hash_report(const Buffer &buf,uint32_t w,uint32_t h,ui
         (unsigned long long)ph,(unsigned long long)nz,100.0*double(nz)/double(n),
         double(sum)/double(n*3));
 }
+// np721：**一帧的时间去哪了**。只读打点（DM_FRAME_TIME=1），一帧一行：
+//   interval = 本次 present 距上次 present 的墙钟间隔（= 帧时）
+//   submit   = 本帧在 xbg_submit_now 里录制/遍历 op 的 CPU 时间（perf.submit_cpu_ns 增量）
+//   present  = 本次 present 调用自身的耗时
+//   gpu      = 本帧 GPU 时间增量（perf.gpu_ns，来自 pass 时间戳）
+//   rest     = interval − submit − present ⇒ 客体自己的 CPU + 驱动队列/同步等待（这一项就是 np720 那 300 ms 的候选池）
+namespace frametime{
+static int on=-1;
+static bool enabled(){if(on<0){const char*e=getenv("DM_FRAME_TIME");on=(e&&*e=='1')?1:0;if(on)xbg_logf("[帧时] DM_FRAME_TIME=1 开启（一帧一行，只读）");}return on!=0;}
+static void report(uint64_t now,uint64_t present_begin){
+    if(!enabled())return;
+    static uint64_t last=0,last_submit=0,last_gpu=0;static uint64_t n=0;
+    double interval=last?(double(now-last)/1e6):0.0;
+    double submit=double(perf.submit_cpu_ns-last_submit)/1e6;
+    double present=double(now-present_begin)/1e6;
+    double gpu=double(perf.gpu_ns-last_gpu)/1e6;
+    if(gpu<0)gpu=0;
+    double rest=interval-submit-present;
+    static uint64_t last_plan=0;
+    double plan=double(frameskip::plan_ns-last_plan)/1e6;
+    if(interval>0.0)
+        xbg_logf("FRAMETIME presents=%llu interval_ms=%.1f submit_ms=%.1f plan_ms=%.1f present_ms=%.1f gpu_ms=%.1f rest_ms=%.1f",
+            (unsigned long long)n,interval,submit,plan,present,gpu,rest>0?rest:0.0);
+    last=now;last_submit=perf.submit_cpu_ns;last_gpu=perf.gpu_ns;last_plan=frameskip::plan_ns;++n;
+}
+}
 static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();deathguard::frame_seal();{SiteScope site(SITE_PRESENT);cur_op=61;TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");
          // np662：**切后台不挂死**。表面销毁后上屏回调会在 wait_window() 无限等新表面 ⇒
          // 帧循环整个停住、看门狗 90 秒判死（死状与真卡点难辨）。无窗口时跳过本帧出图、
@@ -6430,6 +6457,7 @@ static void xbg_present_texture_now(const win_t *window,const tex_t *texture){st
              static int okp=0;if(!r && okp++<3)xbg_logf("【宽限】present 重试成功");
          }
          if(r){static int dn=0;if(dn++<8)xbg_logf("【红】present 失败 %d —— 丢掉这一帧（第 %d 次）",int(r),dn);return;}
+         frametime::report(timing_clock(),present_begin);
          ++stats.presents;if(pass_prof_enabled && stats.presents.load()==pass_prof_frame)xbg_logf("NVN GPASS boundary frame=%llu slots=%u skipped_slots=%u reserved_queries=%u max_queries=%u max_slots=%u",(unsigned long long)pass_prof_frame,pass_prof_slots,pass_prof_skipped_slots,pass_prof_queries,pass_prof_query_limit,pass_prof_slot_limit);perf.present_cpu_ns+=timing_clock()-present_begin;perf_frame();if(provenance_file && stats.presents.load()>=provenance.target)provenance_close("END");if(capture.trace && stats.presents==capture.frame){capture_log("END frame=%llu events=%u bytes=%llu presentedSerial=%llu image=%p",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes,(unsigned long long)texture->serial,(void*)im.image);fclose(capture.trace);capture.trace=nullptr;capture.active=false;xbg_logf("NVN one-frame capture complete frame=%llu events=%u bytes=%llu",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes);}}timing_boundary();}
 extern "C" void xbg_legacy_read_texels(const tex_t *t,unsigned level,unsigned layer,const NVNcopyRegion *r,uint8_t *dst,size_t row,size_t image){gfx_drain();std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();need(t&&r&&dst,"Invalid ReadTexels arguments");auto found=images.find(t->serial);if(found==images.end() || !found->second->gpu_written){int bw,bh,bpp=nvn_fmt_bpb(t->d.format,&bw,&bh);need(bpp && r->xoffset==0 && r->yoffset==0 && r->zoffset==0 && r->depth==1 && uint32_t(r->width)==std::max(1u,t->d.width>>level) && uint32_t(r->height)==std::max(1u,t->d.height>>level),"CPU ReadTexels partial region unsupported");need(!(t->d.flags&0x10),"Linear CPU ReadTexels not implemented");need(nvn_deswizzle(&t->d,level,layer,t->mem,dst,row)==0,"ReadTexels deswizzle failed");}
     else{p_copy_b2t p{};p.src=uint64_t(dst);p.tex=t;p.has_view=1;p.view.set_levels=p.view.set_layers=1;p.view.base_level=level;p.view.nlevels=1;p.view.min_layer=layer;p.view.nlayers=1;p.r=*r;int64_t old=state.copy_stride,old_image=state.copy_image_stride;state.copy_stride=row;state.copy_image_stride=image;copy_texture_buffer(p,true);state.copy_stride=old;state.copy_image_stride=old_image;}}
