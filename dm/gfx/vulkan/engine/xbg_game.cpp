@@ -5719,11 +5719,16 @@ extern "C" void xbg_copy_commands(cmd_t *command,int count,const uint64_t *handl
     for(size_t offset=0;offset<bytes;){op_hdr h;memcpy(&h,snapshot.data()+offset,8);xbg_record_command(command,snapshot.data()+offset,h.size);offset+=h.size;}
 }
 extern "C" void xbg_invoke_command_callback(cmd_t *c,size_t n){uint64_t args[]={uint64_t(c),NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY,n,uint64_t(c->cb_data)};if(cfg.invoke_guest)cfg.invoke_guest(cfg.userdata,reinterpret_cast<void*>(c->cb),args,4);else c->cb(reinterpret_cast<NVNcommandBuffer*>(c),NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY,n,c->cb_data);}
-// 阶段 1：帧摘要只读探针（DM_FRAME_DIGEST=1 打摘要 / =2 加首个差异 op）。默认关、不进 envs。
+// 阶段 1 / 1b：帧摘要只读探针。默认关、不进 envs。
+//   DM_FRAME_DIGEST=1 整帧摘要 / =2 再加 opcode 序列首个差异 / =3 **pass 粒度摘要**（阶段 1b）
 // 依据 30-设计/帧级重复判定-阶段0-摘要口径与零变化清单-2026-11-05.md 第 3/4 节：
-// 只做 FNV-1a 增量 hash + op 序列对照，**不跳过任何 op**、不改 state、不物化整帧命令流。
+// 只做 FNV-1a 增量 hash + 序列对照，**不跳过任何 op**、不改 state、不物化整帧命令流。
 // ⚠ op 流不含资源数据（xbg_command_clone.c:4-6）⇒ 同时输出 wtrack 脏页；
-// wtrack 未启用（marker gfx-wtrack 未设 1）时 dirty_clean 恒 0，「脏位为空」判据不成立。
+// wtrack 未注册 region 时 dirty_clean 恒 1（假阳性，np715 实测 0 region）⇒ 别拿它当判据。
+// ⚠ np715 轮 A 定谳（今日 §1i）：整帧粒度不可用（same=1 0/1524），
+//   但 114/117 个 pass 逐字稳定、占 GPU 时间 98.7% ⇒ 静态性在 **pass 粒度**上成立。
+//   ⇒ =3 按「OP_SET_RT 的目标指针」给 pass 身份键（帧间 pass 数 100–416 波动，序号不可用），
+//     同键多 pass 用出现序号区分；输出静态 pass 占比与「可省 S 类 op / draws」份额。
 namespace framedigest{
 static int mode=-1;
 static uint64_t seq=0,prev_hash=0,prev_dirty=0;
@@ -5731,6 +5736,112 @@ static std::vector<uint32_t> prev_ops,cur_ops;
 static uint64_t mix(uint64_t h,const uint8_t *p,size_t n){
     for(size_t i=0;i<n;i++){h^=p[i];h*=1099511628211ull;}
     return h;
+}
+// ---- 阶段 1b：pass 粒度 ----
+struct pass_digest{uint64_t key,hash;size_t bytes;uint32_t ops,draws,sops;};
+static const int HISTN=4;                        // 帧距历史：1..4 帧（缓冲环轮换时命中会出现在 d>1）
+static std::vector<pass_digest> hist[HISTN];
+static int hist_fill=0;
+static std::vector<pass_digest> cur_passes;
+static pass_digest seg;
+static bool s_op(uint32_t op){   // 设计文档 §2 的 S 类（可跳过：纯绘制/清除）
+    return op==OP_DRAW||op==OP_DRAW_IDX||op==OP_DISPATCH||op==OP_CLEAR_COLOR||op==OP_CLEAR_DS
+        ||op==(OP_COUNT_+2)||op==(OP_COUNT_+3)||op==(OP_COUNT_+7)||op==(OP_COUNT_+8)||op==(OP_COUNT_+9);
+}
+static bool draw_op(uint32_t op){
+    return op==OP_DRAW||op==OP_DRAW_IDX||op==(OP_COUNT_+3)||op==(OP_COUNT_+7)||op==(OP_COUNT_+8);
+}
+// 身份键 = OP_SET_RT 载荷里各渲染目标的 **tex_t.serial**（不是指针、不是原始载荷字节）。
+// 为什么不用原始载荷：`view_t cview[8]` / `has_cview[8]` 里未使用的槽是游戏没写的垃圾，
+// 整段 hash 进去会让「同一个 pass」每帧换键（np715b 实测 new 占 90%+，static 只剩 2/162）。
+// serial 是贴图对象的初始化序号（nvn_obj.h:35），跨帧稳定；载荷里存的是本序号的不可变副本。
+// 不取序号：帧间 pass 数在 100–416 波动（np715 实测）⇒ 序号会整体错位。
+static uint64_t seg_base_key(const uint8_t *p,size_t n){
+    uint64_t h=1469598103934665603ull;int32_t cnt=0;
+    if(n<4)return h;
+    memcpy(&cnt,p,4);
+    if(cnt<0)cnt=0;if(cnt>8)cnt=8;
+    h=mix(h,reinterpret_cast<const uint8_t*>(&cnt),4);
+    for(int i=0;i<cnt;i++){                     // color[i] 是本序号的不可变副本 ⇒ 可安全读 serial
+        const tex_t *t=nullptr;
+        size_t off=offsetof(p_set_rt,color)+size_t(i)*sizeof(const tex_t*);
+        if(off+sizeof(const tex_t*)>n)break;
+        memcpy(&t,p+off,sizeof(const tex_t*));
+        uint64_t ser=t?t->serial:0;
+        h=mix(h,reinterpret_cast<const uint8_t*>(&ser),8);
+    }
+    if(offsetof(p_set_rt,depth)+sizeof(const tex_t*)<=n){
+        const tex_t *d=nullptr;
+        memcpy(&d,p+offsetof(p_set_rt,depth),sizeof(const tex_t*));
+        uint64_t ser=d?d->serial:0;
+        h=mix(h,reinterpret_cast<const uint8_t*>(&ser),8);
+    }
+    return h;
+}
+static void seg_open(const uint8_t *p,size_t n){
+    uint64_t k=seg_base_key(p,n);unsigned occ=0;
+    for(size_t i=0;i<cur_passes.size();i++)if(cur_passes[i].key==k)++occ;   // 同键第几次出现
+    seg=pass_digest{k^(uint64_t(occ)*0x9E3779B97F4A7C15ull),1469598103934665603ull,0,0,0,0};
+    seg.hash=mix(seg.hash,reinterpret_cast<const uint8_t*>(&k),8);          // 同内容不同 RT 也要分开
+}
+static void seg_close(){if(seg.ops)cur_passes.push_back(seg);seg.ops=0;}
+static int match_dist(const pass_digest &c){        // 返回 1..HISTN 表示在第 d 帧前的历史里命中，0 = 未命中
+    for(int d=0;d<hist_fill&&d<HISTN;d++)
+        for(size_t j=0;j<hist[d].size();j++)
+            if(hist[d][j].key==c.key&&hist[d][j].hash==c.hash)return d+1;
+    return 0;
+}
+static void pass_report(uint64_t frame){
+    size_t st=0,chg=0,nw=0;uint64_t dt=0,ds=0,st_sops=0,sops=0,bs=0,bt=0;
+    long long first=-1;uint64_t first_draws=0;
+    const std::vector<pass_digest> &prev=hist_fill?hist[0]:cur_passes;   // 上一帧（首帧退化，无判据）
+    for(size_t i=0;i<cur_passes.size();i++){
+        const pass_digest &c=cur_passes[i];
+        dt+=c.draws;sops+=c.sops;bt+=c.bytes;
+        const pass_digest *pv=nullptr;
+        for(size_t j=0;j<prev.size();j++)if(prev[j].key==c.key){pv=&prev[j];break;}
+        if(pv&&pv->hash==c.hash){++st;ds+=c.draws;st_sops+=c.sops;bs+=c.bytes;}
+        else{if(pv)++chg;else ++nw;if(first<0){first=(long long)i;first_draws=c.draws;}}
+    }
+    // 帧距 1..4：重放层若按 N 帧轮换缓冲地址，命中会出现在 d=N 而不是 d=1
+    size_t dhit[HISTN+1]={0};uint64_t ddraw[HISTN+1]={0};
+    size_t bigi=0;
+    for(size_t i=0;i<cur_passes.size();i++){
+        if(cur_passes[i].draws>cur_passes[bigi].draws)bigi=i;
+        int d=match_dist(cur_passes[i]);
+        if(d>0&&d<=HISTN){++dhit[d];ddraw[d]+=cur_passes[i].draws;}
+    }
+    int bigd=cur_passes.empty()?0:match_dist(cur_passes[bigi]);
+    // 备用口径：不靠身份键，按摘要值对上一帧做多重集交集
+    std::vector<uint64_t> pool;pool.reserve(prev.size());
+    for(size_t i=0;i<prev.size();i++)pool.push_back(prev[i].hash);
+    size_t sth=0;uint64_t dsh=0,ssh=0,bsh=0;
+    for(size_t i=0;i<cur_passes.size();i++)
+        for(size_t j=0;j<pool.size();j++)if(pool[j]==cur_passes[i].hash){
+            pool[j]=pool.back();pool.pop_back();
+            ++sth;dsh+=cur_passes[i].draws;ssh+=cur_passes[i].sops;bsh+=cur_passes[i].bytes;break;}
+    // 一行一提交：静态份额 + 可省 S 类 op + 帧距命中 + 最大 pass 的命中距离
+    xbg_logf("FRAMEDIGEST2 frame=%llu passes=%zu static=%zu chg=%zu new=%zu draws=%llu draws_static=%llu sops=%llu sops_static=%llu bytes=%llu bytes_static=%llu first=%lld first_draws=%llu | d1=%zu d2=%zu d3=%zu d4=%zu ddraws=%llu/%llu/%llu/%llu big=%u bigd=%d hist=%d | hstatic=%zu hdraws=%llu hsops=%llu",
+        (unsigned long long)frame,(size_t)cur_passes.size(),st,chg,nw,
+        (unsigned long long)dt,(unsigned long long)ds,(unsigned long long)sops,(unsigned long long)st_sops,
+        (unsigned long long)bt,(unsigned long long)bs,first,(unsigned long long)first_draws,
+        dhit[1],dhit[2],dhit[3],dhit[4],
+        (unsigned long long)ddraw[1],(unsigned long long)ddraw[2],(unsigned long long)ddraw[3],(unsigned long long)ddraw[4],
+        cur_passes.empty()?0u:cur_passes[bigi].draws,bigd,hist_fill,
+        sth,(unsigned long long)dsh,(unsigned long long)ssh);
+    for(int d=HISTN-1;d>0;--d)hist[d].swap(hist[d-1]);
+    hist[0]=cur_passes;cur_passes.clear();
+    if(hist_fill<HISTN)++hist_fill;
+}
+// =4：**地址无关**摘要（阶段 1b 第二步）。np715f 定谳：op 逐字节摘要被缓冲地址轮换污染
+//   （最大 pass 28,674 draws 只在 d=2/d=4 命中 ⇒ 2–4 帧轮换，不是内容变化）。
+//   ⇒ 只 hash **结构**（op + size，丢掉操作数里的地址）+ 本 pass 里绑定过的 **UBO 内容**。
+//   ⚠ 仍看不见顶点内容变化（2.9M 顶点/帧，逐字节划算不过来）⇒ 阶段 2 必须叠加
+//     GPASS 的 draws/verts 签名，别只靠这一条。
+static uint64_t ubo_digest(uint64_t addr,uint64_t size){
+    if(addr<4096||!size)return 0;
+    size_t take=size_t(size>65536?65536:size);         // 单次上限 64 KB（相机/材质 UBO 都远小于此）
+    return mix(1469598103934665603ull,reinterpret_cast<const uint8_t*>(uintptr_t(addr)),take);
 }
 static void walk(const uint8_t *pc,unsigned depth,uint64_t &h,uint64_t &bytes,uint64_t &ops,uint64_t &steps){
     if(depth>64)return;
@@ -5747,8 +5858,31 @@ static void walk(const uint8_t *pc,unsigned depth,uint64_t &h,uint64_t &bytes,ui
             if(hd.op==OP_JUMP){pc=reinterpret_cast<const uint8_t*>(next);continue;}
             walk(reinterpret_cast<const uint8_t*>(next),depth+1,h,bytes,ops,steps);
         }else if(hd.op!=OP_BEGIN){
+            if(mode>=3){                               // pass 分段：SET_RT 开新段，本 op 属于新段
+                if(hd.op==OP_SET_RT){
+                    // ⚠ 不把 SET_RT 记录本身 hash 进去：载荷里的 cview/has_cview 未用槽是垃圾，
+                    //   一 hash 进去同一条个 pass 每帧换摘要（np715b 学费）。身份已由 key（serial）承担。
+                    seg_close();seg_open(pc+8,hd.size-8);++seg.ops;
+                }else if(mode>=4){
+                    // 地址无关：只进 (op,size) 8 字节头；UBO/SSBO 额外把 **内容** 折进去
+                    seg.hash=mix(seg.hash,pc,8);seg.bytes+=hd.size;++seg.ops;
+                    if(s_op(hd.op))++seg.sops;
+                    if(draw_op(hd.op))++seg.draws;
+                    if(hd.op==OP_BIND_UBO||hd.op==OP_BIND_SSBO){
+                        p_bind_buf b{};size_t cp=hd.size-8;
+                        if(cp>sizeof(b))cp=sizeof(b);
+                        memcpy(&b,pc+8,cp);
+                        uint64_t u=ubo_digest(b.addr,b.size);
+                        seg.hash=mix(seg.hash,reinterpret_cast<const uint8_t*>(&u),8);
+                    }
+                }else{
+                    seg.hash=mix(seg.hash,pc,hd.size);seg.bytes+=hd.size;++seg.ops;
+                    if(s_op(hd.op))++seg.sops;
+                    if(draw_op(hd.op))++seg.draws;
+                }
+            }
             h=mix(h,pc,hd.size);bytes+=hd.size;++ops;
-            if(mode>=2)cur_ops.push_back(hd.op);
+            if(mode==2)cur_ops.push_back(hd.op);       // 只有 =2 需要逐 op 序列（1.4M op 别白存）
         }
         pc+=hd.size;
     }
@@ -5757,14 +5891,16 @@ static void probe(int n,const uint64_t *handles){
     if(mode<0){const char *e=getenv("DM_FRAME_DIGEST");mode=e?atoi(e):0;}
     if(!mode)return;                                   // 默认关：零开销、行为零变化
     uint64_t h=1469598103934665603ull,bytes=0,ops=0,steps=0;
-    if(mode>=2)cur_ops.clear();
+    if(mode==2)cur_ops.clear();
+    if(mode>=3){cur_passes.clear();seg=pass_digest{0,0,0,0,0,0};}
     for(int i=0;i<n;i++)walk(reinterpret_cast<const uint8_t*>(handles[i]),0,h,bytes,ops,steps);
+    if(mode>=3)seg_close();
     uint64_t dp=wtrack::dirty_pages;
     uint64_t delta=dp>=prev_dirty?dp-prev_dirty:0;     // PERF 会周期性清零，负值按 0 处理并看 enabled
     int same=seq&&h==prev_hash;
     int dirty_clean=int(wtrack::enabled&&delta==0);
     long long diff=-1;uint32_t opa=0,opb=0;
-    if(seq&&mode>=2){
+    if(seq&&mode==2){
         size_t m=std::min(prev_ops.size(),cur_ops.size());
         for(size_t i=0;i<m;i++)if(prev_ops[i]!=cur_ops[i]){diff=(long long)i;opa=prev_ops[i];opb=cur_ops[i];break;}
         if(diff<0&&prev_ops.size()!=cur_ops.size()){
@@ -5776,7 +5912,8 @@ static void probe(int n,const uint64_t *handles){
         (unsigned long long)stats.presents.load(),(unsigned long long)stats.submissions.load(),n,
         (unsigned long long)ops,(unsigned long long)bytes,(unsigned long long)h,same,
         int(wtrack::enabled),dirty_clean,(unsigned long long)dp,(unsigned long long)delta,diff,opa,opb);
-    if(mode>=2)prev_ops.swap(cur_ops);
+    if(mode==2)prev_ops.swap(cur_ops);
+    if(mode>=3)pass_report(hud::frame.load(std::memory_order_relaxed));
     prev_hash=h;prev_dirty=dp;++seq;
 }
 }
