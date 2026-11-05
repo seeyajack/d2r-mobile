@@ -1490,7 +1490,7 @@ void submit_slots(bool wait){
             VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};after.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;after.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
             vkCmdPipelineBarrier(s.pro,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&after,0,nullptr,0,nullptr);
             VK(vkEndCommandBuffer(s.pro));cbs[0]=s.pro;cbs[1]=s.cmd;ncb=2;s.pro_ops.clear();}
-        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};si.commandBufferCount=ncb;si.pCommandBuffers=cbs;
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};si.commandBufferCount=ncb;si.pCommandBuffers=cbs;bool main_dropped=false;   // np726：主提交全败转丢帧重建时置位
         {CPU_SCOPE(Submit);
          // np611：**大提交的节奏**。要回答的是"那 44k draw 是一帧、还是加载期间攒下来的十几帧"：
          // 每次提交带上当时的 presents 计数 —— 两次大提交若 presents 相同，说明它们同属一帧（= 攒帧），
@@ -1566,8 +1566,35 @@ void submit_slots(bool wait){
             for(unsigned k=0;k<16;k++){const SubDigest &d=digest_ring[(digest_at+k)&15u];if(!d.serial)continue;
                 xbg_logf("  提交 serial=%llu passes=%u volPass=%u volAtt=%u draws=%u dispatch=%u",
                     (unsigned long long)d.serial,d.passes,d.volpasses,d.volatt,d.draws,d.dispatches);}
-            xbg_fatalf("vkQueueSubmit(cfg.queue,1,&si,s.fence) failed: %d",int(sr));}
-        }++submit_by[sync_site];poolreset::queue(s);
+            // np726：主路径丢帧重建（待办 18；np720a/np722a 两次 FATAL 的站点）。np703/705 只把丢段
+            //   重建接在切段路径，主路径（帧末收尾提交）重试全败仍直接 FATAL。语义与切段路径同款：
+            //   本帧收尾提交整体丢弃（画面缺最后一截），arm 冷却（np658：恢复窗口内不敲队列），帧继续——
+            //   ① fence 不 signal ⇒ retire_slot 的 np633 fence-skip（10s 超时→reset→当完成，且照常做
+            //     本槽全部清理：writeback/查询/arena/描述符）接住；
+            //   ② 本槽 cmd/pro 均未提交 ⇒ 池内无在飞命令 ⇒ **不排 poolreset**（排了 worker 会对同一
+            //     不亮的 fence 再等 10s 超时 → reset_result=VK_TIMEOUT → 下帧录制入口 FATAL"device is
+            //     hung"，FATAL 只是被挪一帧）；下帧 recording_slot 走内联 vkResetCommandPool；
+            //   ③ 连续丢段/丢帧与切段路径共用 split_drops（切段成功或主提交成功都清零），到
+            //     DM_SPLIT_DROP_LIMIT 上限 = 队列真死 ⇒ queue_dead 证据落盘再 FATAL（干净退出）。
+            // np726: main-path frame drop-and-continue (todo 18; the site that FATALed in np720a/np722a).
+            //   np703/705 wired drop-and-rebuild into the split path only; the end-of-frame submit still
+            //   went straight to FATAL after all retries. Same semantics as the split path: discard this
+            //   end-of-frame submission (the frame loses its tail), arm the cooldown, keep going --
+            //   (1) the unsignaled fence is caught by retire_slot's np633 fence-skip (timeout -> reset ->
+            //   treated as done, full slot cleanup still runs); (2) nothing from this slot's pool is in
+            //   flight (cmd/pro never submitted), so DON'T queue poolreset -- its worker would wait 10s on
+            //   the same dead fence, set reset_result=VK_TIMEOUT and only move the FATAL one frame later
+            //   (recording setup's "device is hung"); the next recording_slot resets the pool inline;
+            //   (3) consecutive drops share split_drops with the split path (any successful submit clears
+            //   it); past DM_SPLIT_DROP_LIMIT = queue truly dead: queue_dead evidence, then a clean FATAL.
+            lost_arm();
+            if(split_drop_limit() && ++split_drops>=split_drop_limit()){
+                deathguard::queue_dead(split_seg,sr);
+                xbg_fatalf("vkQueueSubmit(cfg.queue,1,&si,s.fence) failed: %d after %u consecutive drops (queue dead)",int(sr),unsigned(split_drops));}
+            main_dropped=true;
+            static int mn=0;if(mn++<6 || mn%20==0)xbg_logf("【宽限】主提交丢弃（np726 丢帧重建）：已连续丢 %u 次（上限 %u），帧继续",unsigned(split_drops),split_drop_limit());}
+         else split_drops=0;   // np726：主提交成功也清零连续丢段计数（与切段路径"任一段成功即清零"同款）
+        }++submit_by[sync_site];if(!main_dropped)poolreset::queue(s);
         s.recording=false;s.pending=true;s.covers=submitted;s.hud_frame=hud::frame.load(std::memory_order_relaxed);slot_index^=1;++perf.submits;snapshot_reset();++slot_serial;
         if(split_draws_env()>0){static int n;if(n++<8 && split_seg)xbg_logf("【二分】本帧共 %u 段",split_seg);split_seg=0;split_draw_count=0;}   // np629
         pending_events.insert(pending_events.end(),recording_events.begin(),recording_events.end());recording_events.clear();
@@ -6367,13 +6394,17 @@ static void report(uint64_t now,uint64_t present_begin){
     if(!enabled())return;
     static uint64_t last=0,last_submit=0,last_gpu=0;static uint64_t n=0;
     double interval=last?(double(now-last)/1e6):0.0;
-    double submit=double(perf.submit_cpu_ns-last_submit)/1e6;
+    // 铁律 37③：perf_* 在 PERF 窗尾被 perf=Perf{} 清零，跨重置做差会 uint64 包回绕
+    //   （np722 实测 submit_ms=1.8e13 / gpu_ms=9.2e12）⇒ 先在无符号域钳负再转 double。
+    uint64_t d_sub=perf.submit_cpu_ns>=last_submit?perf.submit_cpu_ns-last_submit:0;
+    double submit=double(d_sub)/1e6;
     double present=double(now-present_begin)/1e6;
-    double gpu=double(perf.gpu_ns-last_gpu)/1e6;
-    if(gpu<0)gpu=0;
+    uint64_t d_gpu=perf.gpu_ns>=last_gpu?perf.gpu_ns-last_gpu:0;
+    double gpu=double(d_gpu)/1e6;
     double rest=interval-submit-present;
     static uint64_t last_plan=0,last_cpu=0;
-    double plan=double(frameskip::plan_ns-last_plan)/1e6;
+    uint64_t d_plan=frameskip::plan_ns>=last_plan?frameskip::plan_ns-last_plan:0;
+    double plan=double(d_plan)/1e6;
     uint64_t cpu=0;double cpu_ms=0.0,cpu_pct=-1.0;
     if(proc_cpu_ms(cpu)){
         if(last_cpu&&interval>0.0){cpu_ms=double(cpu-last_cpu);cpu_pct=100.0*cpu_ms/interval;}
