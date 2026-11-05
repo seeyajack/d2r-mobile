@@ -5352,7 +5352,7 @@ namespace frameskip{
 static int mode=-1;
 static std::vector<uint64_t> keys,hashes;                  // 本提交：每个 pass 的身份键 / 结构摘要
 static std::vector<uint8_t> flags;                         // 1 = 本 pass 的 S 类 op 可跳
-static std::vector<uint64_t> prev_keys,prev_hashes;
+static std::vector<uint64_t> prev_keys,prev_hashes,prev_ubo0;
 static size_t idx=0;static bool armed=false;                // 执行期游标
 static uint64_t skipped_ops=0,skipped_passes=0,submits=0,desync=0,planned=0;
 static bool enabled(){if(mode<0){const char*e=getenv("DM_FRAME_SKIP");mode=e?atoi(e):0;if(mode)xbg_logf("【跳过】DM_FRAME_SKIP=%d 开启（阶段 2，跳过匹配 pass 的绘制类 op）",mode);}return mode>0;}
@@ -5381,7 +5381,7 @@ static uint64_t rt_key(const uint8_t *p,size_t n,uint64_t *first_serial=nullptr)
     }
     return h;
 }
-struct seg{uint64_t key,hash;uint64_t ser0;size_t ops;uint32_t draws;};
+struct seg{uint64_t key,hash;uint64_t ser0,ubo0;uint8_t ubo0_seen,uploads;size_t ops;uint32_t draws;};
 // 窗口贴图表：写窗口的那趟是**末尾合成**，跳过它就是"这一帧没上屏"（np716f 22 帧不一致里的黑帧正是这个）。
 // 照 Metal 世界冻结的做法（nvn_mtl.m:5382-5396）：「界面趟与末尾合成趟照画」，只跳世界段。
 static uint64_t win_ser[8];static int win_n=0;
@@ -5425,6 +5425,25 @@ static void plan_walk(const uint8_t *pc,unsigned depth,uint64_t &steps){
                 s.hash^=uint64_t(hd.op)^(uint64_t(hd.size)<<32);s.hash*=1099511628211ull;
                 ++s.draws;
             }
+            // 内容判据（照 Metal 的相机 UBO 检查，nvn_mtl.m:5527）：本 pass **第一个** BIND_UBO 的头部
+            // 256 B 做指纹。相机/视图矩阵就在这里，矩阵变了 = 画面会变 ⇒ 该 pass 不许跳。
+            // 只取第一个、只取 256 B：全量 UBO 内容里有时间/帧号一类无关值，会把判据做成"永远不匹配"（np715g 学费）。
+            // 资源上传（贴图/缓冲被改写）⇒ 这个 pass 的画面依赖新数据，**一律不跳**。
+            // np718a 学费：相机 UBO 没变、结构也没变，但画面对照帧给出 16c095d0（跳过帧停在旧的
+            // 83a6875a）⇒ 变化来自上传过的资源，不是矩阵。上传本身是 M 类、照常执行，所以必须显式挡住。
+            if(hd.op==OP_COPY_B2T||hd.op==OP_COPY_T2T||hd.op==OP_COPY_T2B||hd.op==OP_CLEAR_TEX
+               ||hd.op==OP_UPDATE_UB||hd.op==OP_COPY_B2B||hd.op==OP_COPY_STRIDE||hd.op==OP_COPY_IMAGE_STRIDE)s.uploads=1;
+            if(hd.op==OP_BIND_UBO && !s.ubo0_seen){
+                p_bind_buf b{};size_t cp=hd.size-8;if(cp>sizeof(b))cp=sizeof(b);
+                memcpy(&b,pc+8,cp);
+                if(b.addr>=4096&&b.size){
+                    size_t take=size_t(b.size>256?256:b.size);
+                    uint64_t hh=1469598103934665603ull;
+                    const uint8_t *q=reinterpret_cast<const uint8_t*>(uintptr_t(b.addr));
+                    for(size_t i=0;i<take;i++){hh^=q[i];hh*=1099511628211ull;}
+                    s.ubo0=hh;s.ubo0_seen=1;
+                }
+            }
             ++s.ops;
         }
         pc+=hd.size;
@@ -5440,9 +5459,11 @@ static void plan(int n,const uint64_t *handles){
         keys.push_back(segs[i].key);hashes.push_back(segs[i].hash);
         uint8_t skip=0;
         if(is_window_serial(segs[i].ser0)){flags.push_back(0);continue;}   // 末尾合成/窗口趟：永不跳
+        if(segs[i].uploads){flags.push_back(0);continue;}                   // 含资源上传的 pass：永不跳
         if(!prev_keys.empty()&&segs[i].draws){          // 没有绘制类 op 的 pass 跳不跳都一样，别计入
             for(size_t j=0;j<prev_keys.size();j++)
-                if(prev_keys[j]==segs[i].key&&prev_hashes[j]==segs[i].hash){skip=1;break;}
+                if(prev_keys[j]==segs[i].key&&prev_hashes[j]==segs[i].hash
+                   &&(j>=prev_ubo0.size()||prev_ubo0[j]==segs[i].ubo0)){skip=1;break;}
         }
         flags.push_back(skip);planned+=skip?1u:0u;
     }
@@ -5478,6 +5499,7 @@ static void exec_report(uint64_t frame){
             (unsigned long long)frame,(unsigned long long)stats.presents.load(),segs.size(),
             (unsigned long long)planned,(unsigned long long)skipped_ops,int(armed),(unsigned long long)desync,
             int(altlog&&planned==0),(unsigned long long)submits);
+    prev_ubo0.clear();for(size_t i=0;i<segs.size();i++)prev_ubo0.push_back(segs[i].ubo0);
     prev_keys.swap(keys);prev_hashes.swap(hashes);
 }
 }
