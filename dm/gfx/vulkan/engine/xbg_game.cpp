@@ -5719,9 +5719,70 @@ extern "C" void xbg_copy_commands(cmd_t *command,int count,const uint64_t *handl
     for(size_t offset=0;offset<bytes;){op_hdr h;memcpy(&h,snapshot.data()+offset,8);xbg_record_command(command,snapshot.data()+offset,h.size);offset+=h.size;}
 }
 extern "C" void xbg_invoke_command_callback(cmd_t *c,size_t n){uint64_t args[]={uint64_t(c),NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY,n,uint64_t(c->cb_data)};if(cfg.invoke_guest)cfg.invoke_guest(cfg.userdata,reinterpret_cast<void*>(c->cb),args,4);else c->cb(reinterpret_cast<NVNcommandBuffer*>(c),NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY,n,c->cb_data);}
+// 阶段 1：帧摘要只读探针（DM_FRAME_DIGEST=1 打摘要 / =2 加首个差异 op）。默认关、不进 envs。
+// 依据 30-设计/帧级重复判定-阶段0-摘要口径与零变化清单-2026-11-05.md 第 3/4 节：
+// 只做 FNV-1a 增量 hash + op 序列对照，**不跳过任何 op**、不改 state、不物化整帧命令流。
+// ⚠ op 流不含资源数据（xbg_command_clone.c:4-6）⇒ 同时输出 wtrack 脏页；
+// wtrack 未启用（marker gfx-wtrack 未设 1）时 dirty_clean 恒 0，「脏位为空」判据不成立。
+namespace framedigest{
+static int mode=-1;
+static uint64_t seq=0,prev_hash=0,prev_dirty=0;
+static std::vector<uint32_t> prev_ops,cur_ops;
+static uint64_t mix(uint64_t h,const uint8_t *p,size_t n){
+    for(size_t i=0;i<n;i++){h^=p[i];h*=1099511628211ull;}
+    return h;
+}
+static void walk(const uint8_t *pc,unsigned depth,uint64_t &h,uint64_t &bytes,uint64_t &ops,uint64_t &steps){
+    if(depth>64)return;
+    for(;;){
+        if(++steps>10000000ull)return;                 // 坏 op 流的死循环防护
+        size_t available=command_available(pc);
+        if(available<sizeof(op_hdr))return;
+        op_hdr hd;memcpy(&hd,pc,sizeof(hd));
+        if(hd.size<8||(hd.size&7)||hd.size>available)return;
+        if(hd.op==OP_END)return;
+        if(hd.op==OP_CALL||hd.op==OP_JUMP){
+            if(hd.size<16)return;
+            uint64_t next;memcpy(&next,pc+8,8);
+            if(hd.op==OP_JUMP){pc=reinterpret_cast<const uint8_t*>(next);continue;}
+            walk(reinterpret_cast<const uint8_t*>(next),depth+1,h,bytes,ops,steps);
+        }else if(hd.op!=OP_BEGIN){
+            h=mix(h,pc,hd.size);bytes+=hd.size;++ops;
+            if(mode>=2)cur_ops.push_back(hd.op);
+        }
+        pc+=hd.size;
+    }
+}
+static void probe(int n,const uint64_t *handles){
+    if(mode<0){const char *e=getenv("DM_FRAME_DIGEST");mode=e?atoi(e):0;}
+    if(!mode)return;                                   // 默认关：零开销、行为零变化
+    uint64_t h=1469598103934665603ull,bytes=0,ops=0,steps=0;
+    if(mode>=2)cur_ops.clear();
+    for(int i=0;i<n;i++)walk(reinterpret_cast<const uint8_t*>(handles[i]),0,h,bytes,ops,steps);
+    uint64_t dp=wtrack::dirty_pages;
+    uint64_t delta=dp>=prev_dirty?dp-prev_dirty:0;     // PERF 会周期性清零，负值按 0 处理并看 enabled
+    int same=seq&&h==prev_hash;
+    int dirty_clean=int(wtrack::enabled&&delta==0);
+    long long diff=-1;uint32_t opa=0,opb=0;
+    if(seq&&mode>=2){
+        size_t m=std::min(prev_ops.size(),cur_ops.size());
+        for(size_t i=0;i<m;i++)if(prev_ops[i]!=cur_ops[i]){diff=(long long)i;opa=prev_ops[i];opb=cur_ops[i];break;}
+        if(diff<0&&prev_ops.size()!=cur_ops.size()){
+            diff=(long long)m;opa=m<prev_ops.size()?prev_ops[m]:0xffffffffu;opb=m<cur_ops.size()?cur_ops[m]:0xffffffffu;
+        }
+    }
+    xbg_logf("FRAMEDIGEST seq=%llu frame=%llu presents=%llu subs=%llu n=%d ops=%llu bytes=%llu hash=%016llx same=%d wtrack=%d dirty_clean=%d dirty_total=%llu dirty_delta=%llu diff=%lld op_prev=%u op_cur=%u",
+        (unsigned long long)seq,(unsigned long long)hud::frame.load(std::memory_order_relaxed),
+        (unsigned long long)stats.presents.load(),(unsigned long long)stats.submissions.load(),n,
+        (unsigned long long)ops,(unsigned long long)bytes,(unsigned long long)h,same,
+        int(wtrack::enabled),dirty_clean,(unsigned long long)dp,(unsigned long long)delta,diff,opa,opb);
+    if(mode>=2)prev_ops.swap(cur_ops);
+    prev_hash=h;prev_dirty=dp;++seq;
+}
+}
 static void xbg_submit_now(int n,const uint64_t *handles){std::lock_guard<std::recursive_mutex> lock(mutex);
     if(deferred_live_profile && !timing.top){uint64_t current=stats.presents.load();timing=XbgCpuTiming(timing_clock);timing_first=current+2;timing_last=timing_first+deferred_live_profile-1;deferred_live_profile=0;}
-   TimingRoot timing_root;CPU_SCOPE(Other);need(initialized && !failed,"Game Vulkan backend not initialized/healthy");uint64_t begin=timing_clock();snapshot_reset();uint64_t budget=0;for(int i=0;i<n;i++)execute(reinterpret_cast<const uint8_t*>(handles[i]),0,budget);++stats.submissions;++submitted;if(sync_mode)complete_all();perf.submit_cpu_ns+=timing_clock()-begin;}
+   TimingRoot timing_root;CPU_SCOPE(Other);need(initialized && !failed,"Game Vulkan backend not initialized/healthy");uint64_t begin=timing_clock();snapshot_reset();framedigest::probe(n,handles);uint64_t budget=0;for(int i=0;i<n;i++)execute(reinterpret_cast<const uint8_t*>(handles[i]),0,budget);++stats.submissions;++submitted;if(sync_mode)complete_all();perf.submit_cpu_ns+=timing_clock()-begin;}
 extern "C" uint64_t xbg_legacy_last_fence(){return gfx_async?gfx_enqueued.load():[]{std::lock_guard<std::recursive_mutex> lock(mutex);return submitted;}();}
 extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
     // 不取锁的提前返回只用于新写法；旧写法（非鸿蒙缺省）先判 failed，与原来逐条相同
