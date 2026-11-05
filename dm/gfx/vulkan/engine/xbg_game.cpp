@@ -6046,12 +6046,12 @@ static void winpass_probe_check(){
         (unsigned long long)nz,(unsigned long long)npx,100.0*double(nz)/double(npx),int(im.layout));
 }
 static bool g_winpass_hook_armed=(g_winpass_hook=&winpass_probe_check,true);
-static bool present_probe_due(){    static int every=-2;if(every==-2){const char *e=getenv("DM_PRESENT_PROBE_EVERY_MS");every=e?atoi(e):0;if(every>0)xbg_logf("上屏自检 每 %d ms 采样一次（最多 8 次）",every);}
+static bool present_probe_due(){    static int every=-2;if(every==-2){const char *e=getenv("DM_PRESENT_PROBE_EVERY_MS");every=e?atoi(e):0;if(every>0)xbg_logf("上屏自检 每 %d ms 采样一次（最多 16 次）",every);}
     if(every<=0)return false;
     static uint64_t t0=0,next=0;static int shots=0;
     uint64_t now=timing_clock()/1000000ull;
     if(!t0){t0=now;next=now+uint64_t(every);}
-    if(shots>=8||now<next)return false;
+    if(shots>=16||now<next)return false;   // np715：8→16，为了在同一相位内拿到足够多的像素 hash 样本
     next=now+uint64_t(every);++shots;return true;
 }
 static void present_probe_report(const Buffer &buf,uint32_t w,uint32_t h,uint32_t bpp){
@@ -6063,11 +6063,17 @@ static void present_probe_report(const Buffer &buf,uint32_t w,uint32_t h,uint32_
     uint64_t sum_a=0,na=0;
     for(uint64_t i=0;i<n;i++){const uint8_t *q=p+i*bpp;for(int k=0;k<3;k++){unsigned v=q[k];sum[k]+=v;if(v<lo[k])lo[k]=v;if(v>hi[k])hi[k]=v;}if(q[0]|q[1]|q[2])++nz;
         if(bpp>=4){unsigned a=q[3];sum_a+=a;if(a)++na;}}
-    xbg_logf("[上屏] 源图 %ux%u bpp=%u 均值 %.1f/%.1f/%.1f 非黑像素 %llu/%llu = %.1f%% 范围 R%u-%u G%u-%u B%u-%u 均值A=%.1f A非0=%llu(%.1f%%)",
+    // np715：**像素 hash**。判「画面静止还是在动」不能靠截图（含宿主 UI 与 JPEG 压缩噪声），
+    //   也不能只看均值/非黑占比（不同图可能同均值）⇒ 对整张读回做 FNV-1a，日志里逐次可比。
+    //   与下面的 ASCII 缩略同源同一次读回：hash 相同即逐字节相同。
+    uint64_t ph=1469598103934665603ull;
+    {size_t nb=size_t(n)*bpp;for(size_t i=0;i<nb;i++){ph^=p[i];ph*=1099511628211ull;}}
+    xbg_logf("[上屏] 源图 %ux%u bpp=%u 均值 %.1f/%.1f/%.1f 非黑像素 %llu/%llu = %.1f%% 范围 R%u-%u G%u-%u B%u-%u 均值A=%.1f A非0=%llu(%.1f%%) hash=%016llx",
         w,h,bpp,double(sum[0])/double(n),double(sum[1])/double(n),double(sum[2])/double(n),
         (unsigned long long)nz,(unsigned long long)n,100.0*double(nz)/double(n),
         lo[0],hi[0],lo[1],hi[1],lo[2],hi[2],
-        bpp>=4?double(sum_a)/double(n):-1.0,(unsigned long long)na,bpp>=4?100.0*double(na)/double(n):-1.0);
+        bpp>=4?double(sum_a)/double(n):-1.0,(unsigned long long)na,bpp>=4?100.0*double(na)/double(n):-1.0,
+        (unsigned long long)ph);
     static const char ramp[]=" .:-=+*#%@";const int cols=32,rows=18;
     for(int ry=0;ry<rows;ry++){char line[cols+1];
         for(int rx=0;rx<cols;rx++){
