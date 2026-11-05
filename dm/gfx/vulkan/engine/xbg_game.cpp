@@ -1527,12 +1527,26 @@ void submit_slots(bool wait){
          if(unsigned cd=lost_cooldown_ms()){usleep(cd*1000u);}
          // np701：守卫只包住单次 vkQueueSubmit（重试之间的睡眠不算站龄）。
          // np701: the guard wraps ONE vkQueueSubmit (sleeps between retries are not site age).
-         VkResult sr;{deathguard::VkSite site(deathguard::SUBMIT);sr=vkQueueSubmit(cfg.queue,1,&si,s.fence);}
+         // np726：主路径自检钩子（确定性验证，不等随机风暴——np702/np705 同款思路）。
+         //   DM_SPLIT_DROP_TEST=3：主提交**模拟**失败一次后解除（不碰队列）⇒ 验证主路径丢帧重建：
+         //   丢帧日志 + np633 fence-skip 接住 + 下帧内联池重置 + 帧继续。测试轮禁用重试（模拟失败
+         //   不该被 56 次重试拖住），与切段路径 mode 1/2 同款语义。默认关。
+         // np726: main-path self-test hook (deterministic verification, same idea as np702/np705).
+         //   DM_SPLIT_DROP_TEST=3: simulate ONE main-submit failure then disarm (queue untouched) to
+         //   verify the main-path drop-and-continue: drop log + np633 fence-skip + inline pool reset
+         //   next frame + the loop keeps going. Retries disabled in test mode (a simulated failure must
+         //   not be dragged through 56 retries), same semantics as split modes 1/2. Off by default.
+         bool main_simulate=false;
+         {static bool main_test_hit=false;
+          if(split_drop_test()==3 && !main_test_hit){main_test_hit=true;main_simulate=true;
+             xbg_logf("【自检】DM_SPLIT_DROP_TEST=3：主提交模拟失败一次——验证主路径丢帧重建（np633 应接住 fence，帧继续）");}}
+         VkResult sr;{deathguard::VkSite site(deathguard::SUBMIT);
+            sr=main_simulate?VK_ERROR_DEVICE_LOST:vkQueueSubmit(cfg.queue,1,&si,s.fence);}
          // np631：**冷路径首提交重试**。vkQueueSubmit -4 时等 3ms 重试一次（默认开，DM_RETRY_SUBMIT=0 关）。
          // 依据：① 驱动自带恢复（系统日志 "Gpu is reset when queue submit. Recover queue error now."）；
          //       ② np630run3 的模式：挂点总在"新类型工作第一次提交"处 ⇒ 冷路径首次分配失败最像，
          //          恢复后重试即过。判据：重试成功且游戏推进越过原挂点 = 证实；重试也失败 = 原路 FATAL。
-         if(sr!=VK_SUCCESS && retry_submit_enabled()){
+         if(sr!=VK_SUCCESS && retry_submit_enabled() && split_drop_test()!=3){   // np726：测试轮禁用重试（模拟失败直达丢帧重建）
             // np631b：指数退避多次重试（3→10→30→100ms，最多 6 次）。首跑读数：3ms 一次能过一次
             // （serial=14968）但第二次不够（serial=14974）——驱动恢复时间不固定，退避到 100ms 兜住。
             static int rn=0;if(rn++<6)xbg_logf("【重试】vkQueueSubmit %d，开始指数退避（serial=%llu）",int(sr),(unsigned long long)slot_serial);
