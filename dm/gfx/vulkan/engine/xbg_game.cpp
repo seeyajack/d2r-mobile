@@ -481,14 +481,54 @@ static unsigned lost_cooldown_ms_env(){
     return cached;
 }
 static void lost_arm(){std::lock_guard<std::mutex> l(g_lost_mu);g_lost_ns=timing_clock();}
-static unsigned lost_cooldown_ms(){
-    std::lock_guard<std::mutex> l(g_lost_mu);
-    if(!g_lost_ns)return 0;
-    uint64_t elapsed=(timing_clock()-g_lost_ns)/1000000u;
-    unsigned cd=lost_cooldown_ms_env();
-    return elapsed>=cd?0u:cd-(unsigned)elapsed;
+// np727：自适应冷却（DM_LOST_COOLDOWN_PROBE=1 只记探测日志 / 2 记日志+生效）。
+// 依据（np726a/b §1t③）：巨帧 ≈ 盲等 8 s 冷却 + 恢复 ~1 s（对照 +31 s reset 的巨帧 8.86 s ≈ 8+0.9；
+// 相位内巨帧合计 63–72 s，是墙钟 fps 的主导项）。若能用**非提交**探测（vkGetFenceStatus 停止返回
+// DEVICE_LOST）发现驱动已回来，就把盲等换成实际恢复时长 ⇒ 预期墙钟 fps ~1.8×。
+// 探测不是 submit，不会产生 render_service 记账的 "Submit commandlist fail(13)"，
+// np658/659 连坐杀保护语义不变；arm 后 2.5 s 内不表态（np657：失败集中在 arm 后 0.9–1.7 s）；
+// 探测 fence = 最近一次 -4 的槽 fence（被 reset 摧毁的那笔工作的 fence，驱动对它有真实状态）；
+// 探不出信号（一直 NOT_READY）⇒ 退回盲等 8 s，与现状完全一致。默认关。
+// np727: adaptive cooldown (DM_LOST_COOLDOWN_PROBE=1 log-only / 2 log+act). Evidence (np726a/b):
+// giant frames = the blind 8s cooldown sleep + ~1s recovery, and they own 60-70% of phase wall time.
+// A NON-SUBMIT probe (vkGetFenceStatus stops returning DEVICE_LOST) tells us the driver is back, so the
+// blind wait becomes the actual recovery time. Probing is not a submit and cannot produce the
+// render_service "Submit commandlist fail(13)" accounting, so np658/659 semantics hold; the probe stays
+// silent for the first 2.5s after arm (np657: failures land 0.9-1.7s after); the probe fence is the most
+// recent -4's slot fence (the reset destroyed that work, so the driver holds real state for it); a
+// useless signal (always NOT_READY) falls back to the blind 8s, identical to status quo. Off by default.
+static VkFence g_probe_fence=VK_NULL_HANDLE;   // 最近一次 -4 的槽 fence（np727 恢复探测用；对象由 slot 长期持有）
+static int lost_probe_mode(){
+    static int v=0;static bool read=false;
+    if(!read){read=true;const char *e=getenv("DM_LOST_COOLDOWN_PROBE");v=e?atoi(e):0;
+        if(v)xbg_logf("【冷却】DM_LOST_COOLDOWN_PROBE=%d（1=只记探测日志，2=探测到恢复即提前放行）",v);}
+    return v;
 }
-bool lost_not_fatal(VkResult r,const char *what){
+static unsigned lost_cooldown_ms(){
+    uint64_t armed;{std::lock_guard<std::mutex> l(g_lost_mu);if(!g_lost_ns)return 0;armed=g_lost_ns;}
+    uint64_t elapsed=(timing_clock()-armed)/1000000u;
+    unsigned cd=lost_cooldown_ms_env();
+    if(elapsed>=cd)return 0;
+    int mode=lost_probe_mode();
+    VkFence pf=g_probe_fence;
+    if(!mode || !pf)return cd-(unsigned)elapsed;
+    unsigned floor_ms=2500;static int pn=0;
+    for(;;){
+        elapsed=(timing_clock()-armed)/1000000u;
+        if(elapsed>=cd)return 0;
+        if(elapsed>=floor_ms){
+            VkResult pr=vkGetFenceStatus(cfg.device,pf);
+            bool lost=(pr==VK_ERROR_DEVICE_LOST);
+            if(pn++<48)xbg_logf("【冷却】探测 t=+%u.%us GetFenceStatus=%s",elapsed/1000u,(elapsed%1000u)/100u,
+                pr==VK_ERROR_DEVICE_LOST?"DEV_LOST":pr==VK_NOT_READY?"NOT_READY":pr==VK_SUCCESS?"SUCCESS":"其他");
+            if(!lost && mode==2){std::lock_guard<std::mutex> l(g_lost_mu);g_lost_ns=0;return 0;}   // 恢复结束 ⇒ 提前放行
+            if(!lost)floor_ms=cd;   // mode 1：信号已出现但只记日志，继续盲等
+        }
+        unsigned left=cd-(unsigned)elapsed;
+        usleep((left>100u?100u:left)*1000u);
+    }
+}
+bool lost_not_fatal(VkResult r,const char *what,VkFence probe){
     if(r!=VK_ERROR_DEVICE_LOST)return false;
     static int n=0;if(n++<8)xbg_logf("【红】%s 返回 device lost(-4) —— 不再 FATAL（第 %d 次）",what,n);
     // np658：**冷却退避**。np657 复盘：render_service 按"5 分钟窗口内 Submit commandlist fail(13)
@@ -499,6 +539,7 @@ bool lost_not_fatal(VkResult r,const char *what){
     //   i.e. our submits slamming into the driver's recovery window). lost_not_fatal arms it; submitters
     //   sleep through the remaining window via lost_cooldown_ms() before submitting.
     lost_arm();
+    g_probe_fence=probe;   // np727：留作恢复探测（失败即可再探测；为 0 则退回盲等）
     return true;
 }
 
@@ -6199,7 +6240,7 @@ extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
                 if(r==VK_TIMEOUT)return 0;
                 // 设备错误不能被 completed 快路吞掉；原 fatal 状态仍在 engine 下处理。
                 // Completion must not hide device errors; handle the original fatal state while holding engine.
-                if(r!=VK_SUCCESS){if(lost_not_fatal(r,"guest fence wait"))return 0;lock.lock();fold_completion_wait_stats();VK(r);}
+                if(r!=VK_SUCCESS){if(lost_not_fatal(r,"guest fence wait",f))return 0;lock.lock();fold_completion_wait_stats();VK(r);}
                 XTRACE_BEGIN("dm-legacy-relock");const auto acquired=completion_wait.acquire(lock,fence,deadline);XTRACE_END();
                 XTRACE_COUNT("dm-legacy-relock-result", int(acquired));XTRACE_COUNT("dm-legacy-completed", completed.load());
                 if(acquired==xbg_completion::Acquire::Completed)return 1;
@@ -6209,7 +6250,7 @@ extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
                 XTRACE_BEGIN("dm-legacy-relock");lock.lock();XTRACE_END();XTRACE_COUNT("dm-legacy-relock-result", 0);
                 XTRACE_COUNT("dm-legacy-completed", completed.load());
                 block_ns[SITE_LEGACY_WAIT]+=b1-b0;++block_calls[SITE_LEGACY_WAIT];legacy_wait_ns+=b1-b0;
-                if(r==VK_TIMEOUT)return 0;if(lost_not_fatal(r,"guest fence wait"))return 0;VK(r);
+                if(r==VK_TIMEOUT)return 0;if(lost_not_fatal(r,"guest fence wait",f))return 0;VK(r);
             }}
         retire_done();if(fence<=completed)return 1;}
     if(completion_path && deadline.expired())return fence<=completed;
@@ -6220,7 +6261,7 @@ extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
         if(!completion_path && timeout!=UINT64_MAX){auto elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count();remaining=uint64_t(elapsed)>=timeout?0:timeout-uint64_t(elapsed);}
         bool busy=vkGetFenceStatus(cfg.device,slot.fence)==VK_NOT_READY;uint64_t b0=busy?timing_clock():0;
         VkResult r=vkWaitForFences(cfg.device,1,&slot.fence,VK_TRUE,remaining);if(busy){block_ns[SITE_LEGACY_WAIT]+=timing_clock()-b0;++block_calls[SITE_LEGACY_WAIT];}
-        if(r==VK_TIMEOUT)return 0;if(lost_not_fatal(r,"slot fence wait"))return 0;VK(r);retire_slot(slot);
+        if(r==VK_TIMEOUT)return 0;if(lost_not_fatal(r,"slot fence wait",slot.fence))return 0;VK(r);retire_slot(slot);
     }
     resolve_known_reports();if(pending_writebacks.empty()&&pending_reports.empty()){publish_completed(submitted);}
     return fence<=completed;
