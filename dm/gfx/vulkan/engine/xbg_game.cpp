@@ -5341,6 +5341,134 @@ void execute_indirect(const xbg_indirect &p,bool single){g_gpu_wrote=true;prefli
 }
 template<class T>T payload(const uint8_t *p,size_t n){need(n>=sizeof(T),"Truncated NVN command payload");T out;memcpy(&out,p,sizeof(out));return out;}
 template<class T>T variable_payload(const uint8_t *p,size_t n){T out{};memcpy(&out,p,std::min(n,sizeof(T)));return out;}
+// ══ np715 阶段 2：帧间复用（跳过「与上一提交结构相同」的 pass 的绘制类 op）。默认关。 ══
+// 判据来源（今日 §1j/§1k 实测）：整帧/逐字节摘要不可用（2–4 帧缓冲地址轮换、UBO 有无关变化），
+//   但**结构**（op 类型+长度序列）+ 渲染目标身份在相邻帧是稳定的；上屏像素 71.8% 的帧逐字节相同。
+// 所以判据 = 「RT 身份键 + 结构摘要（只 hash op/size 8 字节头）」都相同 ⇒ 该 pass 的 S 类 op 全跳。
+// 安全设计：① 只按**整 pass** 决定（跳就跳全，绝不半跳）；② 执行期逐 pass 复核身份键，
+//   对不上立刻停跳本提交（防止 walk 与 execute 的遍历顺序分叉导致跳错 pass）；
+//   ③ 默认关；④ 结果侧用 `[上屏] 源图 hash` 验收（跳过轮必须仍是同一 hash）。
+namespace frameskip{
+static int mode=-1;
+static std::vector<uint64_t> keys,hashes;                  // 本提交：每个 pass 的身份键 / 结构摘要
+static std::vector<uint8_t> flags;                         // 1 = 本 pass 的 S 类 op 可跳
+static std::vector<uint64_t> prev_keys,prev_hashes;
+static size_t idx=0;static bool armed=false;                // 执行期游标
+static uint64_t skipped_ops=0,skipped_passes=0,submits=0,desync=0,planned=0;
+static bool enabled(){if(mode<0){const char*e=getenv("DM_FRAME_SKIP");mode=e?atoi(e):0;if(mode)xbg_logf("【跳过】DM_FRAME_SKIP=%d 开启（阶段 2，跳过匹配 pass 的绘制类 op）",mode);}return mode>0;}
+static bool s_op(uint32_t op){
+    return op==OP_DRAW||op==OP_DRAW_IDX||op==OP_DISPATCH||op==OP_CLEAR_COLOR||op==OP_CLEAR_DS
+        ||op==(OP_COUNT_+2)||op==(OP_COUNT_+3)||op==(OP_COUNT_+7)||op==(OP_COUNT_+8)||op==(OP_COUNT_+9);
+}
+// 身份键 = OP_SET_RT 载荷里各渲染目标的 tex_t.serial（指针会随录制副本变，不能用）
+static uint64_t rt_key(const uint8_t *p,size_t n){
+    uint64_t h=1469598103934665603ull;int32_t cnt=0;
+    if(n<4)return h;
+    memcpy(&cnt,p,4);
+    if(cnt<0)cnt=0;if(cnt>8)cnt=8;
+    auto mixv=[](uint64_t hh,const void *q,size_t nb){const uint8_t*b=(const uint8_t*)q;for(size_t i=0;i<nb;i++){hh^=b[i];hh*=1099511628211ull;}return hh;};
+    h=mixv(h,&cnt,4);
+    for(int i=0;i<cnt;i++){
+        size_t off=offsetof(p_set_rt,color)+size_t(i)*sizeof(const tex_t*);
+        if(off+sizeof(const tex_t*)>n)break;
+        const tex_t *t=nullptr;memcpy(&t,p+off,sizeof(const tex_t*));
+        uint64_t s=t?t->serial:0;h=mixv(h,&s,8);
+    }
+    if(offsetof(p_set_rt,depth)+sizeof(const tex_t*)<=n){
+        const tex_t *d=nullptr;memcpy(&d,p+offsetof(p_set_rt,depth),sizeof(const tex_t*));
+        uint64_t s=d?d->serial:0;h=mixv(h,&s,8);
+    }
+    return h;
+}
+struct seg{uint64_t key,hash;size_t ops;uint32_t draws;};
+static std::vector<seg> segs;
+static void seg_open(uint64_t key){seg s{};s.key=key;s.hash=1469598103934665603ull;segs.push_back(s);}
+static void seg_close(){
+    if(segs.empty())return;
+    seg &s=segs.back();if(!s.ops)segs.pop_back();      // 空段（只有 SET_RT）不参与判定
+}
+// 结构摘要：只吃 (op,size) 8 字节头，丢掉全部操作数（地址轮换/时间值都不影响）
+static void plan_walk(const uint8_t *pc,unsigned depth,uint64_t &steps){
+    if(depth>64)return;
+    for(;;){
+        if(++steps>10000000ull)return;
+        size_t available=command_available(pc);
+        if(available<sizeof(op_hdr))return;
+        op_hdr hd;memcpy(&hd,pc,sizeof(hd));
+        if(hd.size<8||(hd.size&7)||hd.size>available)return;
+        if(hd.op==OP_END)return;
+        if(hd.op==OP_CALL||hd.op==OP_JUMP){
+            if(hd.size<16)return;
+            uint64_t next;memcpy(&next,pc+8,8);
+            if(hd.op==OP_JUMP){pc=reinterpret_cast<const uint8_t*>(next);continue;}
+            plan_walk(reinterpret_cast<const uint8_t*>(next),depth+1,steps);
+        }else if(hd.op==OP_SET_RT){
+            seg_close();seg_open(rt_key(pc+8,hd.size-8));
+        }else if(hd.op!=OP_BEGIN){
+            // ⚠ 首个 OP_SET_RT 之前的 op（内置 clear / 状态设置）**不建段**：
+            //   execute() 是按 OP_SET_RT 数 pass 序号的，这里多开一段就会整体错位一位
+            //   ⇒ 执行期第一帧就「身份对不上」（np716a 学费：planned 有值、skipped_ops 恒 0）。
+            if(segs.empty()){pc+=hd.size;continue;}
+            seg &s=segs.back();
+            // ⚠ 只对 **S 类（绘制/清除/派发）** 建摘要：M' 状态 op 是游戏"状态变了才发"的，
+            //   同一画面在两帧里的状态 op 序列可以不同（缓存命中就不发）⇒ 把它们算进摘要，
+            //   大 pass 永远对不上（np716b 实测：planned 只有 85/149，大 pass 一次没跳）。
+            //   这里刻意放宽到"绘制类 op 的类型+长度序列"：它由遮挡剔除结果与合批决定，
+            //   与画面同源；内容层面的风险由 `[上屏] 源图 hash` 验收兜住。
+            if(s_op(hd.op)){
+                s.hash^=uint64_t(hd.op)^(uint64_t(hd.size)<<32);s.hash*=1099511628211ull;
+                ++s.draws;
+            }
+            ++s.ops;
+        }
+        pc+=hd.size;
+    }
+}
+static void plan(int n,const uint64_t *handles){
+    keys.clear();hashes.clear();flags.clear();segs.clear();
+    uint64_t steps=0;
+    for(int i=0;i<n;i++)plan_walk(reinterpret_cast<const uint8_t*>(handles[i]),0,steps);
+    seg_close();
+    planned=0;
+    for(size_t i=0;i<segs.size();i++){
+        keys.push_back(segs[i].key);hashes.push_back(segs[i].hash);
+        uint8_t skip=0;
+        if(!prev_keys.empty()&&segs[i].draws){          // 没有绘制类 op 的 pass 跳不跳都一样，别计入
+            for(size_t j=0;j<prev_keys.size();j++)
+                if(prev_keys[j]==segs[i].key&&prev_hashes[j]==segs[i].hash){skip=1;break;}
+        }
+        flags.push_back(skip);planned+=skip?1u:0u;
+    }
+    // 同轮 A/B：DM_FRAME_SKIP_ALT=1 时偶数提交不跳、奇数提交照跳（画面静止时两者像素必须相同）。
+    static int alt=-2;
+    if(alt==-2){const char*e=getenv("DM_FRAME_SKIP_ALT");alt=(e&&*e=='1')?1:0;if(alt)xbg_logf("【跳过】ALT 交替模式：偶数提交不跳作为对照");}
+    if(alt&&(submits%2)==0){for(size_t i=0;i<flags.size();i++)flags[i]=0;planned=0;}
+}
+static void exec_begin(){idx=(size_t)-1;armed=!flags.empty()&&planned>0;skipped_ops=0;skipped_passes=0;}
+static void exec_pass(const uint8_t *p,size_t n){
+    if(!armed)return;
+    ++idx;
+    if(idx>=keys.size()||rt_key(p,n)!=keys[idx]){
+        armed=false;++desync;
+        xbg_logf("【跳过】pass 身份对不上 ⇒ 本提交放弃跳过（idx=%zu planned=%llu key_plan=%016llx key_exec=%016llx）",
+            idx,(unsigned long long)planned,(unsigned long long)(idx<keys.size()?keys[idx]:0ull),(unsigned long long)rt_key(p,n));
+    }
+}
+static bool exec_skip(){return armed&&idx<flags.size()&&flags[idx];}
+static void count_skip(){++skipped_ops;}
+static void exec_report(uint64_t frame){
+    if(!enabled())return;
+    ++submits;
+    static int altlog=-2;
+    if(altlog==-2){const char*e=getenv("DM_FRAME_SKIP_ALT");altlog=(e&&*e=='1')?1:0;}
+    if(skipped_ops||planned||altlog)   // ALT 模式下对照帧（planned=0）也必须记，否则无法配对
+        xbg_logf("FRAMESKIP frame=%llu presents=%llu passes=%zu planned=%llu skipped_ops=%llu armed=%d desync=%llu ctrl=%d 累计=%llu",
+            (unsigned long long)frame,(unsigned long long)stats.presents.load(),segs.size(),
+            (unsigned long long)planned,(unsigned long long)skipped_ops,int(armed),(unsigned long long)desync,
+            int(altlog&&planned==0),(unsigned long long)submits);
+    prev_keys.swap(keys);prev_hashes.swap(hashes);
+}
+}
 // Graphics thread: retire submitted slots whose fence already signalled (non-blocking) so a game
 // thread blocked on an older fence is released while the next frame is still being translated.
 void poll_retire(){
@@ -5358,6 +5486,11 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
         size_t available=command_available(pc);need(available>=8,"Truncated command header");op_hdr h;memcpy(&h,pc,8);need(h.size>=8 && !(h.size&7) && h.size<=available,"NVN command size outside pool");const uint8_t *p=pc+8;size_t n=h.size-8;cur_op=h.op;
         dispatch_set_last((unsigned)h.op,(unsigned)h.size);
         dispatch_op_trace((unsigned)h.op,(unsigned)h.size,depth);
+        // np715 阶段 2：匹配 pass 的绘制类 op 直接跳过（默认关）。只跳 S 类，M/M' 照常。
+        if(frameskip::enabled()){
+            if(h.op==OP_SET_RT)frameskip::exec_pass(p,n);
+            else if(frameskip::s_op(h.op)&&frameskip::exec_skip()){frameskip::count_skip();pc+=h.size;continue;}
+        }
         switch(h.op){
         case OP_END:return;
         case OP_BEGIN:break;
@@ -5919,7 +6052,7 @@ static void probe(int n,const uint64_t *handles){
 }
 static void xbg_submit_now(int n,const uint64_t *handles){std::lock_guard<std::recursive_mutex> lock(mutex);
     if(deferred_live_profile && !timing.top){uint64_t current=stats.presents.load();timing=XbgCpuTiming(timing_clock);timing_first=current+2;timing_last=timing_first+deferred_live_profile-1;deferred_live_profile=0;}
-   TimingRoot timing_root;CPU_SCOPE(Other);need(initialized && !failed,"Game Vulkan backend not initialized/healthy");uint64_t begin=timing_clock();snapshot_reset();framedigest::probe(n,handles);uint64_t budget=0;for(int i=0;i<n;i++)execute(reinterpret_cast<const uint8_t*>(handles[i]),0,budget);++stats.submissions;++submitted;if(sync_mode)complete_all();perf.submit_cpu_ns+=timing_clock()-begin;}
+   TimingRoot timing_root;CPU_SCOPE(Other);need(initialized && !failed,"Game Vulkan backend not initialized/healthy");uint64_t begin=timing_clock();snapshot_reset();framedigest::probe(n,handles);if(frameskip::enabled())frameskip::plan(n,handles);frameskip::exec_begin();uint64_t budget=0;for(int i=0;i<n;i++)execute(reinterpret_cast<const uint8_t*>(handles[i]),0,budget);frameskip::exec_report(hud::frame.load(std::memory_order_relaxed));++stats.submissions;++submitted;if(sync_mode)complete_all();perf.submit_cpu_ns+=timing_clock()-begin;}
 extern "C" uint64_t xbg_legacy_last_fence(){return gfx_async?gfx_enqueued.load():[]{std::lock_guard<std::recursive_mutex> lock(mutex);return submitted;}();}
 extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
     // 不取锁的提前返回只用于新写法；旧写法（非鸿蒙缺省）先判 failed，与原来逐条相同
@@ -6124,7 +6257,8 @@ static void present_probe_other_serials(){
 //   = 阶段 2 可跳帧的**上限**。读回带一次 GPU 同步 ⇒ 这一轮只判画面、不看 fps（会明显更慢）。
 //   预算控制：`DM_PRESENT_HASH_FROM`（从第几个 present 开始）+ `DM_PRESENT_HASH_FRAMES`（共多少帧），
 //   默认 0 = 关；每帧一行、不打 ASCII 缩略（那是 present_probe_report 的活）。
-static int present_hash_frames(){static int v=-2;if(v==-2){const char*e=getenv("DM_PRESENT_HASH_FRAMES");v=e?atoi(e):0;if(v>0)xbg_logf("[上屏] 逐帧像素 hash 开启：前 %d 个重场景帧（含读回同步，本轮不看 fps）",v);}return v;}
+static int present_hash_frames(){static int v=-2;if(v==-2){const char*e=getenv("DM_PRESENT_HASH_FRAMES");v=e?atoi(e):0;
+    xbg_logf("[上屏] 逐帧像素 hash 自报：DM_PRESENT_HASH_FRAMES=%s 解析=%d%s",e?e:"(未设置)",v,v>0?"（含读回同步，本轮不看 fps）":"（关）");}return v;}
 // ⚠ 预算必须是函数内 static：曾经把「剩余帧数」放在调用点的局部变量里传引用，
 //   结果每次调用都被重新初始化成 0 ⇒ 一次也不触发（np715i 白跑一轮的学费）。
 static bool present_hash_now(uint64_t draws){
@@ -6132,7 +6266,9 @@ static bool present_hash_now(uint64_t draws){
     static int frames=0,done=0;
     if(from==-2){const char*f=getenv("DM_PRESENT_HASH_FROM");from=f?atoi(f):0;frames=present_hash_frames();}
     if(frames<=0)return false;
-    if(draws<20000)return false;                        // 只取「重场景帧」：PRE 期 40 fps 会把预算瞬间烧完
+    static int all=-1;if(all<0){const char*e=getenv("DM_PRESENT_HASH_ALL");all=(e&&*e=='1')?1:0;}
+    if(draws<20000 && !all)return false;                // 只取「重场景帧」：PRE 期 40 fps 会把预算瞬间烧完；
+                                                        // 跳过轮 draws 会变 0 ⇒ 用 DM_PRESENT_HASH_ALL=1 放行
     if(stats.presents.load()<uint64_t(from))return false;
     if(done>=frames)return false;
     if(!done)xbg_logf("[上屏] 逐帧像素 hash 首个样本 present=%llu draws=%llu",(unsigned long long)stats.presents.load(),(unsigned long long)draws);
