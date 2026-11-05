@@ -2451,7 +2451,14 @@ static bool register_texture_record(RegisteredTexture &slot,const tex_t &texture
 }
 struct MemoImage{const tex_t *first;Image *second;const RegisteredTexture *record;uint64_t revision;};
 using PoolKey=std::pair<uintptr_t,int64_t>;
-PoolKey pool_key(const dpool_t *p){need(p && p->pool,"Missing descriptor pool");return {uintptr_t(p->pool->mem),p->off};}
+PoolKey pool_key(const dpool_t *p){need(p && p->pool,"Missing descriptor pool");
+    // np727k：键只用 mem——原键 (mem,off) 里 off 随游戏往池追加纹理而移动，注册时的键与查询时的键
+    // 对不上（np727i 诊断 why=2）⇒ 窗口 blit 绑 null 纹理、屏幕恒定米白/黑。同一块描述符内存就是
+    // 同一个池，off 只是池内的快照位置，不该进键。
+    // np727k: key by the descriptor memory block only -- the old (mem,off) key drifted as the game
+    // appended textures to the pool, so lookups missed the registry and the window blit bound the null
+    // texture (the constant beige/black after the title). Same block = same pool; off must not be in the key.
+    return {uintptr_t(p->pool->mem),0};}
 std::map<PoolKey,std::map<int,RegisteredTexture>> textures;
 static dpool_t g_last_tex_pool{};   // np727j：最近一次 OP_SET_TEX_POOL 的池（state 丢失时的回退）
 static std::set<std::pair<uintptr_t,int>> g_null_bound;   // np727k：被解析成 null 纹理的 (池 mem,id) —— 首次注册时据此失效描述符 memo
@@ -4789,7 +4796,7 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
         if(p.pass_noload && quad_indices.empty() && !ab_off("noload") && ui_uy==0 && ui_vs==1 && first_draw_covers(p,prim,first,count,indexed,vertex_buffers,ib,index_type)){VkRenderPass keep=p.pass;p.pass=p.pass_noload;begin_pass(p,c);p.pass=keep;++noload_passes;}
         else begin_pass(p,c);
         open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;open_pass.serial0=p.images.n&&p.images.v[0]?p.images.v[0]->source.serial:0;open_pass.depth_attached=state.rt.depth!=nullptr;++perf.passes;}
-    if(g_winbind_logged<64 && open_pass.serial0 && win_serial_match(open_pass.serial0)){   // np727i：写窗口的 draw 绑了哪张纹理（放 pass 切换块之后——窗口 blit pass 只有 1 个 draw，入口处 open_pass 还是上一个 pass）
+    if((g_winbind_logged<8 || g_winbind_logged%256==0) && open_pass.serial0 && win_serial_match(open_pass.serial0)){   // np727i：写窗口的 draw 绑了哪张纹理（前 8 次+每 256 次=覆盖全时段，np727k 改）
         ++g_winbind_logged;
         auto win_serial_of=[&](uint64_t h,uint64_t *out_pool_n=nullptr,int *out_why=nullptr)->uint64_t{int id=int(h&0xfffff);
             if(out_pool_n)*out_pool_n=state.texture_pool.n;
@@ -4799,10 +4806,29 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
             auto tit=pit->second.find(id);if(tit==pit->second.end()){if(out_why)*out_why=3;return 0;}   // 3=池内有映射表但无此 id
             if(out_why)*out_why=0;return tit->second.texture.serial;};
         uint64_t pool_n=0;int why=-1;
-        char l[520];int at=snprintf(l,sizeof l,"落点 pass=%llu pooln=%llu why=",(unsigned long long)open_pass.serial0,(unsigned long long)pool_n);
+        auto tex_id_of=[&](uint64_t h)->const RegisteredTexture *{int id=int(h&0xfffff);
+            // np727k：与本文件解析路径同款回退——textures（池键）实际无人注册，真实注册走
+            // mtl_reg_tex → legacy_textures（按裸 id）。诊断必须读同一条解析路径，否则瞎报。
+            if(!id)return nullptr;
+            if(state.texture_pool.n>0 && id<state.texture_pool.n){auto pit=textures.find(pool_key(&state.texture_pool));
+                if(pit!=textures.end()){auto tit=pit->second.find(id);if(tit!=pit->second.end())return &tit->second;}}
+            auto lt=legacy_textures.find(id);return lt==legacy_textures.end()?nullptr:&lt->second;};
+        char l[760];int at=snprintf(l,sizeof l,"落点 pass=%llu pools=%zu[",(unsigned long long)open_pass.serial0,textures.size());
+        {int pn=0;for(auto &kv:textures){if(pn++<6)at+=snprintf(l+at,sizeof l-at,"%s%llx@%lld",pn>1?",":"",(unsigned long long)kv.first.first,(long long)kv.first.second);}
+         at+=snprintf(l+at,sizeof l-at,"] cur=%llx pooln=%llu why=",(unsigned long long)pool_key(&state.texture_pool).first,(unsigned long long)state.texture_pool.n);}
         for(unsigned st=0;st<6 && at<int(sizeof l)-48;st++){unsigned nz=0;for(unsigned r=0;r<8;r++)if(state.tex[st][r])nz=r+1;
             if(nz){at+=snprintf(l+at,sizeof l-at," s%u:",st);
-                for(unsigned r=0;r<nz && at<int(sizeof l)-32;r++){uint64_t h=state.tex[st][r];uint64_t sn=win_serial_of(h,&pool_n,&why);at+=snprintf(l+at,sizeof l-at," %llx/%llu/w%d",(unsigned long long)(h&0xfffff),(unsigned long long)sn,why);}}}
+                for(unsigned r=0;r<nz && at<int(sizeof l)-32;r++){uint64_t h=state.tex[st][r];uint64_t sn=win_serial_of(h,&pool_n,&why);
+                    const RegisteredTexture *rt=tex_id_of(h);
+                    if(rt && sn)at+=snprintf(l+at,sizeof l-at," %llx/%llu/%ux%u.f%u@%llx",(unsigned long long)(h&0xfffff),(unsigned long long)sn,rt->texture.d.width,rt->texture.d.height,rt->texture.d.format,(unsigned long long)uintptr_t(rt->texture.mem));
+                    else at+=snprintf(l+at,sizeof l-at," %llx/full=%llx/%llu/w%d",(unsigned long long)(h&0xfffff),(unsigned long long)h,(unsigned long long)(rt?rt->texture.serial:0),why);}}}
+        {   // legacy 注册表普查：数量 / id 范围 / 765 邻域
+            std::lock_guard<std::recursive_mutex> gb(mutex);
+            at+=snprintf(l+at,sizeof l-at," legacy_n=%zu",(unsigned long long)legacy_textures.size());
+            if(!legacy_textures.empty()){
+                auto lo=legacy_textures.begin();auto hi=legacy_textures.rbegin();
+                at+=snprintf(l+at,sizeof l-at," ids=%d..%d",lo->first,hi->first);
+                for(int d=-3;d<=3;d++){auto it=legacy_textures.find(765+d);if(it!=legacy_textures.end())at+=snprintf(l+at,sizeof l-at," [%d=%ux%u.f%u]",it->first,it->second.texture.d.width,it->second.texture.d.height,it->second.texture.d.format);}}}
         xbg_logf("【落点】%s",l);
         // 独立文件通道（铁律 8）：hilog 16MB 在启动期数秒即回绕，开机期诊断必须落文件。
         static std::string bind_path;if(bind_path.empty()){std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');bind_path=(cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-bind.txt";}
@@ -5743,7 +5769,15 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
            if(!g_gpu_wrote){++g_barrier_skip;break;}
            g_barrier_site="op28-inpass";full_barrier_in_pass(s.cmd);g_gpu_wrote=false;++g_barrier_emit;break;}
         case OP_SET_TEX_POOL:{auto a=payload<p_set_pool>(p,n);need(a.pool,"Null texture pool");state.texture_pool=*a.pool;g_last_tex_pool=*a.pool;   // np727j：记住最近池——某些执行路径（分段/重建后）会把 state 的池丢成空
-            static unsigned pool_switches=0;++pool_switches;if(pool_switches<=8||pool_switches%100==0)xbg_logf("【池】第 %u 次切换纹理池 n=%u mem=%p off=%lld",pool_switches,state.texture_pool.n,state.texture_pool.pool?state.texture_pool.pool->mem:nullptr,(long long)state.texture_pool.off);break;}
+            static unsigned pool_switches=0;++pool_switches;
+            {static PoolKey last_pk{};PoolKey pk=pool_key(&state.texture_pool);
+             if(!(pk==last_pk)){xbg_logf("【池】第 %u 次切换纹理池 n=%u mem=%llx off=%lld（键变化）",pool_switches,state.texture_pool.n,(unsigned long long)pk.first,(long long)pk.second);last_pk=pk;}}
+            // np727k：池键=(mem,off)，off 随追加纹理移动 ⇒ 注册表键漂移，已建的描述符 memo 里可能
+            // 压着 null 绑定（窗口 blit 双缓冲之一恒米白的根因）。off 相对上次执行移动 ⇒ 键位漂了
+            // ⇒ bump memo_epoch 全量懒失效，让每条描述符按 mem 回退重新解析。每 (mem,off) 只 bump 一次。
+            {static std::map<uintptr_t,long long> last_off;auto &lo=last_off[uintptr_t(a.pool->pool->mem)];
+             if(lo && lo!=a.pool->off){memo_epoch.fetch_add(1);static int oe=0;if(oe++<8)xbg_logf("【池】off %lld→%lld（键位漂移）→ bump memo_epoch=%llu",lo,(long long)a.pool->off,(unsigned long long)memo_epoch.load());}
+             lo=a.pool->off;}break;}
         case OP_SET_SAMP_POOL:{auto a=payload<p_set_pool>(p,n);need(a.pool,"Null sampler pool");state.sampler_pool=*a.pool;break;}
         case OP_COPY_B2T:copy_texture_buffer(payload<p_copy_b2t>(p,n),false);break;
         case OP_COPY_T2B:copy_texture_buffer(payload<p_copy_b2t>(p,n),true);break;
