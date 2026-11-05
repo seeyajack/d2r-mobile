@@ -5473,6 +5473,17 @@ static void plan(int n,const uint64_t *handles){
     if(alt&&(submits%2)==0){for(size_t i=0;i<flags.size();i++)flags[i]=0;planned=0;}
     // 周期性强制全画兜底（缺省每 8 次提交一次）：把"结构对得上但内容变了"的漏网之鱼限制在 N 帧内。
     // 照 Metal 世界冻结的"第一帧必是完整帧"（nvn_mtl.m:5389）再加一层保险。
+    // 时间相位 A/B（同包、同一轮里自动交替）：DM_FRAME_SKIP_PHASE_MS=20000 ⇒ 每 20 s 在
+    // 「跳过 / 对照」之间切换。帧率对比因此是**同轮同类**，不用每次改 env 重建（省下 90 s 构建）。
+    static int phase_ms=-2;
+    if(phase_ms==-2){const char*e=getenv("DM_FRAME_SKIP_PHASE_MS");phase_ms=e?atoi(e):0;
+        if(phase_ms>0)xbg_logf("【跳过】时间相位 A/B：每 %d ms 在跳过/对照之间切换",phase_ms);}
+    if(phase_ms>0){
+        static int last=-1;
+        int st=int((timing_clock()/1000000ull)/uint64_t(phase_ms))%2;
+        if(st!=last){last=st;xbg_logf("【跳过】相位切换 → %s（%llu ms）",st?"对照(不跳)":"跳过",(unsigned long long)(timing_clock()/1000000ull));}
+        if(st){for(size_t i=0;i<flags.size();i++)flags[i]=0;planned=0;}
+    }
     static int every=-2;
     if(every==-2){const char*e=getenv("DM_FRAME_SKIP_EVERY");every=e?atoi(e):8;if(every>0)xbg_logf("【跳过】每 %d 次提交强制全画一次（DM_FRAME_SKIP_EVERY）",every);}
     if(every>0&&(submits%uint64_t(every))==0){for(size_t i=0;i<flags.size();i++)flags[i]=0;planned=0;}
