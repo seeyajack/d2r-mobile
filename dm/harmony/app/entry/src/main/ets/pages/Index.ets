@@ -624,7 +624,7 @@ struct Index {
             // np726 性能定谳 A/B（铁律 37：两次独立整跑，env 只差 DM_FRAME_SKIP 一行）：
             //   剥掉全部重诊断（np723a 口径），只留 DM_FRAME_TIME=1 作帧时主仪器；
             //   对照轮 = 本行原文；跳过轮 = 追加 DM_FRAME_SKIP=1（跑完改回）。
-            let envs = 'DM_NVN_SYNC=1 DM_FS=1 DM_WATCH_STALL=90 DM_NVN_API_MAJOR=53 DM_SHADER_SKIP=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000 DM_FRAME_TIME=1';   // np726 收轮基线（干净 envs + 帧时仪器）；跳过轮 = 临时追加 DM_FRAME_SKIP=1
+            let envs = 'DM_NVN_SYNC=1 DM_FS=1 DM_WATCH_STALL=90 DM_NVN_API_MAJOR=53 DM_SHADER_SKIP=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000 DM_FRAME_TIME=1 DM_FRAME_SKIP=1 DM_PRESENT_PROBE=1600';   // np727m：源图探针验 mem-fallback 修复（present 1600 读回+ASCII）;   // np727h：A 键全程连打（+30s 起每 3s 共 120 次）——标题窗口一出现就接住进菜单
             // romfs 双路（d1 瘦包）：
             //   A. HAP 里带 romfs/（fat 包，首次装机用）→ 照旧**每次点都重新解出**。
             //      ⚠ 不能用 pathExists 判"解没解过"：本机 fs.listFileSync 对不存在的路径也不抛
@@ -673,6 +673,30 @@ struct Index {
             }
             dms2.start(dir, log, marker, envs);
             trace(ctx, 'start returned');
+            // np727d：**无手柄按键注入**（DM_PAD_AUTO=<起始秒>/<间隔秒>/<次数>，按 A 键）。用途：
+            //   游戏推进到「按任意键」/菜单这类输入等待态时，不接真手柄也能确定性过场（np702/np705
+            //   同款思路：制造事件，不等运气）。实现 = 起客后定时器把 A 位按下 150 ms 再松开——
+            //   hle_hid 的按下沿锁存（g_press_latch）保证按下沿被游戏读到。envs 里没给 = 关。
+            // np727d: scripted button injection without a physical pad (DM_PAD_AUTO=start_s/interval_s/
+            //   count, presses A). Deterministically pushes through "press any button"/menu waits
+            //   (same idea as np702/np705: make the event, don't wait for luck). A 150 ms press edge is
+            //   latched by hle_hid's g_press_latch and seen by the guest. Absent from envs = off.
+            const padAuto = /(?:^|\s)DM_PAD_AUTO=(\d+)\/(\d+)\/(\d+)(?:\s|$)/.exec(envs);
+            if (padAuto) {
+              const padStart = Number(padAuto[1]) * 1000, padIv = Number(padAuto[2]) * 1000, padN = Number(padAuto[3]);
+              let padK = 0;
+              let padTimer: number = -1;
+              const padDelay = setTimeout(() => {
+                padTimer = setInterval(() => {
+                  padK++;
+                  dms2.setPad(HostBtn.A, 0, 0, 0, 0);
+                  trace(ctx, 'pad-auto 第 ' + padK + '/' + padN + ' 次按下 A');
+                  setTimeout(() => { dms2.setPad(0, 0, 0, 0, 0); }, 150);
+                  if (padK >= padN) clearInterval(padTimer);
+                }, padIv);
+              }, padStart);
+              trace(ctx, 'pad-auto 已排程：' + padAuto[1] + 's 起，每 ' + padAuto[2] + 's 按 A，共 ' + padAuto[3] + ' 次（timer=' + padDelay + '）');
+            }
             // np710：起客后焦点归还手柄区。用户实测（真手柄）：起客前按键能导航 UI，起客后
             //   按键变成 UI 焦点遍历、A 键把焦点送进「运行目录」输入框——XComponent 建游戏
             //   窗口时异步夺走了焦点。立即归还 + 三次延迟重试盖住建窗时机；onBlur 兜底常驻。
