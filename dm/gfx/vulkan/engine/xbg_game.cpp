@@ -6120,6 +6120,43 @@ static void present_probe_other_serials(){
             (unsigned long long)nz,(unsigned long long)npx,100.0*double(nz)/double(npx),int(oi.layout));
     }
 }
+// np715：**逐帧像素 hash**（阶段 1b 的上限读数）。目的只有一个：量出「连续多少帧上屏像素逐字节相同」
+//   = 阶段 2 可跳帧的**上限**。读回带一次 GPU 同步 ⇒ 这一轮只判画面、不看 fps（会明显更慢）。
+//   预算控制：`DM_PRESENT_HASH_FROM`（从第几个 present 开始）+ `DM_PRESENT_HASH_FRAMES`（共多少帧），
+//   默认 0 = 关；每帧一行、不打 ASCII 缩略（那是 present_probe_report 的活）。
+static int present_hash_frames(){static int v=-2;if(v==-2){const char*e=getenv("DM_PRESENT_HASH_FRAMES");v=e?atoi(e):0;if(v>0)xbg_logf("[上屏] 逐帧像素 hash 开启：前 %d 个重场景帧（含读回同步，本轮不看 fps）",v);}return v;}
+// ⚠ 预算必须是函数内 static：曾经把「剩余帧数」放在调用点的局部变量里传引用，
+//   结果每次调用都被重新初始化成 0 ⇒ 一次也不触发（np715i 白跑一轮的学费）。
+static bool present_hash_now(uint64_t draws){
+    static int from=-2;
+    static int frames=0,done=0;
+    if(from==-2){const char*f=getenv("DM_PRESENT_HASH_FROM");from=f?atoi(f):0;frames=present_hash_frames();}
+    if(frames<=0)return false;
+    if(draws<20000)return false;                        // 只取「重场景帧」：PRE 期 40 fps 会把预算瞬间烧完
+    if(stats.presents.load()<uint64_t(from))return false;
+    if(done>=frames)return false;
+    if(!done)xbg_logf("[上屏] 逐帧像素 hash 首个样本 present=%llu draws=%llu",(unsigned long long)stats.presents.load(),(unsigned long long)draws);
+    ++done;return true;
+}
+// 8 字节步进的 FNV 变体：8 MB 一帧要能扛住 1.2 fps 的节奏（逐字节版会慢 4–8 倍）
+static uint64_t pixel_hash8(const uint8_t *p,size_t nb){
+    uint64_t h=1469598103934665603ull;size_t i=0;
+    for(;i+8<=nb;i+=8){uint64_t w;memcpy(&w,p+i,8);h^=w;h*=1099511628211ull;h^=(h>>29);}
+    for(;i<nb;i++){h^=p[i];h*=1099511628211ull;}
+    return h;
+}
+static void present_frame_hash_report(const Buffer &buf,uint32_t w,uint32_t h,uint32_t bpp,uint64_t serial){
+    if(!buf.mapped||!w||!h||bpp<3)return;
+    const uint8_t *p=static_cast<const uint8_t*>(buf.mapped)+buf.offset;
+    size_t nb=size_t(w)*h*bpp;
+    uint64_t ph=pixel_hash8(p,nb);
+    uint64_t nz=0,sum=0,n=uint64_t(w)*h;
+    for(uint64_t i=0;i<n;i++){const uint8_t *q=p+i*bpp;if(q[0]|q[1]|q[2])++nz;sum+=q[0];sum+=q[1];sum+=q[2];}
+    xbg_logf("[上屏] 帧hash present=%llu serial=%llu %ux%u hash=%016llx 非黑=%llu(%.1f%%) 均值RGB=%.1f",
+        (unsigned long long)stats.presents.load(),(unsigned long long)serial,w,h,
+        (unsigned long long)ph,(unsigned long long)nz,100.0*double(nz)/double(n),
+        double(sum)/double(n*3));
+}
 static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();deathguard::frame_seal();{SiteScope site(SITE_PRESENT);cur_op=61;TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");
          // np662：**切后台不挂死**。表面销毁后上屏回调会在 wait_window() 无限等新表面 ⇒
          // 帧循环整个停住、看门狗 90 秒判死（死状与真卡点难辨）。无窗口时跳过本帧出图、
@@ -6136,9 +6173,10 @@ static void xbg_present_texture_now(const win_t *window,const tex_t *texture){st
          const int probe_n=present_probe_target();
          static bool probe_done=false;
          const bool probe_now = (probe_n>0 && !probe_done && stats.presents.load()>=uint64_t(probe_n)) || present_probe_due();
+         const bool hash_now=present_hash_now(uint64_t(g_draws_since_present));   // np715 逐帧像素 hash（默认关）   // np715 逐帧像素 hash（默认关）
          Buffer probe_buf;
          Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-         if(probe_now && im.bpp>=4 && im.samples==VK_SAMPLE_COUNT_1_BIT && (im.aspects&VK_IMAGE_ASPECT_COLOR_BIT)){
+         if((probe_now||hash_now) && im.bpp>=4 && im.samples==VK_SAMPLE_COUNT_1_BIT && (im.aspects&VK_IMAGE_ASPECT_COLOR_BIT)){
              probe_buf=readback_buffer(size_t(im.width)*im.height*4);
              // np668：**自检的对照**。DM_PRESENT_PROBE_FILL=1 时先把源图整张涂绿再读回：
              //   读回是绿的 ⇒ 读回通路本身没问题，之前读到的全 0 是真的"源图黑"；
@@ -6147,7 +6185,7 @@ static void xbg_present_texture_now(const win_t *window,const tex_t *texture){st
              //   before the readback: green comes back => the readback path is sound and the zeros were real;
              //   still zeros => the readback path is broken and the earlier conclusion must be discarded.
              static int probe_fill=-1;if(probe_fill<0){const char *e=getenv("DM_PRESENT_PROBE_FILL");probe_fill=(e&&*e=='1')?1:0;if(probe_fill)xbg_logf("[上屏] 自检对照开启：读回前先涂绿");}
-             if(probe_fill){
+             if(probe_fill && probe_now){
                  VkImageSubresourceRange rr{VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
                  VkImageMemoryBarrier tb{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};tb.srcQueueFamilyIndex=tb.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;tb.image=im.image;tb.subresourceRange=rr;
                  tb.oldLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;tb.newLayout=VK_IMAGE_LAYOUT_GENERAL;tb.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT;tb.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -6163,11 +6201,13 @@ static void xbg_present_texture_now(const win_t *window,const tex_t *texture){st
              VkBufferMemoryBarrier ph{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};ph.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;ph.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
              ph.srcQueueFamilyIndex=ph.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;ph.buffer=probe_buf.buffer;ph.offset=probe_buf.offset;ph.size=probe_buf.size;
              vkCmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&ph,0,nullptr);
-             xbg_logf("[上屏] 自检启动：present=%llu 纹理 serial=%llu %ux%u fmt=%#x",(unsigned long long)stats.presents.load(),
+             if(probe_now)xbg_logf("[上屏] 自检启动：present=%llu 纹理 serial=%llu %ux%u fmt=%#x",(unsigned long long)stats.presents.load(),
                  (unsigned long long)texture->serial,im.width,im.height,unsigned(im.fmt));
          }
          c.finish();submit_slots(false);
-         if(probe_now && probe_buf.buffer){gpu_sync(perf.sync_readback);probe_buf.invalidate();present_probe_report(probe_buf,im.width,im.height,4);
+         if((probe_now||hash_now) && probe_buf.buffer){gpu_sync(perf.sync_readback);probe_buf.invalidate();
+             if(hash_now)present_frame_hash_report(probe_buf,im.width,im.height,4,texture->serial);
+          if(probe_now){present_probe_report(probe_buf,im.width,im.height,4);
              xbg_logf("[上屏] 绘制落点：一帧 %llu 次绘制，打到 serial=%llu 的 %llu 次；最后一次目标 serial=%llu image=%p；上屏 image=%p 同一镜像=%d",
                  (unsigned long long)g_draws_since_present,(unsigned long long)texture->serial,
                  (unsigned long long)g_draws_to_present_serial,(unsigned long long)g_last_draw_serial,g_last_draw_image,
@@ -6177,6 +6217,7 @@ static void xbg_present_texture_now(const win_t *window,const tex_t *texture){st
                  (unsigned long long)im.last_write,int(im.layout),(unsigned long long)im.checked_submission);
              present_probe_other_serials();
              if(probe_n>0 && stats.presents.load()>=uint64_t(probe_n))probe_done=true;}
+         }
          g_present_serial_hint=texture->serial;g_winfill_serial=texture->serial;
          {bool known=false;for(int i=0;i<g_win_n;i++)if(g_win_serials[i]==texture->serial)known=true;
           if(!known && g_win_n<8){g_win_serials[g_win_n++]=texture->serial;xbg_logf("[上屏] 登记窗口缓冲 serial=%llu（共 %d 个）",(unsigned long long)texture->serial,g_win_n);}}g_draws_since_present=0;g_draws_to_present_serial=0;
