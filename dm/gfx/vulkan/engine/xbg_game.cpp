@@ -5452,6 +5452,9 @@ static void plan_walk(const uint8_t *pc,unsigned depth,uint64_t &steps){
 }
 static void plan(int n,const uint64_t *handles){
     keys.clear();hashes.clear();flags.clear();segs.clear();
+    // ⚠ 窗口 serial 还没登记（第一帧之前）⇒ 根本不知道哪趟是上屏合成趟，保护等于没开。
+    //   np723a 就是在这里 SIGBUS：早期帧把合成趟跳了。⇒ 未登记一律不跳。
+    if(win_n==0){planned=0;segs.clear();return;}
     uint64_t steps=0;
     for(int i=0;i<n;i++)plan_walk(reinterpret_cast<const uint8_t*>(handles[i]),0,steps);
     seg_close();
