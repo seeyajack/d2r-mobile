@@ -6346,6 +6346,18 @@ static void present_frame_hash_report(const Buffer &buf,uint32_t w,uint32_t h,ui
 //   gpu      = 本帧 GPU 时间增量（perf.gpu_ns，来自 pass 时间戳）
 //   rest     = interval − submit − present ⇒ 客体自己的 CPU + 驱动队列/同步等待（这一项就是 np720 那 300 ms 的候选池）
 namespace frametime{
+// /proc/self/stat 的 utime+stime（tick=10 ms）。判「rest 是客体 CPU 还是在等」：
+// 帧时里 CPU 占用接近 100% ⇒ 客体翻译执行主导；明显低 ⇒ 还在等驱动/队列。
+static bool proc_cpu_ms(uint64_t &out){
+    FILE *f=fopen("/proc/self/stat","r");if(!f)return false;
+    char buf[1024];size_t n=fread(buf,1,sizeof(buf)-1,f);fclose(f);buf[n]=0;
+    char *p=strrchr(buf,')');if(!p)return false;++p;
+    unsigned long long v[24]={0};int i=0;
+    for(char *t=strtok(p," \n");t&&i<24;t=strtok(nullptr," \n"))v[i++]=strtoull(t,nullptr,10);
+    if(i<13)return false;
+    out=(v[11]+v[12])*10ull;   // v[0]=state(第3字段) ⇒ utime=第14字段=v[11]、stime=v[12]
+    return true;
+}
 static int on=-1;
 static bool enabled(){if(on<0){const char*e=getenv("DM_FRAME_TIME");on=(e&&*e=='1')?1:0;if(on)xbg_logf("[帧时] DM_FRAME_TIME=1 开启（一帧一行，只读）");}return on!=0;}
 static void report(uint64_t now,uint64_t present_begin){
@@ -6357,11 +6369,16 @@ static void report(uint64_t now,uint64_t present_begin){
     double gpu=double(perf.gpu_ns-last_gpu)/1e6;
     if(gpu<0)gpu=0;
     double rest=interval-submit-present;
-    static uint64_t last_plan=0;
+    static uint64_t last_plan=0,last_cpu=0;
     double plan=double(frameskip::plan_ns-last_plan)/1e6;
+    uint64_t cpu=0;double cpu_ms=0.0,cpu_pct=-1.0;
+    if(proc_cpu_ms(cpu)){
+        if(last_cpu&&interval>0.0){cpu_ms=double(cpu-last_cpu);cpu_pct=100.0*cpu_ms/interval;}
+        last_cpu=cpu;
+    }
     if(interval>0.0)
-        xbg_logf("FRAMETIME presents=%llu interval_ms=%.1f submit_ms=%.1f plan_ms=%.1f present_ms=%.1f gpu_ms=%.1f rest_ms=%.1f",
-            (unsigned long long)n,interval,submit,plan,present,gpu,rest>0?rest:0.0);
+        xbg_logf("FRAMETIME presents=%llu interval_ms=%.1f submit_ms=%.1f plan_ms=%.1f present_ms=%.1f gpu_ms=%.1f rest_ms=%.1f cpu_pct=%.0f",
+            (unsigned long long)n,interval,submit,plan,present,gpu,rest>0?rest:0.0,cpu_pct);
     last=now;last_submit=perf.submit_cpu_ns;last_gpu=perf.gpu_ns;last_plan=frameskip::plan_ns;++n;
 }
 }
