@@ -5361,8 +5361,9 @@ static bool s_op(uint32_t op){
         ||op==(OP_COUNT_+2)||op==(OP_COUNT_+3)||op==(OP_COUNT_+7)||op==(OP_COUNT_+8)||op==(OP_COUNT_+9);
 }
 // 身份键 = OP_SET_RT 载荷里各渲染目标的 tex_t.serial（指针会随录制副本变，不能用）
-static uint64_t rt_key(const uint8_t *p,size_t n){
+static uint64_t rt_key(const uint8_t *p,size_t n,uint64_t *first_serial=nullptr){
     uint64_t h=1469598103934665603ull;int32_t cnt=0;
+    if(first_serial)*first_serial=0;
     if(n<4)return h;
     memcpy(&cnt,p,4);
     if(cnt<0)cnt=0;if(cnt>8)cnt=8;
@@ -5372,7 +5373,7 @@ static uint64_t rt_key(const uint8_t *p,size_t n){
         size_t off=offsetof(p_set_rt,color)+size_t(i)*sizeof(const tex_t*);
         if(off+sizeof(const tex_t*)>n)break;
         const tex_t *t=nullptr;memcpy(&t,p+off,sizeof(const tex_t*));
-        uint64_t s=t?t->serial:0;h=mixv(h,&s,8);
+        uint64_t s=t?t->serial:0;if(i==0&&first_serial)*first_serial=s;h=mixv(h,&s,8);
     }
     if(offsetof(p_set_rt,depth)+sizeof(const tex_t*)<=n){
         const tex_t *d=nullptr;memcpy(&d,p+offsetof(p_set_rt,depth),sizeof(const tex_t*));
@@ -5380,9 +5381,14 @@ static uint64_t rt_key(const uint8_t *p,size_t n){
     }
     return h;
 }
-struct seg{uint64_t key,hash;size_t ops;uint32_t draws;};
+struct seg{uint64_t key,hash;uint64_t ser0;size_t ops;uint32_t draws;};
+// 窗口贴图表：写窗口的那趟是**末尾合成**，跳过它就是"这一帧没上屏"（np716f 22 帧不一致里的黑帧正是这个）。
+// 照 Metal 世界冻结的做法（nvn_mtl.m:5382-5396）：「界面趟与末尾合成趟照画」，只跳世界段。
+static uint64_t win_ser[8];static int win_n=0;
+static void note_window_serial(uint64_t s){if(win_n<8){for(int i=0;i<win_n;i++)if(win_ser[i]==s)return;win_ser[win_n++]=s;}}
+static bool is_window_serial(uint64_t s){for(int i=0;i<win_n;i++)if(win_ser[i]==s)return true;return false;}
 static std::vector<seg> segs;
-static void seg_open(uint64_t key){seg s{};s.key=key;s.hash=1469598103934665603ull;segs.push_back(s);}
+static void seg_open(uint64_t key,uint64_t ser0){seg s{};s.key=key;s.ser0=ser0;s.hash=1469598103934665603ull;segs.push_back(s);}
 static void seg_close(){
     if(segs.empty())return;
     seg &s=segs.back();if(!s.ops)segs.pop_back();      // 空段（只有 SET_RT）不参与判定
@@ -5403,7 +5409,7 @@ static void plan_walk(const uint8_t *pc,unsigned depth,uint64_t &steps){
             if(hd.op==OP_JUMP){pc=reinterpret_cast<const uint8_t*>(next);continue;}
             plan_walk(reinterpret_cast<const uint8_t*>(next),depth+1,steps);
         }else if(hd.op==OP_SET_RT){
-            seg_close();seg_open(rt_key(pc+8,hd.size-8));
+            seg_close();uint64_t s0=0;uint64_t k=rt_key(pc+8,hd.size-8,&s0);seg_open(k,s0);
         }else if(hd.op!=OP_BEGIN){
             // ⚠ 首个 OP_SET_RT 之前的 op（内置 clear / 状态设置）**不建段**：
             //   execute() 是按 OP_SET_RT 数 pass 序号的，这里多开一段就会整体错位一位
@@ -5433,6 +5439,7 @@ static void plan(int n,const uint64_t *handles){
     for(size_t i=0;i<segs.size();i++){
         keys.push_back(segs[i].key);hashes.push_back(segs[i].hash);
         uint8_t skip=0;
+        if(is_window_serial(segs[i].ser0)){flags.push_back(0);continue;}   // 末尾合成/窗口趟：永不跳
         if(!prev_keys.empty()&&segs[i].draws){          // 没有绘制类 op 的 pass 跳不跳都一样，别计入
             for(size_t j=0;j<prev_keys.size();j++)
                 if(prev_keys[j]==segs[i].key&&prev_hashes[j]==segs[i].hash){skip=1;break;}
@@ -5443,6 +5450,11 @@ static void plan(int n,const uint64_t *handles){
     static int alt=-2;
     if(alt==-2){const char*e=getenv("DM_FRAME_SKIP_ALT");alt=(e&&*e=='1')?1:0;if(alt)xbg_logf("【跳过】ALT 交替模式：偶数提交不跳作为对照");}
     if(alt&&(submits%2)==0){for(size_t i=0;i<flags.size();i++)flags[i]=0;planned=0;}
+    // 周期性强制全画兜底（缺省每 8 次提交一次）：把"结构对得上但内容变了"的漏网之鱼限制在 N 帧内。
+    // 照 Metal 世界冻结的"第一帧必是完整帧"（nvn_mtl.m:5389）再加一层保险。
+    static int every=-2;
+    if(every==-2){const char*e=getenv("DM_FRAME_SKIP_EVERY");every=e?atoi(e):8;if(every>0)xbg_logf("【跳过】每 %d 次提交强制全画一次（DM_FRAME_SKIP_EVERY）",every);}
+    if(every>0&&(submits%uint64_t(every))==0){for(size_t i=0;i<flags.size();i++)flags[i]=0;planned=0;}
 }
 static void exec_begin(){idx=(size_t)-1;armed=!flags.empty()&&planned>0;skipped_ops=0;skipped_passes=0;}
 static void exec_pass(const uint8_t *p,size_t n){
@@ -6356,7 +6368,8 @@ static void xbg_present_texture_now(const win_t *window,const tex_t *texture){st
          }
          g_present_serial_hint=texture->serial;g_winfill_serial=texture->serial;
          {bool known=false;for(int i=0;i<g_win_n;i++)if(g_win_serials[i]==texture->serial)known=true;
-          if(!known && g_win_n<8){g_win_serials[g_win_n++]=texture->serial;xbg_logf("[上屏] 登记窗口缓冲 serial=%llu（共 %d 个）",(unsigned long long)texture->serial,g_win_n);}}g_draws_since_present=0;g_draws_to_present_serial=0;
+          if(!known && g_win_n<8){g_win_serials[g_win_n++]=texture->serial;xbg_logf("[上屏] 登记窗口缓冲 serial=%llu（共 %d 个）",(unsigned long long)texture->serial,g_win_n);}
+          frameskip::note_window_serial(texture->serial);}   // 让阶段 2 知道哪趟是写窗口的合成趟g_draws_since_present=0;g_draws_to_present_serial=0;
          int r;{CPU_SCOPE(Present);
          // np658：reset 恢复窗口内先安静（present 也走队列，同样会喂 render_service 的失败计数）。
          // np658: stay quiet during the recovery window (present also goes through the queue and feeds the counter).
