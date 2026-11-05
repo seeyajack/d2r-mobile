@@ -2453,6 +2453,9 @@ struct MemoImage{const tex_t *first;Image *second;const RegisteredTexture *recor
 using PoolKey=std::pair<uintptr_t,int64_t>;
 PoolKey pool_key(const dpool_t *p){need(p && p->pool,"Missing descriptor pool");return {uintptr_t(p->pool->mem),p->off};}
 std::map<PoolKey,std::map<int,RegisteredTexture>> textures;
+static dpool_t g_last_tex_pool{};   // np727j：最近一次 OP_SET_TEX_POOL 的池（state 丢失时的回退）
+static std::set<std::pair<uintptr_t,int>> g_null_bound;   // np727k：被解析成 null 纹理的 (池 mem,id) —— 首次注册时据此失效描述符 memo
+static std::mutex g_null_bound_mu;
 std::map<int,RegisteredTexture> legacy_textures;std::map<int,samp_par> legacy_samplers;
 std::map<int,RegisteredTexture> *texture_pool_cache=nullptr;PoolKey texture_pool_cache_key{}; // descriptors(): last texture pool (entries are never erased before shutdown)
 std::map<PoolKey,std::map<int,samp_par>> samplers;
@@ -3181,6 +3184,7 @@ static bool g_shader_skip_abort=false;
 //   只是被"绑了一下"，真正的合成步骤缺失。只读诊断：不加锁、不进日志热路径。
 // np670: where do the draws land? Companion to the present probe. Diagnostic only, no locks, no hot-path logging.
 static uint64_t g_draws_since_present=0,g_draws_to_present_serial=0,g_last_draw_serial=0,g_present_serial_hint=0;static void *g_last_draw_image=nullptr;
+static int g_winbind_logged=0;   // np727i：写窗口 serial 的 draw 绑定纹理日志预算（文件级，铁律 39）
 // np598：DM_SHADER_SKIP 是否开着（只读一次）。draw() 要用它决定"没有顶点着色器"是丢这一条还是报错。
 // np598: whether DM_SHADER_SKIP is on (read once). draw() uses it to decide whether a missing vertex shader
 //   means "drop this draw" or a hard error.
@@ -4299,6 +4303,7 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                             prepare_read(*im,commands.command);if(desc_memo_recording)desc_memo_images.push_back({it->second.tex,im,it->second.record,it->second.revision});
                             VkDescriptorImageInfo ii{};ii.imageView=it->second.view;ii.sampler=b.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER?it->second.sampler:VK_NULL_HANDLE;ii.imageLayout=VK_IMAGE_LAYOUT_GENERAL;
                             image_infos.push_back(ii);write.pImageInfo=&image_infos.back();img_fast=true;++img_cache_hits;
+                            if(g_winbind_logged<8 && open_pass.serial0 && win_serial_match(open_pass.serial0)){++g_winbind_logged;xbg_logf("【落点】写窗口 serial=%llu 的 draw 绑定纹理 serial=%llu（快路径 stage=%u slot=%u id=%d）",(unsigned long long)open_pass.serial0,(unsigned long long)it->second.tex->serial,ns,b.slot+element,int(handle&0xfffff));}
                             {BufRef &r=img_slot_refs[it->second.view];const void *cur=&recording_slot();
                              for(const void *old_slot:r.slots)if(old_slot!=cur){bool alive=false;for(const Slot &sl:slots)if(&sl==old_slot){alive=sl.pending||sl.recording;break;}
                                  if(!alive){static int n;if(n++<8)xbg_logf("【红】跨槽引用悬空 VkImageView=%p（快路径）登记槽=%p 当前槽=%p serial=%llu",(void*)it->second.view,old_slot,cur,(unsigned long long)slot_serial);}}
@@ -4310,9 +4315,20 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                 if(!img_fast){
                 need(b.source==XBG_SOURCE_TEXTURE || b.source==XBG_SOURCE_IMAGE,"Unsupported image source");unsigned slot=b.slot+element;need(slot<(b.source==XBG_SOURCE_IMAGE?16u:128u),"Image binding slot out of range");uint64_t handle=b.source==XBG_SOURCE_IMAGE?state.img[ns][slot]:state.tex[ns][slot];int id=int(handle&0xfffff);
                 const RegisteredTexture *record=nullptr;
-                if(id==0 || (state.texture_pool.n>0 && id>=state.texture_pool.n))record=&null_texture(b);
-                else{PoolKey pk=pool_key(&state.texture_pool);if(!texture_pool_cache || !(pk==texture_pool_cache_key)){auto pool=textures.find(pk);texture_pool_cache=pool==textures.end()?&legacy_textures:&pool->second;texture_pool_cache_key=pk;}auto tex=texture_pool_cache->find(id);if(tex==texture_pool_cache->end())xbg_fatalf("Unregistered texture descriptor id=%d stage=%u slot=%u",id,ns,slot);record=&tex->second;}
+                PoolKey pk_used=pool_key(&state.texture_pool);
+                // np727j：池键=(描述符内存,off)，而 off 随游戏往池里追加纹理而移动 ⇒ 注册表键停在
+                // 注册时的旧 off，当前键查不到（np727i 诊断 why=2：有界但映射缺失）⇒ 此前绑定
+                // null 纹理、窗口 blit 输出恒定米白/黑（标题之后画面全错的根因）。
+                // 修法：当前键查不到时按 mem 回退扫描（同一条描述符内存=同一个池）；
+                // 越界 id 仍走 null（保持"Missing in-pool IDs still fail"的原语义）。
+                if(id!=0 && textures.find(pk_used)==textures.end()){
+                    for(auto &kv:textures)if(kv.first.first==pk_used.first){static int fb=0;if(fb++<8)xbg_logf("【落点】池键 (mem=%llx,off=%lld) 无注册 → 按 mem 回退 off=%lld（第 %d 次）",(unsigned long long)pk_used.first,(long long)pk_used.second,(long long)kv.first.second,fb);pk_used=kv.first;break;}
+                }
+                if(id==0 || (state.texture_pool.n>0 && id>=state.texture_pool.n)){record=&null_texture(b);
+                    {std::lock_guard<std::mutex> gb(g_null_bound_mu);g_null_bound.insert({pk_used.first,id});}}   // np727k：记下"该 id 在该池被 null 绑定过"——首注时失效 memo
+                else{if(!texture_pool_cache || !(pk_used==texture_pool_cache_key)){auto pool=textures.find(pk_used);texture_pool_cache=pool==textures.end()?&legacy_textures:&pool->second;texture_pool_cache_key=pk_used;}auto tex=texture_pool_cache->find(id);if(tex==texture_pool_cache->end())xbg_fatalf("Unregistered texture descriptor id=%d stage=%u slot=%u",id,ns,slot);record=&tex->second;}
                 const auto &registered=*record;const tex_t &texture=registered.texture;
+                if(g_winbind_logged<16 && open_pass.serial0 && win_serial_match(open_pass.serial0)){++g_winbind_logged;xbg_logf("【落点】写窗口 serial=%llu 的 draw 绑定纹理 serial=%llu（慢路径 stage=%u slot=%u id=%d）",(unsigned long long)open_pass.serial0,(unsigned long long)texture.serial,ns,b.slot+element,int(handle&0xfffff));}
                 if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){need(texture.d.target==10 && texture.mem && texture.L.size,"Invalid buffer texture");
                     TexelResident *res=nullptr;
                     if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER && texel_memo_enabled && !compute){Buffer pv;
@@ -4654,6 +4670,7 @@ void dispatch_op_trace(unsigned op, unsigned size, unsigned depth) {
 extern "C" { volatile unsigned dm_last_cmd_op = 0xffffffffu; volatile unsigned dm_last_cmd_size = 0; }
 void dispatch_set_last(unsigned op, unsigned size) { dm_last_cmd_op = op; dm_last_cmd_size = size; }
 void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instances=1,uint32_t first_instance=0){g_gpu_wrote=true;preflight_cpu_reads();CPU_SCOPE(Draw);++cur_digest.draws;DrawRoot draw_timing_root(&cpu_scope);provenance_draw();
+
     need(state.rt.n>=0 && state.rt.n<=8,"Invalid draw color target count");
     dtrace("1 enter");
     VkShaderModule modules[5]{};for(unsigned i=0;i<5;i++)if(state.shader[i])modules[i]=state.shader[i]->module;
@@ -4772,6 +4789,24 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
         if(p.pass_noload && quad_indices.empty() && !ab_off("noload") && ui_uy==0 && ui_vs==1 && first_draw_covers(p,prim,first,count,indexed,vertex_buffers,ib,index_type)){VkRenderPass keep=p.pass;p.pass=p.pass_noload;begin_pass(p,c);p.pass=keep;++noload_passes;}
         else begin_pass(p,c);
         open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;open_pass.serial0=p.images.n&&p.images.v[0]?p.images.v[0]->source.serial:0;open_pass.depth_attached=state.rt.depth!=nullptr;++perf.passes;}
+    if(g_winbind_logged<64 && open_pass.serial0 && win_serial_match(open_pass.serial0)){   // np727i：写窗口的 draw 绑了哪张纹理（放 pass 切换块之后——窗口 blit pass 只有 1 个 draw，入口处 open_pass 还是上一个 pass）
+        ++g_winbind_logged;
+        auto win_serial_of=[&](uint64_t h,uint64_t *out_pool_n=nullptr,int *out_why=nullptr)->uint64_t{int id=int(h&0xfffff);
+            if(out_pool_n)*out_pool_n=state.texture_pool.n;
+            if(!id||state.texture_pool.n==0||id>=state.texture_pool.n){if(out_why)*out_why=1;return 0;}   // 1=越界/无池
+            auto pit=textures.find(pool_key(&state.texture_pool));
+            if(pit==textures.end()){if(out_why)*out_why=2;return 0;}   // 2=当前池在注册表里没有
+            auto tit=pit->second.find(id);if(tit==pit->second.end()){if(out_why)*out_why=3;return 0;}   // 3=池内有映射表但无此 id
+            if(out_why)*out_why=0;return tit->second.texture.serial;};
+        uint64_t pool_n=0;int why=-1;
+        char l[520];int at=snprintf(l,sizeof l,"落点 pass=%llu pooln=%llu why=",(unsigned long long)open_pass.serial0,(unsigned long long)pool_n);
+        for(unsigned st=0;st<6 && at<int(sizeof l)-48;st++){unsigned nz=0;for(unsigned r=0;r<8;r++)if(state.tex[st][r])nz=r+1;
+            if(nz){at+=snprintf(l+at,sizeof l-at," s%u:",st);
+                for(unsigned r=0;r<nz && at<int(sizeof l)-32;r++){uint64_t h=state.tex[st][r];uint64_t sn=win_serial_of(h,&pool_n,&why);at+=snprintf(l+at,sizeof l-at," %llx/%llu/w%d",(unsigned long long)(h&0xfffff),(unsigned long long)sn,why);}}}
+        xbg_logf("【落点】%s",l);
+        // 独立文件通道（铁律 8）：hilog 16MB 在启动期数秒即回绕，开机期诊断必须落文件。
+        static std::string bind_path;if(bind_path.empty()){std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');bind_path=(cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-bind.txt";}
+        if(FILE *f=fopen(bind_path.c_str(),"a")){fprintf(f,"np727i %s\n",l);fclose(f);}}
     if(state.ds.dt || state.ds.st || state.bounds.enable)open_pass.depth_used=true;
     if(new_run){end_occlusion_query();begin_occlusion_query(c.command,occlusion,occlusion_index);}
     BindCache &bc=bind_cache;if(!bind_cache_enabled || bc.cmd!=c.command || pipeline.transient){bc=BindCache{};bc.cmd=c.command;}
@@ -5707,7 +5742,8 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
            // np712b: skip when nothing was written (see g_gpu_wrote). Clear the flag on emit.
            if(!g_gpu_wrote){++g_barrier_skip;break;}
            g_barrier_site="op28-inpass";full_barrier_in_pass(s.cmd);g_gpu_wrote=false;++g_barrier_emit;break;}
-        case OP_SET_TEX_POOL:{auto a=payload<p_set_pool>(p,n);need(a.pool,"Null texture pool");state.texture_pool=*a.pool;break;}
+        case OP_SET_TEX_POOL:{auto a=payload<p_set_pool>(p,n);need(a.pool,"Null texture pool");state.texture_pool=*a.pool;g_last_tex_pool=*a.pool;   // np727j：记住最近池——某些执行路径（分段/重建后）会把 state 的池丢成空
+            static unsigned pool_switches=0;++pool_switches;if(pool_switches<=8||pool_switches%100==0)xbg_logf("【池】第 %u 次切换纹理池 n=%u mem=%p off=%lld",pool_switches,state.texture_pool.n,state.texture_pool.pool?state.texture_pool.pool->mem:nullptr,(long long)state.texture_pool.off);break;}
         case OP_SET_SAMP_POOL:{auto a=payload<p_set_pool>(p,n);need(a.pool,"Null sampler pool");state.sampler_pool=*a.pool;break;}
         case OP_COPY_B2T:copy_texture_buffer(payload<p_copy_b2t>(p,n),false);break;
         case OP_COPY_T2B:copy_texture_buffer(payload<p_copy_b2t>(p,n),true);break;
@@ -5961,7 +5997,12 @@ extern "C" void xbg_game_set_frame(uint64_t frame){hud::frame.store(frame,std::m
 extern "C" double xbg_game_gpu_ms(uint64_t frame){const hud::Gpu &g=hud::gpu[frame%64];if(g.frame.load(std::memory_order_acquire)!=frame)return -1;return double(g.ns.load(std::memory_order_acquire))/1e6;}
 static void xbg_legacy_pool_add_now(void *p,size_t n){std::lock_guard<std::recursive_mutex> lock(mutex);need(p&&n,"Invalid NVN pool");pools[uintptr_t(p)]=n;cmd_range_lo=0;cmd_range_bytes=0;auto epoch=provenance.pool(uint64_t(p),true);provenance_log("POOL_ADD mem=%p bytes=%zu epoch=%llu",p,n,epoch);}
 static void xbg_legacy_pool_del_now(void *p){std::lock_guard<std::recursive_mutex> lock(mutex);provenance_log("POOL_DEL mem=%p epoch=%llu",p,provenance.epoch(uint64_t(p)));provenance.pool(uint64_t(p),false);{auto pit=pools.find(uintptr_t(p));if(pit!=pools.end())vcache::drop_pool(uintptr_t(p),pit->second);}pools.erase(uintptr_t(p));cmd_range_lo=0;cmd_range_bytes=0;}
-static void xbg_register_texture_now(const dpool_t *p,int id,const tex_t *t,const view_t *v){std::lock_guard<std::recursive_mutex> lock(mutex);need(p&&id>=0&&id<p->n&&t,"Invalid texture registration");auto &slot=textures[pool_key(p)][id];if(register_texture_record(slot,*t,v))++memo_bump[0];}
+static void xbg_register_texture_now(const dpool_t *p,int id,const tex_t *t,const view_t *v){std::lock_guard<std::recursive_mutex> lock(mutex);need(p&&id>=0&&id<p->n&&t,"Invalid texture registration");auto &slot=textures[pool_key(p)][id];
+    const bool first_reg=(slot.revision==0);   // np727k：此前从未注册
+    if(register_texture_record(slot,*t,v)){++memo_bump[0];
+        if(first_reg){bool poisoned=false;{std::lock_guard<std::mutex> gb(g_null_bound_mu);poisoned=g_null_bound.erase({pool_key(p).first,id})>0;}
+            if(poisoned){memo_epoch.fetch_add(1);   // 该 id 曾被 null 绑定并进了描述符 memo ⇒ 全池懒失效，null 绑定就此重建
+                static int fe=0;if(fe++<8)xbg_logf("【池】id=%d 首次注册且曾被 null 绑定 → bump memo_epoch=%llu（窗口 blit 的源就此接上）",id,(unsigned long long)memo_epoch.load());}}}}
 static void xbg_register_sampler_now(const dpool_t *p,int id,const samp_par *s){std::lock_guard<std::recursive_mutex> lock(mutex);need(p&&id>=0&&id<p->n&&s,"Invalid sampler registration");auto &slot=samplers[pool_key(p)][id];if(memcmp(&slot,s,sizeof(*s))){++memo_epoch;++memo_bump[1];}slot=*s;}
 static void xbg_legacy_tex_release_now(tex_t *t){std::lock_guard<std::recursive_mutex> lock(mutex);if(t){auto i=images.find(t->serial);if(i!=images.end()){provenance_image("RELEASE",t,*i->second);retire_object(i->second);++memo_bump[2];}images.erase(t->serial);image_index_dirty=true;++images_epoch;++memo_check_gen;}}
 static void xbg_legacy_prog_release_now(prog_t *p){/* Immutable shader modules are keyed by original control digest, shared safely. */std::lock_guard<std::recursive_mutex> lock(mutex);if(p && p->serial)program_cache.erase(p->serial);}
