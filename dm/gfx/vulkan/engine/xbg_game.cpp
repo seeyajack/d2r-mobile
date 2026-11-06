@@ -5670,10 +5670,7 @@ static void exec_report(uint64_t frame){
     static int altlog=-2;
     if(altlog==-2){const char*e=getenv("DM_FRAME_SKIP_ALT");altlog=(e&&*e=='1')?1:0;}
     if(skipped_ops||planned||altlog){   // ALT 模式下对照帧（planned=0）也必须记，否则无法配对
-        // np729：补「谁被跳」——planned 的 pass 里前 16 个 serial0 原地列在 FRAMESKIP 行尾。
-        //   原行不含 serial，「谁被跳」只能靠 GPASS draws 波动反推（np728 即用此法证实合成趟被跳，
-        //   方法论候选 202 的另一半）。行尾追加不增行数，日志预算不变。
-        // np729: append the first 16 planned serial0s to the FRAMESKIP line (no extra lines, budget unchanged).
+        // np729 分片 B：serbuf 块放回（指纹抽样仍撤下）——二分第二刀。
         char serbuf[320];size_t so=0;serbuf[0]=0;
         for(size_t i=0,n=0;i<segs.size()&&i<flags.size()&&n<16&&so+24<sizeof(serbuf);i++)if(flags[i]){
             int w=snprintf(serbuf+so,sizeof(serbuf)-so,"%s%llu",n?",":"",(unsigned long long)segs[i].ser0);
@@ -5684,20 +5681,6 @@ static void exec_report(uint64_t frame){
             int(altlog&&planned==0),(unsigned long long)submits,serbuf);
     }
     g_fs_tick_planned=planned;g_fs_tick_skippedops=skipped_ops;g_fs_tick_frame=frame;
-    // np729：窗口趟（永不跳）的 UBO 指纹抽样留痕——窗口 blit 的 UV/渐变 uniform 是否在动。
-    //   每 64 次提交采一次（与 DM_PRESENT_PROBE_EVERY 对齐量级）；变化而 2791 内容不变 ⇒
-    //   uniform 在动、塌缩来自游戏语义；不变而内容变 ⇒ 执行侧没看到更新（陈旧）。
-    // np729: sample the never-skipped window pass's folded UBO fingerprint every 64 submits; moving
-    //   fingerprint + static content = game-side collapse, static fingerprint + moving content = stale.
-    for(size_t i=0;i<segs.size()&&i<flags.size();i++)if(is_window_serial(segs[i].ser0)&&segs[i].ubo0_seen&&(submits%64)==1){
-        static uint64_t lastv[8]={},lasts[8]={};static int seen[8]={};
-        int slot=-1;for(int k=0;k<8;k++)if(seen[k]&&lasts[k]==segs[i].ser0){slot=k;break;}
-        if(slot<0)for(int k=0;k<8;k++)if(!seen[k]){slot=k;lasts[k]=segs[i].ser0;break;}
-        if(slot>=0&&(!seen[slot]||lastv[slot]!=segs[i].ubo0))
-            xbg_logf("【跳过】窗口趟 serial=%llu UBO指纹%s submits=%llu frame=%llu val=%016llx",
-                (unsigned long long)segs[i].ser0,seen[slot]?"变化":"首见",(unsigned long long)submits,
-                (unsigned long long)frame,(unsigned long long)segs[i].ubo0);
-        if(slot>=0){lastv[slot]=segs[i].ubo0;seen[slot]=1;}}
     prev_ubo0.clear();for(size_t i=0;i<segs.size();i++)prev_ubo0.push_back(segs[i].ubo0);
     prev_keys.swap(keys);prev_hashes.swap(hashes);
 }
