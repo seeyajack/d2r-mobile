@@ -5795,23 +5795,25 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
             // this frame skipped it (then look for who cleared it). One increment per bind, dumped only on the
             // fatal path.
             if(a.index<16)++bind_hits[a.stage][a.index];
-            // np730：窗口趟绑定内容带出——RT 为窗口缓冲时，UBO 头 64B 指纹 + 前 4 个 float，
-            //   指纹变化才打（每 (stage,slot) 每值一行），全局限流 160 行。判据：blit 的 UV/渐变
-            //   uniform 到底更新没有、更新成什么——np729 已证窗口输出与源 2791 内容完全脱钩。
-            // np730: dump window-pass UBO head fingerprint + first floats on change (capped 160 lines).
+            // np731：窗口趟绑定内容带出——RT 为窗口缓冲时，把着色器实际访问的全部成员偏移
+            //   （SPIR-V 反汇编：set0 binding0 UBO 1392B 成员 0/16/144/160/176/192/1360/1376，
+            //   与 binding6 64KB storage 指向同一缓冲）的浮点值打出来，整段指纹变化才打。
+            //   np730 教训：只看头 64B 时矩阵区（144+）从未被看到，且 (stage,index) 键让
+            //   UBO 与 storage 互相覆盖。
+            // np731: dump all shader-accessed member offsets of the window-pass buffer on change.
             if(a.addr>=4096&&a.size&&state.rt.color[0]&&win_serial_match(state.rt.color[0]->serial)){
                 static int wblog_n=0;
                 if(wblog_n<160){
-                    size_t take=size_t(a.size>64?64:a.size);
+                    size_t take=size_t(a.size>1408?1408:a.size);
                     uint64_t fp=1469598103934665603ull;const uint8_t *qb=reinterpret_cast<const uint8_t*>(uintptr_t(a.addr));
                     for(size_t i=0;i<take;i++){fp^=qb[i];fp*=1099511628211ull;}
-                    static std::map<uint32_t,uint64_t> wfp;uint32_t wk=(uint32_t)(a.stage*16+a.index);
-                    auto it=wfp.find(wk);
-                    if(it==wfp.end()||it->second!=fp){wfp[wk]=fp;++wblog_n;
-                        float fv[4]={0,0,0,0};memcpy(fv,qb,take<16?take:16);
-                        xbg_logf("【窗口绑定】UBO stage=%d slot=%d addr=%#llx size=%llu fp=%016llx f=[%.3f %.3f %.3f %.3f]",
-                            a.stage,a.index,(unsigned long long)a.addr,(unsigned long long)a.size,
-                            (unsigned long long)fp,fv[0],fv[1],fv[2],fv[3]);}}}
+                    static std::map<uint64_t,uint64_t> wfp;auto it=wfp.find(a.addr);
+                    if(it==wfp.end()||it->second!=fp){wfp[a.addr]=fp;++wblog_n;
+                        float fv[352];memcpy(fv,qb,take<1408?take:1408);
+                        xbg_logf("【窗口绑定】addr=%#llx m0=[%.3f %.3f %.3f %.3f] m1=[%.3f %.3f %.3f %.3f] m144=[%.2f %.2f %.2f %.2f] m160=[%.2f %.2f %.2f %.2f] m176=[%.2f %.2f %.2f %.2f] m192=[%.2f %.2f %.2f %.2f] m1360=[%.3f %.3f %.3f %.3f] m1376=[%.3f %.3f %.3f %.3f]",
+                            (unsigned long long)a.addr,fv[0],fv[1],fv[2],fv[3],fv[4],fv[5],fv[6],fv[7],
+                            fv[36],fv[37],fv[38],fv[39],fv[40],fv[41],fv[42],fv[43],fv[44],fv[45],fv[46],fv[47],fv[48],fv[49],fv[50],fv[51],
+                            fv[340],fv[341],fv[342],fv[343],fv[344],fv[345],fv[346],fv[347]);}}}
             // np541：与 UBUPDATE 成对取证——看游戏绑定给着色器的缓冲区地址是不是也在未映射区。
             // np541: pairs with UBUPDATE -- check whether the buffer addresses bound to the shaders are also unmapped.
             {static int nb;if(nb<16){++nb;void *pg=(void*)(uintptr_t)(a.addr&~0xfffull);unsigned char mv=0;
@@ -5820,7 +5822,24 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
         case OP_BIND_TEX:case OP_BIND_SAMP:case OP_BIND_IMG:{auto a=variable_payload<p_bind_handles>(p,n);need(a.stage>=0 && a.stage<6 && a.first>=0 && a.n>=0 && a.n<=32 && a.first+a.n<=(h.op==OP_BIND_IMG?16:128) && n>=offsetof(p_bind_handles,h)+size_t(a.n)*8,"Invalid descriptor binding record");uint64_t *dst=h.op==OP_BIND_IMG?state.img[a.stage]:h.op==OP_BIND_SAMP?state.samp[a.stage]:state.tex[a.stage];memcpy(dst+a.first,a.h,a.n*8);++tex_gen[a.stage];break;}
         case OP_STENCIL:{auto a=payload<p_stencil>(p,n);need(a.face>=0 && a.face<=3 && a.which>=0 && a.which<=2,"Invalid stencil state");for(unsigned i=0;i<2;i++)if(a.face&(1<<i)){if(a.which==0)state.stencil_compare[i]=a.value_mask;else if(a.which==1)state.stencil_write[i]=a.mask;else state.stencil_ref[i]=a.ref;}break;}
         case OP_POLY_OFFSET:{auto a=payload<p_poly_offset>(p,n);state.bias[0]=a.factor;state.bias[1]=a.units;state.bias[2]=a.clamp;break;}
-        case OP_DRAW:{auto a=payload<p_draw>(p,n);draw(a.prim,a.first,a.count,nullptr);break;}
+        case OP_DRAW:{auto a=payload<p_draw>(p,n);
+            // np732：FS 采样瞬间的槽表——RT=窗口时打（槽表指纹变化才打，限 200 行）。
+            //   np731 定性：FS 无 varying，采样坐标全靠 UBO(binding4)——FS 绘制瞬间 binding4
+            //   到底绑没绑上，一锤定音。
+            // np732: dump the live UBO/tex slot table at window-pass draws (change-only, capped).
+            if(state.rt.color[0]&&win_serial_match(state.rt.color[0]->serial)){
+                static uint64_t lastfp=0;static int wdraw_n=0;
+                if(wdraw_n<200){
+                    uint64_t fp=1469598103934665603ull;
+                    for(int st=0;st<6;st++)for(int k=0;k<4;k++){fp^=(state.ub[st][k].address^(state.ub[st][k].size<<3))*1099511628211ull;fp*=1099511628211ull;}
+                    for(int st=0;st<6;st++)for(int k=0;k<3;k++){fp^=state.tex[st][k]*1099511628211ull;fp*=1099511628211ull;}
+                    if(fp!=lastfp){lastfp=fp;++wdraw_n;
+                        char line[600];int at=snprintf(line,sizeof line,"【窗口绘制】UBO:");
+                        for(int st=0;st<6&&at<int(sizeof line)-40;st++)for(int k=0;k<4&&at<int(sizeof line)-40;k++)if(state.ub[st][k].size)at+=snprintf(line+at,sizeof line-at," s%d.%d=%#llx/%llu",st,k,(unsigned long long)state.ub[st][k].address,(unsigned long long)state.ub[st][k].size);
+                        at+=snprintf(line+at,sizeof line-at," TEX:");
+                        for(int st=0;st<6&&at<int(sizeof line)-24;st++)for(int k=0;k<3&&at<int(sizeof line)-24;k++)if(state.tex[st][k])at+=snprintf(line+at,sizeof line-at," s%d.%d=%#llx",st,k,(unsigned long long)state.tex[st][k]);
+                        xbg_logf("%s",line);}}}
+            draw(a.prim,a.first,a.count,nullptr);break;}
         case OP_DRAW_IDX:{auto a=payload<p_draw_idx>(p,n);
             // np662：ibuf==0 = DrawArraysInstanced 的"非索引"约定（hle_nvn.c 同日新增）——
             // 走非索引实例化路径，不碰索引缓冲。first 借 base_vertex 携带（p_draw_idx 无 first 字段）。
