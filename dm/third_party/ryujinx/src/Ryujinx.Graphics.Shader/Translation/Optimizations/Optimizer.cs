@@ -320,6 +320,21 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             Operand lhs = operation.GetSource(0);
             Operand rhs = operation.GetSource(1);
 
+            // np736: Ryujinx's emitter also produces the commutative form
+            //   v = (1.0 / gl_FragCoord.w) * (x * gl_FragCoord.w)
+            // (BotW's blit shaders do exactly this). The original pass only checked
+            // attrMul * reciprocal, so the pair survived into SPIR-V. Combined with
+            // the pCoords IsNan guard in CodeGen/Spirv/Instructions.cs, an anomalous
+            // gl_FragCoord.w then collapses the sample coordinate to (0,0).
+            // Multiplication is commutative, so normalise the operand order here.
+            // All the strict checks below still apply after the swap, so a genuine
+            // non-perspective multiply/divide cannot be folded by accident.
+            if (lhs.AsgOp is Operation lhsOp && lhsOp.Inst == (Instruction.FP32 | Instruction.Divide) &&
+                rhs.AsgOp is Operation rhsOp && rhsOp.Inst == (Instruction.FP32 | Instruction.Multiply))
+            {
+                (lhs, rhs) = (rhs, lhs);
+            }
+
             // Check LHS of the main multiplication operation. We expect an input being multiplied by gl_FragCoord.w.
             if (lhs.AsgOp is not Operation attrMulOp || attrMulOp.Inst != (Instruction.FP32 | Instruction.Multiply))
             {
