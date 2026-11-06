@@ -144,6 +144,15 @@ static uint64_t g_winfill_serial=0;
 //   always one apart, so comparing against a single value never matches (measured). Match against the set.
 static uint64_t g_win_serials[8];static int g_win_n=0;
 static bool win_serial_match(uint64_t s){for(int i=0;i<g_win_n;i++)if(g_win_serials[i]==s)return true;return false;}
+// np745：**被上屏趟采样的源纹理**（合成缓冲 2791 这类）。它的生产 pass 一旦被帧间复用跳掉，
+//   3D 层就整帧不进合成缓冲，窗口只剩 UI 层（实测：米白 + 少量暗像素）——而 blit 本身完全正常。
+//   通用判据（换游戏仍成立）：**上屏趟读谁，谁的生产 pass 就永不跳**。集合由窗口 draw 的绑定处登记。
+static uint64_t g_present_src[8];static int g_present_src_n=0;
+static void note_present_src(uint64_t s){if(s && g_present_src_n<8){for(int i=0;i<g_present_src_n;i++)if(g_present_src[i]==s)return;g_present_src[g_present_src_n++]=s;}}
+static bool is_present_src(uint64_t s){for(int i=0;i<g_present_src_n;i++)if(g_present_src[i]==s)return true;return false;}
+// np751：2791 合成趟采样过的**最大面积**源纹理（=3D 场景缓冲候选，np749/750 里的 s6/s8）运行期登记。
+//   serial 每轮漂移（13505/13521/13502），env 写死读不中 ⇒ 登记后由 present_probe_other_serials 同刻读回均值/gw。
+static uint64_t g_probe_dyn_serial=0;static unsigned g_probe_dyn_w=0,g_probe_dyn_h=0;static int g_probe_dyn_logged=0;
 namespace {
 xbg_game_config cfg{};
 std::recursive_mutex mutex;
@@ -4310,7 +4319,9 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                             prepare_read(*im,commands.command);if(desc_memo_recording)desc_memo_images.push_back({it->second.tex,im,it->second.record,it->second.revision});
                             VkDescriptorImageInfo ii{};ii.imageView=it->second.view;ii.sampler=b.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER?it->second.sampler:VK_NULL_HANDLE;ii.imageLayout=VK_IMAGE_LAYOUT_GENERAL;
                             image_infos.push_back(ii);write.pImageInfo=&image_infos.back();img_fast=true;++img_cache_hits;
-                            if(g_winbind_logged<8 && open_pass.serial0 && win_serial_match(open_pass.serial0)){++g_winbind_logged;xbg_logf("【落点】写窗口 serial=%llu 的 draw 绑定纹理 serial=%llu（快路径 stage=%u slot=%u id=%d）",(unsigned long long)open_pass.serial0,(unsigned long long)it->second.tex->serial,ns,b.slot+element,int(handle&0xfffff));}
+                            // np743：原条件用 open_pass.serial0（p.images.v[0]->source.serial）在真机上是 0 ⇒ 这条日志永远不打。
+// 改用已经在工作的 state.rt.color[0]（【窗口绑定】同源），把"窗口 draw 到底绑了哪个纹理"打出来。
+if(g_winbind_logged<8 && state.rt.color[0] && win_serial_match(state.rt.color[0]->serial)){++g_winbind_logged;xbg_logf("【落点】写窗口 serial=%llu 的 draw 绑定纹理 serial=%llu（快路径 stage=%u slot=%u id=%d rt=%llu）",(unsigned long long)state.rt.color[0]->serial,(unsigned long long)it->second.tex->serial,ns,b.slot+element,int(handle&0xfffff),(unsigned long long)state.rt.color[0]->serial);note_present_src(it->second.tex->serial);}
                             {BufRef &r=img_slot_refs[it->second.view];const void *cur=&recording_slot();
                              for(const void *old_slot:r.slots)if(old_slot!=cur){bool alive=false;for(const Slot &sl:slots)if(&sl==old_slot){alive=sl.pending||sl.recording;break;}
                                  if(!alive){static int n;if(n++<8)xbg_logf("【红】跨槽引用悬空 VkImageView=%p（快路径）登记槽=%p 当前槽=%p serial=%llu",(void*)it->second.view,old_slot,cur,(unsigned long long)slot_serial);}}
@@ -4335,7 +4346,7 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                     {std::lock_guard<std::mutex> gb(g_null_bound_mu);g_null_bound.insert({pk_used.first,id});}}   // np727k：记下"该 id 在该池被 null 绑定过"——首注时失效 memo
                 else{if(!texture_pool_cache || !(pk_used==texture_pool_cache_key)){auto pool=textures.find(pk_used);texture_pool_cache=pool==textures.end()?&legacy_textures:&pool->second;texture_pool_cache_key=pk_used;}auto tex=texture_pool_cache->find(id);if(tex==texture_pool_cache->end())xbg_fatalf("Unregistered texture descriptor id=%d stage=%u slot=%u",id,ns,slot);record=&tex->second;}
                 const auto &registered=*record;const tex_t &texture=registered.texture;
-                if(g_winbind_logged<16 && open_pass.serial0 && win_serial_match(open_pass.serial0)){++g_winbind_logged;xbg_logf("【落点】写窗口 serial=%llu 的 draw 绑定纹理 serial=%llu（慢路径 stage=%u slot=%u id=%d）",(unsigned long long)open_pass.serial0,(unsigned long long)texture.serial,ns,b.slot+element,int(handle&0xfffff));}
+                if(g_winbind_logged<16 && state.rt.color[0] && win_serial_match(state.rt.color[0]->serial)){++g_winbind_logged;xbg_logf("【落点】写窗口 serial=%llu 的 draw 绑定纹理 serial=%llu（慢路径 stage=%u slot=%u id=%d rt=%llu）",(unsigned long long)state.rt.color[0]->serial,(unsigned long long)texture.serial,ns,b.slot+element,int(handle&0xfffff),(unsigned long long)state.rt.color[0]->serial);note_present_src(texture.serial);}
                 if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){need(texture.d.target==10 && texture.mem && texture.L.size,"Invalid buffer texture");
                     TexelResident *res=nullptr;
                     if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER && texel_memo_enabled && !compute){Buffer pv;
@@ -4359,6 +4370,38 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                         else if(b.flags&3){VkFormatProperties fp{};vkGetPhysicalDeviceFormatProperties(cfg.physical,viewed,&fp);bool listed=storage_without_format_listed(viewed) && (fp.optimalTilingFeatures&VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT);
                             if((b.flags&1) && !(listed && cfg.enabled_core.shaderStorageImageWriteWithoutFormat))xbg_fatalf("Image format %d lacks formatless-write support without VK_KHR_format_feature_flags2 (shader=%s listedWithStorageImage=%d shaderStorageImageWriteWithoutFormat=%u)",int(viewed),shader.key.c_str(),int(listed),unsigned(cfg.enabled_core.shaderStorageImageWriteWithoutFormat));
                             if((b.flags&2) && !(listed && cfg.enabled_core.shaderStorageImageReadWithoutFormat))xbg_fatalf("Image format %d lacks formatless-read support without VK_KHR_format_feature_flags2 (shader=%s listedWithStorageImage=%d shaderStorageImageReadWithoutFormat=%u)",int(viewed),shader.key.c_str(),int(listed),unsigned(cfg.enabled_core.shaderStorageImageReadWithoutFormat));}im.gpu_written=true,provenance_write(im,__LINE__);im.last_write=++write_seq;}
+                    // np744：窗口 pass 采样绑定的实际 image/view/layout —— 判「采样恒常量」到底是
+                    // descriptor 没写对、layout 不对，还是 view 指错。只打窗口 RT，限 6 行。
+                    // np745：窗口 RT **以及合成缓冲 2791 的 RT** 都打——后者回答"3D 层（13633）
+                    //   有没有被合成进 2791"。3D pass 实测 1600x900/28993 draws，而 2791 的合成趟只有 1 draw。
+                    if(state.rt.color[0] && (win_serial_match(state.rt.color[0]->serial) || state.rt.color[0]->serial==2791)){
+                        static int n3=0; if(n3<10){++n3;
+                            xbg_logf("【窗口图像】rt=%llu serial=%llu id=%d img=%p view=%p levels=%u layout=%d fmt=%#x",
+                                (unsigned long long)state.rt.color[0]->serial,(unsigned long long)texture.serial,id,
+                                (void*)im.image,(void*)ii.imageView,im.levels,int(im.layout),im.source.d.format);}}
+                    // np748：2791 合成趟到底该采谁。把该趟 shader key + 声明的 slot + 全部纹理槽
+                    //   （id/serial/尺寸）一次打出来 ⇒ 区分「slot 错位」与「游戏确实绑了 8x8」。
+                    if(state.rt.color[0] && state.rt.color[0]->serial==2791){
+                        // np749：按「源 serial」去重，每个不同的源只打一次 —— 2791 的 pass 有
+                        //   draws=1/2/3/4/12 多种形态，限流打最早 3 次会只看到背景层。
+                        static uint64_t seen_src[16]; static int nseen=0; bool dup=false;
+                        for(int i=0;i<nseen;i++) if(seen_src[i]==texture.serial) dup=true;
+                        if(!dup && nseen<16){ seen_src[nseen++]=texture.serial;
+                            char tb[1024]; int at=0; tb[0]=0;
+                            for(int s=0;s<16;s++){uint64_t h=state.tex[ns][s]; if(!h)continue; int sid=int(h&0xfffff);
+                                uint64_t ser=0; unsigned tw=0,th=0; int gw=-1;
+                                auto lt=legacy_textures.find(sid);
+                                if(lt!=legacy_textures.end()){ser=lt->second.texture.serial;tw=lt->second.texture.d.width;th=lt->second.texture.d.height;
+                                    // np751：每槽 gw——bind 时刻该 image 是否从未被写过（gw 只增不减，绑时 0 ⇒ 至少绑时未写）。
+                                    auto gi=images.find(ser);if(gi!=images.end()&&gi->second)gw=int(gi->second->gpu_written);
+                                    // np751：合成大源登记（np749 的 s6/s8=1600x900 是全表最大面积 ⇒ 稳选中 3D 缓冲）。
+                                    if(ser && uint64_t(tw)*th>uint64_t(g_probe_dyn_w)*g_probe_dyn_h){g_probe_dyn_serial=ser;g_probe_dyn_w=tw;g_probe_dyn_h=th;
+                                        if(!g_probe_dyn_logged){g_probe_dyn_logged=1;xbg_logf("【2791合成·大源】登记 serial=%llu %ux%u gw=%d（旁证将同刻读回均值）",(unsigned long long)ser,tw,th,gw);}}}
+                                if(at<int(sizeof tb)-96) at+=snprintf(tb+at,sizeof tb-at," s%d:id%d/ser%llu/%ux%u/gw%d",s,sid,(unsigned long long)ser,tw,th,gw);}
+                            xbg_logf("【2791合成】shader=%s st=%u bind=%u slot=%u 本槽=%ux%u gw=%d lw=%llu 槽:%s",
+                                shader.key.c_str(),ns,b.binding,b.slot+element,
+                                im.source.d.width,im.source.d.height,int(im.gpu_written),
+                                (unsigned long long)im.last_write,tb);}}
                     image_infos.push_back(ii);write.pImageInfo=&image_infos.back();
                     if(img_cacheable){img_cache.emplace(ikey,ImgEntry{&texture,&im,ii.imageView,ii.sampler,record,record->revision});++img_cache_misses;}
                     {BufRef &r=img_slot_refs[ii.imageView];const void *cur=&recording_slot();
@@ -5643,7 +5686,9 @@ static void plan(int n,const uint64_t *handles){
     for(size_t i=0;i<segs.size();i++){
         keys.push_back(segs[i].key);hashes.push_back(segs[i].hash);
         uint8_t skip=0;
-        if(is_window_serial(segs[i].ser0)){flags.push_back(0);continue;}   // 末尾合成/窗口趟：永不跳
+        // np745：窗口趟**以及被窗口采样的源**（合成缓冲）都永不跳。后者是真正的 3D 层入口：
+        //   跳掉它 ⇒ 整帧 3D 不进合成缓冲 ⇒ 窗口只剩 UI 层（米白）。
+        if(is_window_serial(segs[i].ser0) || is_present_src(segs[i].ser0)){flags.push_back(0);continue;}   // 窗口趟 / 上屏源：永不跳
         if(segs[i].uploads){flags.push_back(0);continue;}                   // 含资源上传的 pass：永不跳
         if(!prev_keys.empty()&&segs[i].draws){          // 没有绘制类 op 的 pass 跳不跳都一样，别计入
             for(size_t j=0;j<prev_keys.size();j++)
@@ -6527,36 +6572,41 @@ static void present_probe_report(const Buffer &buf,uint32_t w,uint32_t h,uint32_
 // np673: is anything in the *other* render targets? Distinguishes "the whole render produces nothing" from
 //   "only the final composite into the window is missing". DM_PRESENT_PROBE_SERIALS=222,6224 reads those
 //   images back at the same instant and logs stats only.
+static void present_probe_read_one(uint64_t serial){
+    auto it=images.find(serial);
+    if(it==images.end() || !it->second){xbg_logf("[上屏] 旁证 serial=%llu 不存在",(unsigned long long)serial);return;}
+    Image &oi=*it->second;
+    if(oi.samples!=VK_SAMPLE_COUNT_1_BIT || oi.aspects!=VK_IMAGE_ASPECT_COLOR_BIT || oi.bpp<4 || !oi.width || !oi.height){
+        xbg_logf("[上屏] 旁证 serial=%llu 跳过（samples=%d aspects=%d bpp=%u %ux%u）",(unsigned long long)serial,int(oi.samples),int(oi.aspects),oi.bpp,oi.width,oi.height);return;}
+    Buffer b=readback_buffer(size_t(oi.width)*oi.height*4);
+    {Commands q; VkImageLayout saved=oi.layout;oi.transition(q.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+     VkBufferImageCopy r{};r.bufferOffset=b.offset;r.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};r.imageExtent={oi.width,oi.height,1};
+     vkCmdCopyImageToBuffer(q.command,oi.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,b.buffer,1,&r);
+     VkBufferMemoryBarrier h{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};h.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;h.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
+     h.srcQueueFamilyIndex=h.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;h.buffer=b.buffer;h.offset=b.offset;h.size=b.size;
+     vkCmdPipelineBarrier(q.command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&h,0,nullptr);
+     oi.transition(q.command,saved);q.finish();}
+    gpu_sync(perf.sync_readback);b.invalidate();
+    const uint8_t *pp=static_cast<const uint8_t*>(b.mapped)+b.offset;uint64_t npx=uint64_t(oi.width)*oi.height,nz=0;uint64_t sum[3]={0,0,0};
+    for(uint64_t i=0;i<npx;i++){const uint8_t *q=pp+i*4;for(int k=0;k<3;k++)sum[k]+=q[k];if(q[0]|q[1]|q[2])++nz;}
+    // np751：行尾补 gw/lw——bind 时刻的 gw 只证明「绑时未写过」，probe 时刻的 gw 才回答「到底有没有被写过」。
+    xbg_logf("[上屏] 旁证 serial=%llu %ux%u 均值 %.1f/%.1f/%.1f 非黑 %llu/%llu = %.1f%% 布局=%d gw=%d lw=%llu",
+        (unsigned long long)serial,oi.width,oi.height,double(sum[0])/double(npx),double(sum[1])/double(npx),double(sum[2])/double(npx),
+        (unsigned long long)nz,(unsigned long long)npx,100.0*double(nz)/double(npx),int(oi.layout),int(oi.gpu_written),(unsigned long long)oi.last_write);
+}
 static void present_probe_other_serials(){
     static int inited=0;
-    if(!inited){inited=1;const char *e0=getenv("DM_PRESENT_PROBE_SERIALS");if(!e0||!*e0){inited=2;return;}xbg_logf("[上屏] 旁证：同刻读回 serial 列表 = %s",e0);}
-    if(inited!=1)return;
-    const char *e=getenv("DM_PRESENT_PROBE_SERIALS");if(!e)return;
-    std::string list(e);size_t pos=0;int n=0;
-    while(pos<=list.size() && n<6){
-        size_t comma=list.find(',',pos);if(comma==std::string::npos)comma=list.size();
-        std::string tok=list.substr(pos,comma-pos);pos=comma+1;if(tok.empty())continue;++n;
-        uint64_t serial=strtoull(tok.c_str(),nullptr,10);
-        auto it=images.find(serial);
-        if(it==images.end() || !it->second){xbg_logf("[上屏] 旁证 serial=%llu 不存在",(unsigned long long)serial);continue;}
-        Image &oi=*it->second;
-        if(oi.samples!=VK_SAMPLE_COUNT_1_BIT || oi.aspects!=VK_IMAGE_ASPECT_COLOR_BIT || oi.bpp<4 || !oi.width || !oi.height){
-            xbg_logf("[上屏] 旁证 serial=%llu 跳过（samples=%d aspects=%d bpp=%u %ux%u）",(unsigned long long)serial,int(oi.samples),int(oi.aspects),oi.bpp,oi.width,oi.height);continue;}
-        Buffer b=readback_buffer(size_t(oi.width)*oi.height*4);
-        {Commands q; VkImageLayout saved=oi.layout;oi.transition(q.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-         VkBufferImageCopy r{};r.bufferOffset=b.offset;r.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};r.imageExtent={oi.width,oi.height,1};
-         vkCmdCopyImageToBuffer(q.command,oi.image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,b.buffer,1,&r);
-         VkBufferMemoryBarrier h{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};h.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;h.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
-         h.srcQueueFamilyIndex=h.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;h.buffer=b.buffer;h.offset=b.offset;h.size=b.size;
-         vkCmdPipelineBarrier(q.command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&h,0,nullptr);
-         oi.transition(q.command,saved);q.finish();}
-        gpu_sync(perf.sync_readback);b.invalidate();
-        const uint8_t *pp=static_cast<const uint8_t*>(b.mapped)+b.offset;uint64_t npx=uint64_t(oi.width)*oi.height,nz=0;uint64_t sum[3]={0,0,0};
-        for(uint64_t i=0;i<npx;i++){const uint8_t *q=pp+i*4;for(int k=0;k<3;k++)sum[k]+=q[k];if(q[0]|q[1]|q[2])++nz;}
-        xbg_logf("[上屏] 旁证 serial=%llu %ux%u 均值 %.1f/%.1f/%.1f 非黑 %llu/%llu = %.1f%% 布局=%d",
-            (unsigned long long)serial,oi.width,oi.height,double(sum[0])/double(npx),double(sum[1])/double(npx),double(sum[2])/double(npx),
-            (unsigned long long)nz,(unsigned long long)npx,100.0*double(nz)/double(npx),int(oi.layout));
-    }
+    if(!inited){inited=1;const char *e0=getenv("DM_PRESENT_PROBE_SERIALS");if(!e0||!*e0)inited=2;else xbg_logf("[上屏] 旁证：同刻读回 serial 列表 = %s",e0);}
+    if(inited==1){
+        const char *e=getenv("DM_PRESENT_PROBE_SERIALS");if(e){
+        std::string list(e);size_t pos=0;int n=0;
+        while(pos<=list.size() && n<6){
+            size_t comma=list.find(',',pos);if(comma==std::string::npos)comma=list.size();
+            std::string tok=list.substr(pos,comma-pos);pos=comma+1;if(tok.empty())continue;++n;
+            present_probe_read_one(strtoull(tok.c_str(),nullptr,10));}}}
+    // np751：合成大源（3D 场景缓冲候选）——serial 每轮漂移，env 写死读不中，运行期登记后同刻读回。
+    //   独立于 env 列表：即使 DM_PRESENT_PROBE_SERIALS 未设也读。
+    if(g_probe_dyn_serial)present_probe_read_one(g_probe_dyn_serial);
 }
 // np715：**逐帧像素 hash**（阶段 1b 的上限读数）。目的只有一个：量出「连续多少帧上屏像素逐字节相同」
 //   = 阶段 2 可跳帧的**上限**。读回带一次 GPU 同步 ⇒ 这一轮只判画面、不看 fps（会明显更慢）。

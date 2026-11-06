@@ -422,7 +422,15 @@ struct Index {
                 const base: string = nm.substring(0, nm.length - 8);
                 try {
                   const buf = rm.getRawFileContentSync('shaders_extra/' + nm);
-                  const w: number = dms2.writeFileGz(ctx.filesDir + '/' + base, buf.buffer);
+                  // np739：诊断版 SPIR-V（A1/A2/A3/A4 换态只换 rawfile 里的 *_override.mark.gz）。
+                  // spv_override() 读 shader 目录父目录下的 spv-override/<key>.spv，必须落进子目录；
+                  // hdc 写不进应用沙箱，所以只能随 HAP 的 rawfile 由应用自己投递。
+                  let dest: string = ctx.filesDir + '/' + base;
+                  if (base.endsWith('_override')) {
+                    ensureDir(ctx.filesDir + '/spv-override');
+                    dest = ctx.filesDir + '/spv-override/ecb4242efaf4042b.spv';
+                  }
+                  const w: number = dms2.writeFileGz(dest, buf.buffer);
                   trace(ctx, '标记已投 files/' + base + '（' + w + ' 字节）');
                 } catch (err) {
                   trace(ctx, '标记投递失败：' + nm + ' → ' + (err as Error).message);
@@ -624,7 +632,7 @@ struct Index {
             // np726 性能定谳 A/B（铁律 37：两次独立整跑，env 只差 DM_FRAME_SKIP 一行）：
             //   剥掉全部重诊断（np723a 口径），只留 DM_FRAME_TIME=1 作帧时主仪器；
             //   对照轮 = 本行原文；跳过轮 = 追加 DM_FRAME_SKIP=1（跑完改回）。
-            let envs = 'DM_NVN_SYNC=1 DM_FS=1 DM_WATCH_STALL=90 DM_NVN_API_MAJOR=53 DM_SHADER_SKIP=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000 DM_FRAME_TIME=1 DM_FRAME_SKIP=1 DM_FRAME_SKIP_ALT=1 DM_PRESENT_PROBE=1600 DM_PRESENT_PROBE_SERIALS=1,2,2791 DM_PRESENT_PROBE_EVERY=32 DM_PAD_AUTO=25/3/130/2500';   // np729：①合成缓冲 2791 加进读回 ②EVERY=32 周期读回（~1.5fps 下约 21s 一个 tick，米白/黑交替两相都能采到）③ALT=1 同轮跳/不跳自动交替 ④保留 A 按住 2500ms 连打（推进新状态）
+            let envs = 'DM_NVN_SYNC=1 DM_FS=1 DM_WATCH_STALL=90 DM_NVN_API_MAJOR=53 DM_SHADER_SKIP=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000 DM_FRAME_TIME=1 DM_FRAME_SKIP=1 DM_FRAME_SKIP_ALT=1 DM_PRESENT_PROBE_EVERY_MS=30000 DM_PRESENT_PROBE_SERIALS=1,2,2791 DM_PRESENT_PROBE_EVERY=32 DM_PAD_AUTO=25/3/130/2500';   // np751：PROBE=1600（present 计数 ≈22 分钟）从未触发过 ⇒ 换时间触发 EVERY_MS=30000（16 次、30s 一个，拿 [上屏] 源图 窗口像素）。np729：①合成缓冲 2791 加进读回 ②EVERY=32 周期读回 ③ALT=1 同轮跳/不跳自动交替 ④A 按住 2500ms 连打
             // romfs 双路（d1 瘦包）：
             //   A. HAP 里带 romfs/（fat 包，首次装机用）→ 照旧**每次点都重新解出**。
             //      ⚠ 不能用 pathExists 判"解没解过"：本机 fs.listFileSync 对不存在的路径也不抛
