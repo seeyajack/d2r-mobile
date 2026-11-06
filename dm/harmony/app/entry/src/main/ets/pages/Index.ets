@@ -337,12 +337,14 @@ struct Index {
             } catch {
               trace(ctx, 'out/ 列不出');
             }
-            // 着色器投递（门票③，np346）：rawfile 里是 <key>.xgs.gz（全量 728MB→约 215MB，
-            // 装机一分钟级；未压缩 1.1GB 包在无线链路上装不动）。dirFileCount 够 17000 就跳过；
-            // 解出走 writeFileGz（原生 libdeflate 解 gzip + mkdirs 修复后的落盘）。
+            // np755：**覆盖目录**取代换代清除（np754b 实测 27k 次 unlinkSync 在沙箱 fs 上 = 30 分钟级，
+            //   进程冻死）。修正包解到 files/shaders-override/（新目录、无同名冲突、零 unlink），
+            //   引擎侧 DM_SHADER_OVERRIDE_DIR 里的同名 .xgs 优先于 shaders/。换包 = 新增文件，秒级。
             const dir = this.runtimeDir.trim().length > 0 ? this.runtimeDir.trim() : ctx.filesDir;
             const sdir = ctx.filesDir + '/shaders';
+            const odir = ctx.filesDir + '/shaders-override';
             ensureDir(sdir);
+            ensureDir(odir);
             const gzNames: string[] = rawList(rm, 'shaders').filter((s: string): boolean => s.endsWith('.gz'));
             if (gzNames.length > 0) {
               const have: number = dms2.dirFileCount(sdir);
@@ -440,22 +442,32 @@ struct Index {
               if (extra.length > 0) {
                 let ok = 0;
                 let skip = 0;
+                let fresh = 0;
                 const t0: number = Date.now();
                 for (const nm of extra) {
-                  const dst = sdir + '/' + nm.substring(0, nm.length - 3);
+                  const dst = odir + '/' + nm.substring(0, nm.length - 3);
                   try {
-                    if (fs.accessSync(dst)) { skip++; continue; }
-                  } catch (e) { }
-                  try {
+                    // np755：解到**覆盖目录**（引擎先读它）。np754 的尺寸比对保留——非绑定表类的内容
+                    //   变更（尺寸不同）仍能自愈；绑定表类（同尺寸）由"新目录首解必然写入"保证。
                     const buf = rm.getRawFileContentSync('shaders_extra/' + nm);
+                    let isize = -1;
+                    {
+                      const u8 = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+                      if (u8.length > 4) { isize = (u8[u8.length - 4]) | (u8[u8.length - 3] << 8) | (u8[u8.length - 2] << 16) | (u8[u8.length - 1] << 24); }
+                    }
+                    let stale = true;
+                    try { const st = fs.statSync(dst); stale = isize < 0 || Number(st.size) !== isize; } catch (e) { }
+                    if (!stale) { skip++; continue; }
+                    try { if (fs.accessSync(dst)) { fresh++; } } catch (e) { }
                     const w: number = dms2.writeFileGz(dst, buf.buffer);
                     if (w >= 0) ok++; else trace(ctx, '增量包解出失败(' + w + ')：' + nm);
                   } catch (err) {
                     trace(ctx, '增量包读取失败：' + nm + ' → ' + (err as Error).message);
                   }
                 }
+                if (fresh > 0) { trace(ctx, 'np754: 尺寸不一致重解 ' + fresh + ' 个'); }
                 trace(ctx, 'shaders_extra: 新解 ' + ok + ' 个、已存在跳过 ' + skip + ' 个（共 ' + extra.length +
-                      '），耗时 ' + (Date.now() - t0) + ' ms → ' + sdir);
+                      '），耗时 ' + (Date.now() - t0) + ' ms → ' + odir);
               }
             }
             const log = ctx.filesDir + '/host.log';
@@ -632,7 +644,7 @@ struct Index {
             // np726 性能定谳 A/B（铁律 37：两次独立整跑，env 只差 DM_FRAME_SKIP 一行）：
             //   剥掉全部重诊断（np723a 口径），只留 DM_FRAME_TIME=1 作帧时主仪器；
             //   对照轮 = 本行原文；跳过轮 = 追加 DM_FRAME_SKIP=1（跑完改回）。
-            let envs = 'DM_NVN_SYNC=1 DM_FS=1 DM_WATCH_STALL=90 DM_NVN_API_MAJOR=53 DM_SHADER_SKIP=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000 DM_FRAME_TIME=1 DM_FRAME_SKIP=1 DM_FRAME_SKIP_ALT=1 DM_PRESENT_PROBE_EVERY_MS=30000 DM_PRESENT_PROBE_SERIALS=1,2,2791 DM_PRESENT_PROBE_EVERY=32 DM_PAD_AUTO=25/3/130/2500';   // np751：PROBE=1600（present 计数 ≈22 分钟）从未触发过 ⇒ 换时间触发 EVERY_MS=30000（16 次、30s 一个，拿 [上屏] 源图 窗口像素）。np729：①合成缓冲 2791 加进读回 ②EVERY=32 周期读回 ③ALT=1 同轮跳/不跳自动交替 ④A 按住 2500ms 连打
+            let envs = 'DM_NVN_SYNC=1 DM_FS=1 DM_WATCH_STALL=90 DM_NVN_API_MAJOR=53 DM_SHADER_SKIP=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000 DM_FRAME_TIME=1 DM_FRAME_SKIP=1 DM_FRAME_SKIP_ALT=1 DM_PRESENT_PROBE_EVERY_MS=10000 DM_PRESENT_PROBE_SERIALS=2791 DM_PRESENT_PROBE_EVERY=32 DM_PAD_AUTO=25/3/130/2500 DM_SHADER_OVERRIDE_DIR=/data/storage/el2/base/haps/entry/files/shaders-override';   // np755：+覆盖目录（shaders-override 同名 .xgs 优先，修正包通道）。np753：EVERY_MS 10000；np752：SERIALS=2791+动态表；np751：ALT=1 + A 按住 2500ms
             // romfs 双路（d1 瘦包）：
             //   A. HAP 里带 romfs/（fat 包，首次装机用）→ 照旧**每次点都重新解出**。
             //      ⚠ 不能用 pathExists 判"解没解过"：本机 fs.listFileSync 对不存在的路径也不抛
