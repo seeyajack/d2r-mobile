@@ -5569,15 +5569,28 @@ static void plan_walk(const uint8_t *pc,unsigned depth,uint64_t &steps){
                 s.hash^=uint64_t(hd.op)^(uint64_t(hd.size)<<32);s.hash*=1099511628211ull;
                 ++s.draws;
             }
-            // 内容判据（照 Metal 的相机 UBO 检查，nvn_mtl.m:5527）：本 pass **第一个** BIND_UBO 的头部
+            // 内容判据（照 Metal 的相机 UBO 检查，nvn_mtl.m:5527）：本 pass 第一个 BIND_UBO 的头部
             // 256 B 做指纹。相机/视图矩阵就在这里，矩阵变了 = 画面会变 ⇒ 该 pass 不许跳。
-            // 只取第一个、只取 256 B：全量 UBO 内容里有时间/帧号一类无关值，会把判据做成"永远不匹配"（np715g 学费）。
+            // 只取头部、不取全量：全量 UBO 内容里有时间/帧号一类无关值，会把判据做成"永远不匹配"（np715g 学费）。
             // 资源上传（贴图/缓冲被改写）⇒ 这个 pass 的画面依赖新数据，**一律不跳**。
             // np718a 学费：相机 UBO 没变、结构也没变，但画面对照帧给出 16c095d0（跳过帧停在旧的
             // 83a6875a）⇒ 变化来自上传过的资源，不是矩阵。上传本身是 M 类、照常执行，所以必须显式挡住。
+            // np729（C1）收紧：指纹从「第一个 BIND_UBO 头 256 B」扩为「**每个** BIND_UBO 各头 256 B，
+            //   折叠进同一 64 位指纹（后续项 xor 自乘串行吸收）」。学费：np728 定谳——合成趟（产出
+            //   上屏内容）在 ~10% 的帧被跳成 0 draws；渐变/UV 参数只要住在后续 UBO、或第一个 UBO 的
+            //   256 B 之外，旧指纹漏检 ⇒ 旧内容留在 2791 上、窗口 blit 忠实地把陈旧帧上屏。
+            //   开销：只加在 plan()（提交前），execute 零新增；DM_FRAME_SKIP=0 时整段不执行。
+            //   边界：仍不覆盖 UBO 头 256 B 之外的深部变化——那由周期全画兜底（every）与 np729 的
+            //   2791 读回归因。
+            // np729 (C1): the content gate widens from "first BIND_UBO head 256 B" to "**each**
+            //   BIND_UBO's head 256 B, folded into the same 64-bit fingerprint". np728 showed the
+            //   composite pass (produces the on-screen content) was skipped into 0 draws on ~10% of
+            //   frames; a fade/UV change living in a later UBO (or past the first UBO's 256 B) escapes
+            //   the old fingerprint, so stale content stays on 2791 and the window blit faithfully
+            //   presents it. Cost lands in plan() only; never runs with DM_FRAME_SKIP=0.
             if(hd.op==OP_COPY_B2T||hd.op==OP_COPY_T2T||hd.op==OP_COPY_T2B||hd.op==OP_CLEAR_TEX
                ||hd.op==OP_UPDATE_UB||hd.op==OP_COPY_B2B||hd.op==OP_COPY_STRIDE||hd.op==OP_COPY_IMAGE_STRIDE)s.uploads=1;
-            if(hd.op==OP_BIND_UBO && !s.ubo0_seen){
+            if(hd.op==OP_BIND_UBO){
                 p_bind_buf b{};size_t cp=hd.size-8;if(cp>sizeof(b))cp=sizeof(b);
                 memcpy(&b,pc+8,cp);
                 if(b.addr>=4096&&b.size){
@@ -5585,7 +5598,8 @@ static void plan_walk(const uint8_t *pc,unsigned depth,uint64_t &steps){
                     uint64_t hh=1469598103934665603ull;
                     const uint8_t *q=reinterpret_cast<const uint8_t*>(uintptr_t(b.addr));
                     for(size_t i=0;i<take;i++){hh^=q[i];hh*=1099511628211ull;}
-                    s.ubo0=hh;s.ubo0_seen=1;
+                    if(!s.ubo0_seen){s.ubo0=hh;s.ubo0_seen=1;}
+                    else{s.ubo0^=hh*1099511628211ull;s.ubo0*=1099511628211ull;}
                 }
             }
             ++s.ops;
@@ -6607,6 +6621,18 @@ static void xbg_present_texture_now(const win_t *window,const tex_t *texture){st
              present_probe_other_serials();
              if(probe_n>0 && stats.presents.load()>=uint64_t(probe_n))probe_done=true;}
          }
+         // np729（C2b）：周期旁证读回 DM_PRESENT_PROBE_EVERY=N——每 N 次 present 把 _SERIALS 列表
+         //   读回并打统计行（不打 ASCII）。开口 2 需要时间线：单次读回无法归因「米白/黑交替」是
+         //   游戏自画还是快照/跳帧陈旧。本路径自带 Commands/readback/gpu_sync，与 probe_buf 无关，
+         //   可独立调用。日志预算：3 serial × 每 64 present = 每 64 帧 3 行，2000 帧 ≈ 100 行（安全）。
+         //   默认关（未设 env 不读回）。
+         // np729 (C2b): periodic serials readback; DM_PRESENT_PROBE_EVERY=N reads the _SERIALS list
+         //   every N presents and logs stats only (no ASCII). Self-contained (own Commands/readback/
+         //   gpu_sync), independent of probe_buf. Default off.
+         {static int probe_every=-1;
+          if(probe_every<0){const char *e=getenv("DM_PRESENT_PROBE_EVERY");probe_every=e?atoi(e):0;
+              if(probe_every>0)xbg_logf("[上屏] 周期旁证 DM_PRESENT_PROBE_EVERY=%d（每 %d 次 present 读回 _SERIALS）",probe_every,probe_every);}
+          if(probe_every>0 && stats.presents.load()%uint64_t(probe_every)==0)present_probe_other_serials();}
          g_present_serial_hint=texture->serial;g_winfill_serial=texture->serial;
          {bool known=false;for(int i=0;i<g_win_n;i++)if(g_win_serials[i]==texture->serial)known=true;
           if(!known && g_win_n<8){g_win_serials[g_win_n++]=texture->serial;xbg_logf("[上屏] 登记窗口缓冲 serial=%llu（共 %d 个）",(unsigned long long)texture->serial,g_win_n);}
