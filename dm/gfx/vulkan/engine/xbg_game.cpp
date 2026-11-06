@@ -5605,6 +5605,27 @@ static void plan_walk(const uint8_t *pc,unsigned depth,uint64_t &steps){
                     else{s.ubo0^=hh*1099511628211ull;s.ubo0*=1099511628211ull;}
                 }
             }
+            // np730：顶点缓冲内容指纹——渐变/UV 常走 vertex buffer（CPU 直写映射内存，绕过
+            //   UPDATE_UB 与 UBO 指纹；np729 验收：合成趟仍被跳 384+ 次、0-draws 656 帧）。
+            //   折进同一内容累加器（s.ubo0），与 UBO 头指纹共用比较通道。
+            // np730: fold vertex-buffer head content into the same fingerprint; np729 showed the
+            //   composite pass still skipped 384+ times with UBO fingerprints matching -- the gradient
+            //   lives in vertex data written directly by the game into mapped memory.
+            if(hd.op==OP_BIND_VBUF){
+                p_bind_vbuf b{};size_t cp=hd.size-8;if(cp>sizeof(b))cp=sizeof(b);
+                memcpy(&b,pc+8,cp);
+                for(int k=0;k<b.n&&k<16;k++){
+                    uint64_t va=b.r[k].address,vs=b.r[k].size;
+                    if(va>=4096&&vs){
+                        size_t take=size_t(vs>256?256:vs);
+                        uint64_t hh=1469598103934665603ull;
+                        const uint8_t *q=reinterpret_cast<const uint8_t*>(uintptr_t(va));
+                        for(size_t i=0;i<take;i++){hh^=q[i];hh*=1099511628211ull;}
+                        if(!s.ubo0_seen){s.ubo0=hh;s.ubo0_seen=1;}
+                        else{s.ubo0^=hh*1099511628211ull;s.ubo0*=1099511628211ull;}
+                    }
+                }
+            }
             ++s.ops;
         }
         pc+=hd.size;
@@ -5744,7 +5765,25 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
         case OP_BIND_STATE:{auto a=payload<p_bind_state>(p,n);switch(a.kind){case 0:{blend_st b;memcpy(&b,a.bytes,sizeof(b));state.blend[b.target]=b;break;}case 1:memcpy(&state.color,a.bytes,sizeof(state.color));break;case 2:memcpy(&state.mask,a.bytes,sizeof(state.mask));break;case 3:memcpy(&state.ms,a.bytes,sizeof(state.ms));break;case 4:memcpy(&state.poly,a.bytes,sizeof(state.poly));break;case 5:memcpy(&state.ds,a.bytes,sizeof(state.ds));break;default:xbg_fatalf("Unknown NVN state object %d",a.kind);}break;}
         case OP_BIND_VATTR:{auto a=variable_payload<p_bind_vattr>(p,n);need(a.first==0 && a.n>=0 && a.n<=16 && n>=offsetof(p_bind_vattr,st)+size_t(a.n)*4,"Invalid vertex attribute record");need(xbg_vertex_attributes_replace(state.attrib,reinterpret_cast<const uint32_t*>(a.st),a.n)==0,"Invalid vertex attribute replacement");break;}
         case OP_BIND_VSTREAM:{auto a=variable_payload<p_bind_vstream>(p,n);need(a.first>=0 && a.n>=0 && a.first+a.n<=16 && n>=offsetof(p_bind_vstream,st)+size_t(a.n)*sizeof(vs_st),"Invalid vertex stream record");memcpy(state.stream+a.first,a.st,a.n*sizeof(vs_st));break;}
-        case OP_BIND_VBUF:{auto a=variable_payload<p_bind_vbuf>(p,n);need(a.first>=0 && a.n>=0 && a.first+a.n<=16 && n>=offsetof(p_bind_vbuf,r)+size_t(a.n)*sizeof(NVNbufferRange),"Invalid vertex buffer record");memcpy(state.vb+a.first,a.r,a.n*sizeof(NVNbufferRange));break;}
+        case OP_BIND_VBUF:{auto a=variable_payload<p_bind_vbuf>(p,n);need(a.first>=0 && a.n>=0 && a.first+a.n<=16 && n>=offsetof(p_bind_vbuf,r)+size_t(a.n)*sizeof(NVNbufferRange),"Invalid vertex buffer record");memcpy(state.vb+a.first,a.r,a.n*sizeof(NVNbufferRange));
+            // np730：窗口趟顶点缓冲带出（同 UBO 判据；限流 80 行）——顶点位置/UV 若走 vertex
+            //   buffer，塌缩在这里直接可见（矩形四角坐标塌成同一点 = 输出单色）。
+            if(state.rt.color[0]&&win_serial_match(state.rt.color[0]->serial)){
+                static int wvlog_n=0;
+                if(wvlog_n<80){
+                    for(int k=0;k<a.n&&k<16;k++){
+                        uint64_t va=a.r[k].address,vs=a.r[k].size;
+                        if(va<4096||!vs)continue;
+                        size_t take=size_t(vs>64?64:vs);
+                        uint64_t fp=1469598103934665603ull;const uint8_t *qb=reinterpret_cast<const uint8_t*>(uintptr_t(va));
+                        for(size_t i=0;i<take;i++){fp^=qb[i];fp*=1099511628211ull;}
+                        static std::map<uint64_t,uint64_t> wvfp;auto it=wvfp.find(va);
+                        if(it==wvfp.end()||it->second!=fp){wvfp[va]=fp;++wvlog_n;
+                            float fv[4]={0,0,0,0};memcpy(fv,qb,take<16?take:16);
+                            xbg_logf("【窗口绑定】VBUF addr=%#llx size=%llu fp=%016llx f=[%.3f %.3f %.3f %.3f]",
+                                (unsigned long long)va,(unsigned long long)vs,(unsigned long long)fp,fv[0],fv[1],fv[2],fv[3]);
+                            if(wvlog_n>=80)break;}}}}
+            break;}
         case OP_BIND_UBO:case OP_BIND_SSBO:{auto a=payload<p_bind_buf>(p,n);need(a.stage>=0 && a.stage<6 && a.index>=0 && a.index<16,"Invalid shader buffer slot");
             // np603：**每个 (阶段,槽) 被绑过多少次**。着色器清单里写着"要 slot 2"，而客体侧 slot 2 是空的，
             // 这时必须分清两件事：① 游戏从头到尾就没绑过这个槽（那多半是导出器给的槽号不对，或这条 shader
@@ -5756,6 +5795,23 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
             // this frame skipped it (then look for who cleared it). One increment per bind, dumped only on the
             // fatal path.
             if(a.index<16)++bind_hits[a.stage][a.index];
+            // np730：窗口趟绑定内容带出——RT 为窗口缓冲时，UBO 头 64B 指纹 + 前 4 个 float，
+            //   指纹变化才打（每 (stage,slot) 每值一行），全局限流 160 行。判据：blit 的 UV/渐变
+            //   uniform 到底更新没有、更新成什么——np729 已证窗口输出与源 2791 内容完全脱钩。
+            // np730: dump window-pass UBO head fingerprint + first floats on change (capped 160 lines).
+            if(a.addr>=4096&&a.size&&state.rt.color[0]&&win_serial_match(state.rt.color[0]->serial)){
+                static int wblog_n=0;
+                if(wblog_n<160){
+                    size_t take=size_t(a.size>64?64:a.size);
+                    uint64_t fp=1469598103934665603ull;const uint8_t *qb=reinterpret_cast<const uint8_t*>(uintptr_t(a.addr));
+                    for(size_t i=0;i<take;i++){fp^=qb[i];fp*=1099511628211ull;}
+                    static std::map<uint32_t,uint64_t> wfp;uint32_t wk=(uint32_t)(a.stage*16+a.index);
+                    auto it=wfp.find(wk);
+                    if(it==wfp.end()||it->second!=fp){wfp[wk]=fp;++wblog_n;
+                        float fv[4]={0,0,0,0};memcpy(fv,qb,take<16?take:16);
+                        xbg_logf("【窗口绑定】UBO stage=%d slot=%d addr=%#llx size=%llu fp=%016llx f=[%.3f %.3f %.3f %.3f]",
+                            a.stage,a.index,(unsigned long long)a.addr,(unsigned long long)a.size,
+                            (unsigned long long)fp,fv[0],fv[1],fv[2],fv[3]);}}}
             // np541：与 UBUPDATE 成对取证——看游戏绑定给着色器的缓冲区地址是不是也在未映射区。
             // np541: pairs with UBUPDATE -- check whether the buffer addresses bound to the shaders are also unmapped.
             {static int nb;if(nb<16){++nb;void *pg=(void*)(uintptr_t)(a.addr&~0xfffull);unsigned char mv=0;
