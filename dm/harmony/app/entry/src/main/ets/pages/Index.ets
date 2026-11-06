@@ -624,7 +624,7 @@ struct Index {
             // np726 性能定谳 A/B（铁律 37：两次独立整跑，env 只差 DM_FRAME_SKIP 一行）：
             //   剥掉全部重诊断（np723a 口径），只留 DM_FRAME_TIME=1 作帧时主仪器；
             //   对照轮 = 本行原文；跳过轮 = 追加 DM_FRAME_SKIP=1（跑完改回）。
-            let envs = 'DM_NVN_SYNC=1 DM_FS=1 DM_WATCH_STALL=90 DM_NVN_API_MAJOR=53 DM_SHADER_SKIP=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000 DM_FRAME_TIME=1 DM_FRAME_SKIP=1 DM_FRAME_SKIP_ALT=1 DM_PRESENT_PROBE=1600 DM_PRESENT_PROBE_SERIALS=1,2,2791 DM_PRESENT_PROBE_EVERY=64 DM_PAD_AUTO=25/3/130/2500';   // np729：①合成缓冲 2791 加进读回 ②DM_PRESENT_PROBE_EVERY=64 周期读回（时间线，归因米白是游戏自画还是快照/跳帧陈旧）③ALT=1 同轮跳/不跳自动交替 ④保留 A 按住 2500ms 连打（推进新状态）
+            let envs = 'DM_NVN_SYNC=1 DM_FS=1 DM_WATCH_STALL=90 DM_NVN_API_MAJOR=53 DM_SHADER_SKIP=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000 DM_FRAME_TIME=1 DM_FRAME_SKIP=1 DM_FRAME_SKIP_ALT=1 DM_PRESENT_PROBE=1600 DM_PRESENT_PROBE_SERIALS=1,2,2791 DM_PRESENT_PROBE_EVERY=32 DM_PAD_AUTO=25/3/130/2500';   // np729：①合成缓冲 2791 加进读回 ②EVERY=32 周期读回（~1.5fps 下约 21s 一个 tick，米白/黑交替两相都能采到）③ALT=1 同轮跳/不跳自动交替 ④保留 A 按住 2500ms 连打（推进新状态）
             // romfs 双路（d1 瘦包）：
             //   A. HAP 里带 romfs/（fat 包，首次装机用）→ 照旧**每次点都重新解出**。
             //      ⚠ 不能用 pathExists 判"解没解过"：本机 fs.listFileSync 对不存在的路径也不抛

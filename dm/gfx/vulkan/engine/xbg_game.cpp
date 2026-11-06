@@ -5491,6 +5491,9 @@ template<class T>T variable_payload(const uint8_t *p,size_t n){T out{};memcpy(&o
 // 安全设计：① 只按**整 pass** 决定（跳就跳全，绝不半跳）；② 执行期逐 pass 复核身份键，
 //   对不上立刻停跳本提交（防止 walk 与 execute 的遍历顺序分叉导致跳错 pass）；
 //   ③ 默认关；④ 结果侧用 `[上屏] 源图 hash` 验收（跳过轮必须仍是同一 hash）。
+// np729：present 侧周期旁证 tick 头读这三个（exec_report 写、present 流程读）；缺省 0 = 无跳帧信息。
+// np729: the present-side periodic-serials tick header reads these (written by exec_report); 0 = no skip info.
+uint64_t g_fs_tick_planned=0,g_fs_tick_skippedops=0;static uint64_t g_fs_tick_frame=0;
 namespace frameskip{
 static int mode=-1;
 static std::vector<uint64_t> keys,hashes;                  // 本提交：每个 pass 的身份键 / 结构摘要
@@ -5666,11 +5669,35 @@ static void exec_report(uint64_t frame){
     ++submits;
     static int altlog=-2;
     if(altlog==-2){const char*e=getenv("DM_FRAME_SKIP_ALT");altlog=(e&&*e=='1')?1:0;}
-    if(skipped_ops||planned||altlog)   // ALT 模式下对照帧（planned=0）也必须记，否则无法配对
-        xbg_logf("FRAMESKIP frame=%llu presents=%llu passes=%zu planned=%llu skipped_ops=%llu armed=%d desync=%llu ctrl=%d 累计=%llu",
+    if(skipped_ops||planned||altlog){   // ALT 模式下对照帧（planned=0）也必须记，否则无法配对
+        // np729：补「谁被跳」——planned 的 pass 里前 16 个 serial0 原地列在 FRAMESKIP 行尾。
+        //   原行不含 serial，「谁被跳」只能靠 GPASS draws 波动反推（np728 即用此法证实合成趟被跳，
+        //   方法论候选 202 的另一半）。行尾追加不增行数，日志预算不变。
+        // np729: append the first 16 planned serial0s to the FRAMESKIP line (no extra lines, budget unchanged).
+        char serbuf[320];size_t so=0;serbuf[0]=0;
+        for(size_t i=0,n=0;i<segs.size()&&i<flags.size()&&n<16&&so+24<sizeof(serbuf);i++)if(flags[i]){
+            int w=snprintf(serbuf+so,sizeof(serbuf)-so,"%s%llu",n?",":"",(unsigned long long)segs[i].ser0);
+            if(w>0){so+=(size_t)w;++n;}else break;}
+        xbg_logf("FRAMESKIP frame=%llu presents=%llu passes=%zu planned=%llu skipped_ops=%llu armed=%d desync=%llu ctrl=%d 累计=%llu 跳过serial[%s]",
             (unsigned long long)frame,(unsigned long long)stats.presents.load(),segs.size(),
             (unsigned long long)planned,(unsigned long long)skipped_ops,int(armed),(unsigned long long)desync,
-            int(altlog&&planned==0),(unsigned long long)submits);
+            int(altlog&&planned==0),(unsigned long long)submits,serbuf);
+    }
+    g_fs_tick_planned=planned;g_fs_tick_skippedops=skipped_ops;g_fs_tick_frame=frame;
+    // np729：窗口趟（永不跳）的 UBO 指纹抽样留痕——窗口 blit 的 UV/渐变 uniform 是否在动。
+    //   每 64 次提交采一次（与 DM_PRESENT_PROBE_EVERY 对齐量级）；变化而 2791 内容不变 ⇒
+    //   uniform 在动、塌缩来自游戏语义；不变而内容变 ⇒ 执行侧没看到更新（陈旧）。
+    // np729: sample the never-skipped window pass's folded UBO fingerprint every 64 submits; moving
+    //   fingerprint + static content = game-side collapse, static fingerprint + moving content = stale.
+    for(size_t i=0;i<segs.size()&&i<flags.size();i++)if(is_window_serial(segs[i].ser0)&&segs[i].ubo0_seen&&(submits%64)==1){
+        static uint64_t lastv[8]={},lasts[8]={};static int seen[8]={};
+        int slot=-1;for(int k=0;k<8;k++)if(seen[k]&&lasts[k]==segs[i].ser0){slot=k;break;}
+        if(slot<0)for(int k=0;k<8;k++)if(!seen[k]){slot=k;lasts[k]=segs[i].ser0;break;}
+        if(slot>=0&&(!seen[slot]||lastv[slot]!=segs[i].ubo0))
+            xbg_logf("【跳过】窗口趟 serial=%llu UBO指纹%s submits=%llu frame=%llu val=%016llx",
+                (unsigned long long)segs[i].ser0,seen[slot]?"变化":"首见",(unsigned long long)submits,
+                (unsigned long long)frame,(unsigned long long)segs[i].ubo0);
+        if(slot>=0){lastv[slot]=segs[i].ubo0;seen[slot]=1;}}
     prev_ubo0.clear();for(size_t i=0;i<segs.size();i++)prev_ubo0.push_back(segs[i].ubo0);
     prev_keys.swap(keys);prev_hashes.swap(hashes);
 }
@@ -6632,7 +6659,14 @@ static void xbg_present_texture_now(const win_t *window,const tex_t *texture){st
          {static int probe_every=-1;
           if(probe_every<0){const char *e=getenv("DM_PRESENT_PROBE_EVERY");probe_every=e?atoi(e):0;
               if(probe_every>0)xbg_logf("[上屏] 周期旁证 DM_PRESENT_PROBE_EVERY=%d（每 %d 次 present 读回 _SERIALS）",probe_every,probe_every);}
-          if(probe_every>0 && stats.presents.load()%uint64_t(probe_every)==0)present_probe_other_serials();}
+          if(probe_every>0 && stats.presents.load()%uint64_t(probe_every)==0){
+              // np729：tick 头带上跳帧状态（g_fs_tick_* = 最近一次 exec_report 写入）——旁证统计行
+              //   自身不带相位，没有这行就无法把「米白分布」归因到跳/不跳相位。
+              // np729: tick header carries the last submission's skip state for phase attribution.
+              xbg_logf("[上屏] 旁证 tick present=%llu frame=%llu 跳帧 planned=%llu skipped_ops=%llu",
+                  (unsigned long long)stats.presents.load(),(unsigned long long)g_fs_tick_frame,
+                  (unsigned long long)g_fs_tick_planned,(unsigned long long)g_fs_tick_skippedops);
+              present_probe_other_serials();}}
          g_present_serial_hint=texture->serial;g_winfill_serial=texture->serial;
          {bool known=false;for(int i=0;i<g_win_n;i++)if(g_win_serials[i]==texture->serial)known=true;
           if(!known && g_win_n<8){g_win_serials[g_win_n++]=texture->serial;xbg_logf("[上屏] 登记窗口缓冲 serial=%llu（共 %d 个）",(unsigned long long)texture->serial,g_win_n);}
