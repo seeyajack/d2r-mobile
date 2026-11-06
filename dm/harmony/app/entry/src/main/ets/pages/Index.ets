@@ -624,7 +624,7 @@ struct Index {
             // np726 性能定谳 A/B（铁律 37：两次独立整跑，env 只差 DM_FRAME_SKIP 一行）：
             //   剥掉全部重诊断（np723a 口径），只留 DM_FRAME_TIME=1 作帧时主仪器；
             //   对照轮 = 本行原文；跳过轮 = 追加 DM_FRAME_SKIP=1（跑完改回）。
-            let envs = 'DM_NVN_SYNC=1 DM_FS=1 DM_WATCH_STALL=90 DM_NVN_API_MAJOR=53 DM_SHADER_SKIP=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000 DM_FRAME_TIME=1 DM_FRAME_SKIP=1 DM_PRESENT_PROBE=1600 DM_PRESENT_PROBE_SERIALS=1,2 DM_PAD_AUTO=25/3/130';   // np727m：源图探针验 mem-fallback 修复（present 1600 读回+ASCII）;   // np727h：A 键全程连打（+30s 起每 3s 共 120 次）——标题窗口一出现就接住进菜单
+            let envs = 'DM_NVN_SYNC=1 DM_FS=1 DM_WATCH_STALL=90 DM_NVN_API_MAJOR=53 DM_SHADER_SKIP=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000 DM_FRAME_TIME=1 DM_FRAME_SKIP=1 DM_PRESENT_PROBE=1600 DM_PRESENT_PROBE_SERIALS=1,2 DM_PAD_AUTO=25/3/130/2500';   // np728：hold_ms=2500——A 按住 2.5s 跨 ≥3 个游戏读（~1.2fps 时 150ms 脉冲只跨 1 帧，锁存一次性交付即清 ⇒ 单帧脉冲进不去去抖）；   // np727h：A 键全程连打（+30s 起每 3s 共 120 次）——标题窗口一出现就接住进菜单
             // romfs 双路（d1 瘦包）：
             //   A. HAP 里带 romfs/（fat 包，首次装机用）→ 照旧**每次点都重新解出**。
             //      ⚠ 不能用 pathExists 判"解没解过"：本机 fs.listFileSync 对不存在的路径也不抛
@@ -681,21 +681,32 @@ struct Index {
             //   count, presses A). Deterministically pushes through "press any button"/menu waits
             //   (same idea as np702/np705: make the event, don't wait for luck). A 150 ms press edge is
             //   latched by hle_hid's g_press_latch and seen by the guest. Absent from envs = off.
-            const padAuto = /(?:^|\s)DM_PAD_AUTO=(\d+)\/(\d+)\/(\d+)(?:\s|$)/.exec(envs);
+            // np728：hold_ms 第 4 参（缺省 150 保持 np727d 行为）。游戏 ~1.2fps 时两次取手柄相隔 ~830ms，
+            //   150ms 脉冲在两次读之间完成 ⇒ 按下沿锁存只给 1 帧即清，游戏看到「按下 1 帧+抬起」；
+            //   真手柄 150ms = 9 帧 @60fps 持续按住。若标题「按任意键」有去抖（连续 N 帧），单帧脉冲永远进不去。
+            //   hold_ms=2500 + 间隔 3s ⇒ A 跨 ≥3 个连续游戏读。
+            // np728: hold_ms is the 4th parameter (default 150 keeps np727d behavior). At ~1.2 fps the
+            //   guest reads the pad ~830 ms apart, so a 150 ms pulse completes between two reads: the
+            //   press-edge latch delivers exactly one frame then clears ("pressed 1 frame + released").
+            //   A real pad held 150 ms spans 9 frames at 60 fps. If the title screen debounces
+            //   (N consecutive frames required), a single-frame pulse never gets in.
+            //   hold_ms=2500 + 3 s interval ⇒ A spans >=3 consecutive guest reads.
+            const padAuto = /(?:^|\s)DM_PAD_AUTO=(\d+)\/(\d+)\/(\d+)(?:\/(\d+))?(?:\s|$)/.exec(envs);
             if (padAuto) {
               const padStart = Number(padAuto[1]) * 1000, padIv = Number(padAuto[2]) * 1000, padN = Number(padAuto[3]);
+              const padHold = padAuto[4] ? Number(padAuto[4]) : 150;   // 缺省 150ms = np727d 原行为 | default 150 ms = np727d behavior
               let padK = 0;
               let padTimer: number = -1;
               const padDelay = setTimeout(() => {
                 padTimer = setInterval(() => {
                   padK++;
                   dms2.setPad(HostBtn.A, 0, 0, 0, 0);
-                  trace(ctx, 'pad-auto 第 ' + padK + '/' + padN + ' 次按下 A');
-                  setTimeout(() => { dms2.setPad(0, 0, 0, 0, 0); }, 150);
+                  trace(ctx, 'pad-auto 第 ' + padK + '/' + padN + ' 次按下 A（按住 ' + padHold + 'ms）');
+                  setTimeout(() => { dms2.setPad(0, 0, 0, 0, 0); }, padHold);
                   if (padK >= padN) clearInterval(padTimer);
                 }, padIv);
               }, padStart);
-              trace(ctx, 'pad-auto 已排程：' + padAuto[1] + 's 起，每 ' + padAuto[2] + 's 按 A，共 ' + padAuto[3] + ' 次（timer=' + padDelay + '）');
+              trace(ctx, 'pad-auto 已排程：' + padAuto[1] + 's 起，每 ' + padAuto[2] + 's 按 A（按住 ' + padHold + 'ms），共 ' + padAuto[3] + ' 次（timer=' + padDelay + '）');
             }
             // np710：起客后焦点归还手柄区。用户实测（真手柄）：起客前按键能导航 UI，起客后
             //   按键变成 UI 焦点遍历、A 键把焦点送进「运行目录」输入框——XComponent 建游戏
