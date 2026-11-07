@@ -344,17 +344,28 @@ struct Index {
             const sdir = ctx.filesDir + '/shaders';
             const odir = ctx.filesDir + '/shaders-override-b';
             ensureDir(sdir);
-            // np789：一次性沙箱清理——本会话误留的 SPIR-V 覆盖（spv-override/*.spv，重装不删=铁律23）
-            //   与诊断 marker（gfx-no-descmemo/gfx-no-imgcache，关缓存饿死提交路径）。删完即恢复正常基线。
+            // np792：启动清理 v2——清空**两条**覆盖通道，让覆盖态每启动收敛到「随包态」（铁律 23 结构性根治）。
+            //   np790 定谳：186 词手写 ecb4242e 同时污染 spv-override/*.spv **与** shaders-override-b/*.xgs
+            //   （np789 日志 ovr=1 346 键含 186 词版；skip-if-exists 使换包失效）⇒ 只清其一不够。
+            //   先清后解：本函数稍后把 rawfile shaders_extra 重解入 odir ⇒ 清空零损失；改 odir 目录名时
+            //   本块用同一 odir 变量自动跟随（勿另写死路径）。
             try {
+              let nSpv = 0; let nOvr = 0; let nMk = 0;
               const odir2 = ctx.filesDir + '/spv-override';
-              ensureDir(odir2);
-              for (const f of fs.listFileSync(odir2)) {
-                if (f.endsWith('.spv')) { try { fs.unlinkSync(odir2 + '/' + f); } catch (e) { } }
-              }
+              try {
+                for (const f of fs.listFileSync(odir2)) {
+                  try { fs.unlinkSync(odir2 + '/' + f); nSpv++; } catch (e) { }
+                }
+              } catch (e) { }
+              try {
+                for (const f of fs.listFileSync(odir)) {
+                  try { fs.unlinkSync(odir + '/' + f); nOvr++; } catch (e) { }
+                }
+              } catch (e) { }
               for (const mk of ['gfx-no-descmemo', 'gfx-no-imgcache']) {
-                try { fs.unlinkSync(sdir + '/' + mk); } catch (e) { }
+                try { fs.unlinkSync(sdir + '/' + mk); nMk++; } catch (e) { }
               }
+              trace(ctx, 'np792 清理: spv=' + nSpv + ' ovr=' + nOvr + ' mk=' + nMk);
             } catch (err) { }
             ensureDir(odir);
             const gzNames: string[] = rawList(rm, 'shaders').filter((s: string): boolean => s.endsWith('.gz'));
