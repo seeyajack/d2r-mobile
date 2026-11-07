@@ -344,28 +344,36 @@ struct Index {
             const sdir = ctx.filesDir + '/shaders';
             const odir = ctx.filesDir + '/shaders-override-b';
             ensureDir(sdir);
-            // np792：启动清理 v2——清空**两条**覆盖通道，让覆盖态每启动收敛到「随包态」（铁律 23 结构性根治）。
-            //   np790 定谳：186 词手写 ecb4242e 同时污染 spv-override/*.spv **与** shaders-override-b/*.xgs
-            //   （np789 日志 ovr=1 346 键含 186 词版；skip-if-exists 使换包失效）⇒ 只清其一不够。
-            //   先清后解：本函数稍后把 rawfile shaders_extra 重解入 odir ⇒ 清空零损失；改 odir 目录名时
-            //   本块用同一 odir 变量自动跟随（勿另写死路径）。
+            // np803：清理 v3——**对账式 + rename 熔断**（np792 学费：主线程 unlinkSync 15,732 个=20s ⇒
+            //   THREAD_BLOCK_6S 看门狗杀进程=闪退，铁律 47 unlink 红线）。随包名单之外的才算残留；
+            //   残留 >200 个 ⇒ rename 整目录（单次元数据操作，瞬时；旧目录留沙箱成孤儿=永不 purge 精神）；
+            //   ≤200 个 ⇒ 逐个 unlink。正常随包态 = 0 删除 0 rename 零开销。spv-override 非空即整目录 rename。
             try {
-              let nSpv = 0; let nOvr = 0; let nMk = 0;
+              let nRen = 0; let nKill = 0; let nMk = 0;
               const odir2 = ctx.filesDir + '/spv-override';
               try {
-                for (const f of fs.listFileSync(odir2)) {
-                  try { fs.unlinkSync(odir2 + '/' + f); nSpv++; } catch (e) { }
-                }
+                if (fs.listFileSync(odir2).length > 0) { fs.renameSync(odir2, odir2 + '.trash-' + Date.now()); nRen++; }
               } catch (e) { }
               try {
+                const expect = new Set<string>();
+                for (const nm of rawList(rm, 'shaders_extra')) {
+                  if (nm.endsWith('.gz') && !nm.endsWith('.mark.gz')) { expect.add(nm.substring(0, nm.length - 3)); }
+                }
+                const staleNames: string[] = [];
                 for (const f of fs.listFileSync(odir)) {
-                  try { fs.unlinkSync(odir + '/' + f); nOvr++; } catch (e) { }
+                  if (!expect.has(f)) { staleNames.push(f); }
+                }
+                if (staleNames.length > 200) {
+                  try { fs.renameSync(odir, odir + '.trash-' + Date.now()); nRen++; }
+                  catch (e) { }
+                } else {
+                  for (const f of staleNames) { try { fs.unlinkSync(odir + '/' + f); nKill++; } catch (e) { } }
                 }
               } catch (e) { }
               for (const mk of ['gfx-no-descmemo', 'gfx-no-imgcache']) {
                 try { fs.unlinkSync(sdir + '/' + mk); nMk++; } catch (e) { }
               }
-              trace(ctx, 'np792 清理: spv=' + nSpv + ' ovr=' + nOvr + ' mk=' + nMk);
+              trace(ctx, 'np803 清理: rename=' + nRen + ' kill=' + nKill + ' mk=' + nMk);
             } catch (err) { }
             ensureDir(odir);
             const gzNames: string[] = rawList(rm, 'shaders').filter((s: string): boolean => s.endsWith('.gz'));
