@@ -275,6 +275,12 @@ uint64_t svc_host_call(int num, uint64_t *regs) {
     // np382: these two svc numbers are host calls the rewriter inserts FOR D2R (skill aim / skill slot icons) and their
     // implementations jump to hard-coded D2R addresses. For any other game they are never taken over, even if the
     // build output happens to carry the same number (return 0 = not handled, back to the original path).
+    // np757：BotW 专属接管先于 D2R 门。svc #0x90 只由改写器打进 BotW 1.6.0 产品的 CUTS 桶
+    //   （main+0x1835694，DM_ATK_UPDATE_SKIP 门控），别的游戏产物里不存在这个号 ⇒ 无碰撞面。
+    // np757: BotW-specific takeover before the D2R gate. svc #0x90 is only inserted into the BotW
+    //   1.6.0 product by the rewriter (main+0x1835694, DM_ATK_UPDATE_SKIP gated); no other game's
+    //   build carries this number, so there is no collision surface.
+    if (num == SVC_HOST_ATK_UPDATE) { void svc_atk_update(uint64_t *); svc_atk_update(regs); return 1; }
     if (!dm_game_is_d2r()) return 0;
     switch (num) {
     case SVC_HOST_PRIVATE_SKILL_AIM: { void svc_private_skill_aim(uint64_t *); svc_private_skill_aim(regs); return 1; }
@@ -302,6 +308,7 @@ uint64_t svc_host_call(int num, uint64_t *regs) {
     case SVC_HOST_MERC_SLOT: { void svc_merc_slot(uint64_t *); svc_merc_slot(regs); return 1; }
     case SVC_HOST_MERC_SLOT_CL: { void svc_merc_slot_cl(uint64_t *); svc_merc_slot_cl(regs); return 1; }
     case SVC_HOST_CAM_AHEAD: { void svc_cam_ahead(uint64_t *); svc_cam_ahead(regs); return 1; }
+    case SVC_HOST_ATK_UPDATE: { void svc_atk_update(uint64_t *); svc_atk_update(regs); return 1; }
     }
     return 0;
 }

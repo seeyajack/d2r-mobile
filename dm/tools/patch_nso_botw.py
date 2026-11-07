@@ -153,6 +153,13 @@ CUTS = {'db0507f36b84200ac05f75d76ed5026f': [
 # 原指令须与位置无关（不得 PC 相对 / 分支 / 涉 x18·tpidr），离线断言；宿主未挂回调时门块进出一次即返回 ----
 # ---- Registered observation gates: {NSO build ID: [(offset, number, original instruction word, reason)]}. Numbers match OBS_* in the host's hle.h;
 # the original instruction must be position independent (no PC-relative / branch / anything involving x18 or tpidr), asserted offline; when the host has no callback attached the gate block goes in and out once and returns ----
+
+# 1.6.0 载荷（moduleid 8e9978d5…）的接管桶：此前为空——所有既有接管都是 1.0.0 时代/Metal 专属，
+# 鸿蒙 1.6.0 出包从未应用过任何地址级接管（cuts.tsv 一直只有头）。np757 首条：
+CUTS['8e9978d50bdd20b4c8395a106c27ffde'] = [
+    (0x1835694, 'c3311194', '011200d4', 'Atk 每帧更新调用点 bl 0x1c81da0 → svc #0x90：DM_ATK_UPDATE_SKIP=1 时直接返回 0（音频静音、游戏能跑；np756 冻结链=该更新内的音频作业死等 audren 反馈内存），否则原样代调（hle.h SVC_HOST_ATK_UPDATE，hle_audio.c svc_atk_update）', '仅宿主'),
+]
+
 OBS = {'db0507f36b84200ac05f75d76ed5026f': [
     (0xb1dc60, 1, 'd10603ff', 'UI 消息总线虚函数实现入口（x1 = 消息 {u64 类型哈希, u64 动作哈希, char* 面板名, …}）：'
      'DM_UIMSG 消息流与 DM_BOOTPROF 启动分段的唯一来源；原指令 sub sp, sp, #0x180'),

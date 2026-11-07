@@ -342,7 +342,7 @@ struct Index {
             //   引擎侧 DM_SHADER_OVERRIDE_DIR 里的同名 .xgs 优先于 shaders/。换包 = 新增文件，秒级。
             const dir = this.runtimeDir.trim().length > 0 ? this.runtimeDir.trim() : ctx.filesDir;
             const sdir = ctx.filesDir + '/shaders';
-            const odir = ctx.filesDir + '/shaders-override';
+            const odir = ctx.filesDir + '/shaders-override-b';
             ensureDir(sdir);
             ensureDir(odir);
             const gzNames: string[] = rawList(rm, 'shaders').filter((s: string): boolean => s.endsWith('.gz'));
@@ -644,7 +644,7 @@ struct Index {
             // np726 性能定谳 A/B（铁律 37：两次独立整跑，env 只差 DM_FRAME_SKIP 一行）：
             //   剥掉全部重诊断（np723a 口径），只留 DM_FRAME_TIME=1 作帧时主仪器；
             //   对照轮 = 本行原文；跳过轮 = 追加 DM_FRAME_SKIP=1（跑完改回）。
-            let envs = 'DM_NVN_SYNC=1 DM_FS=1 DM_WATCH_STALL=90 DM_NVN_API_MAJOR=53 DM_SHADER_SKIP=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000 DM_FRAME_TIME=1 DM_FRAME_SKIP=1 DM_FRAME_SKIP_ALT=1 DM_PRESENT_PROBE_EVERY_MS=10000 DM_PRESENT_PROBE_SERIALS=2791 DM_PRESENT_PROBE_EVERY=32 DM_PAD_AUTO=25/3/130/2500 DM_SHADER_OVERRIDE_DIR=/data/storage/el2/base/haps/entry/files/shaders-override';   // np755：+覆盖目录（shaders-override 同名 .xgs 优先，修正包通道）。np753：EVERY_MS 10000；np752：SERIALS=2791+动态表；np751：ALT=1 + A 按住 2500ms
+            let envs = 'DM_NVN_SYNC=1 DM_FS=1 DM_WATCH_STALL=90 DM_NVN_API_MAJOR=53 DM_SHADER_SKIP=1 DM_SAMPLER_BORDER=transparent DM_SPLIT_DRAWS=4000 DM_FRAME_TIME=1 DM_FRAME_SKIP=1 DM_FRAME_SKIP_ALT=1 DM_PRESENT_PROBE_EVERY_MS=30000 DM_PRESENT_PROBE_SERIALS=2791 DM_PRESENT_PROBE_EVERY=32 DM_PAD_AUTO=25/3/130/2500 DM_SHADER_OVERRIDE_DIR=/data/storage/el2/base/haps/entry/files/shaders-override-b DM_ATK_UPDATE_SKIP=0 DM_SAVE=/data/storage/el2/base/haps/entry/files/save';   // np755：+覆盖目录（shaders-override 同名 .xgs 优先，修正包通道）。np757：+DM_ATK_UPDATE_SKIP=0（np757d 实测:跳过连初始化一起废,音频永不前进=自造冻结;改回原生路径赌竞态,svc #0x90 留作仪器）+EVERY_MS 回 30000/DM_SAVE 回原存档（np757f 双改仍冻;10s cadence 是 np756 起开机冻结的首嫌疑,回 np753 可跑口径）。np753：EVERY_MS 10000；np752：SERIALS=2791+动态表；np751：ALT=1 + A 按住 2500ms
             // romfs 双路（d1 瘦包）：
             //   A. HAP 里带 romfs/（fat 包，首次装机用）→ 照旧**每次点都重新解出**。
             //      ⚠ 不能用 pathExists 判"解没解过"：本机 fs.listFileSync 对不存在的路径也不抛

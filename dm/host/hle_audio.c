@@ -560,6 +560,26 @@ HLE_FORCE("_ZN2nn5audio26RequestUpdateAudioRendererENS0_19AudioRendererHandleEPK
     return 0;
 }
 
+// np757：**Atk 每帧更新跳过**（调用点接管，hle.h SVC_HOST_ATK_UPDATE=0x90；改写器把
+//   main+0x1835694 的 bl 0x1c81da0 换成 svc #0x90）。冻结链（np756 实证）：主线程帧 tick → 本调用
+//   → 作业系统提交音频作业 → 作业在 worker 里**零系统调用纯自旋**——轮询 audren 服务本该每帧写回的
+//   反馈内存，我们的 nn::audio 全桩从不写 ⇒ 死等 ⇒ 主线程等它 ⇒ 2.9 分钟静默死亡（开机即死同根）。
+//   DM_ATK_UPDATE_SKIP=1：直接返回 0——调用方对 NULL 返回走的是 9 次迭代循环里「跳过本项」的
+//   良性路径（0x1835780 计数继续），音频静音、游戏能跑；缺省原样代调（行为零变化）。
+//   真修复 = 模拟 audren 反馈写回，待 RE（11-07 文件 §6①）。
+void svc_atk_update(uint64_t *regs) {
+    static uint8_t *B;
+    if (!B) for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) B = (uint8_t *)g_mod[i].base;
+    static int skip = -1;
+    if (skip < 0) {
+        const char *e = getenv("DM_ATK_UPDATE_SKIP");
+        skip = (e && *e == '1') ? 1 : 0;
+        if (skip) LOG("audio：DM_ATK_UPDATE_SKIP=1 —— Atk 每帧更新跳过（音频静音，规避 np756 冻结链）");
+    }
+    if (skip) { regs[0] = 0; return; }
+    regs[0] = ((uint64_t (*)(uint64_t, uint64_t))(B + 0x1c81da0))(regs[0], regs[1]);
+}
+
 
 // 前端生命周期 / 音频会话打断：暂停真出声，期间由静音接收端接手按实时消耗（节奏不断）；恢复时切回 AudioUnit。
 // 前端在 切后台 / 打断开始 时调 1，回前台 / 打断结束（shouldResume）时调 0。
