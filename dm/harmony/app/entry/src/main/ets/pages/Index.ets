@@ -344,6 +344,18 @@ struct Index {
             const sdir = ctx.filesDir + '/shaders';
             const odir = ctx.filesDir + '/shaders-override-b';
             ensureDir(sdir);
+            // np789：一次性沙箱清理——本会话误留的 SPIR-V 覆盖（spv-override/*.spv，重装不删=铁律23）
+            //   与诊断 marker（gfx-no-descmemo/gfx-no-imgcache，关缓存饿死提交路径）。删完即恢复正常基线。
+            try {
+              const odir2 = ctx.filesDir + '/spv-override';
+              ensureDir(odir2);
+              for (const f of fs.listFileSync(odir2)) {
+                if (f.endsWith('.spv')) { try { fs.unlinkSync(odir2 + '/' + f); } catch (e) { } }
+              }
+              for (const mk of ['gfx-no-descmemo', 'gfx-no-imgcache']) {
+                try { fs.unlinkSync(sdir + '/' + mk); } catch (e) { }
+              }
+            } catch (err) { }
             ensureDir(odir);
             const gzNames: string[] = rawList(rm, 'shaders').filter((s: string): boolean => s.endsWith('.gz'));
             if (gzNames.length > 0) {
