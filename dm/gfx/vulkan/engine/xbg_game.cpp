@@ -4428,11 +4428,11 @@ if(g_winbind_logged<8 && state.rt.color[0] && win_serial_match(state.rt.color[0]
                                     if(!seen&&nbig<8){seen_big[nbig++]=ser;newbig=true;}}}
                             if(at<int(sizeof tb)-96) at+=snprintf(tb+at,sizeof tb-at," s%d:id%d/ser%llu/%ux%u/gw%d",s,sid,(unsigned long long)ser,tw,th,gw);}
                         if((newbig||nlines==0)&&nlines<40){++nlines;
-                            xbg_logf("【2791合成】rt=%llu shader=%s st=%u bind=%u slot=%u 本槽=%ux%u gw=%d lw=%llu 槽:%s",
+                            xbg_logf("【2791合成】rt=%llu shader=%s st=%u bind=%u slot=%u 本槽=%ux%u gw=%d lw=%llu 三维:%llu 槽:%s",
                                 (unsigned long long)state.rt.color[0]->serial,
                                 shader.key.c_str(),ns,b.binding,b.slot+element,
                                 im.source.d.width,im.source.d.height,int(im.gpu_written),
-                                (unsigned long long)im.last_write,tb);}}
+                                (unsigned long long)im.last_write,(unsigned long long)g_probe_3d_serial,tb);}}
                     image_infos.push_back(ii);write.pImageInfo=&image_infos.back();
                     if(img_cacheable){img_cache.emplace(ikey,ImgEntry{&texture,&im,ii.imageView,ii.sampler,record,record->revision});++img_cache_misses;}
                     {BufRef &r=img_slot_refs[ii.imageView];const void *cur=&recording_slot();
@@ -6208,7 +6208,12 @@ static void xbg_legacy_pool_add_now(void *p,size_t n){std::lock_guard<std::recur
 static void xbg_legacy_pool_del_now(void *p){std::lock_guard<std::recursive_mutex> lock(mutex);provenance_log("POOL_DEL mem=%p epoch=%llu",p,provenance.epoch(uint64_t(p)));provenance.pool(uint64_t(p),false);{auto pit=pools.find(uintptr_t(p));if(pit!=pools.end())vcache::drop_pool(uintptr_t(p),pit->second);}pools.erase(uintptr_t(p));cmd_range_lo=0;cmd_range_bytes=0;}
 static void xbg_register_texture_now(const dpool_t *p,int id,const tex_t *t,const view_t *v){std::lock_guard<std::recursive_mutex> lock(mutex);need(p&&id>=0&&id<p->n&&t,"Invalid texture registration");auto &slot=textures[pool_key(p)][id];
     const bool first_reg=(slot.revision==0);   // np727k：此前从未注册
+    const uint64_t old_ser=slot.texture.serial;   // np759：迁移对账基准
     if(register_texture_record(slot,*t,v)){++memo_bump[0];
+        // np759：**池双缓冲对账**。np758b 真值：拷贝/合成采到 ping-pong 陈旧一侧（13390≠场景 13396）。
+        //   这里打 1600×900 类的 id→serial 迁移——「场景真身」的 serial 到底有没有登记到游戏绑的那个 id 下。
+        if(t->d.width>=1400 && t->d.height<=2000 && t->d.height>=800 && old_ser && old_ser!=t->serial){
+            static int n759=0; if(n759++<40)xbg_logf("【池迁移】id=%d serial %llu→%llu pool=(%llx,%lld)",id,(unsigned long long)old_ser,(unsigned long long)t->serial,(unsigned long long)pool_key(p).first,(long long)pool_key(p).second); }
         if(first_reg){bool poisoned=false;{std::lock_guard<std::mutex> gb(g_null_bound_mu);poisoned=g_null_bound.erase({pool_key(p).first,id})>0;}
             if(poisoned){memo_epoch.fetch_add(1);   // 该 id 曾被 null 绑定并进了描述符 memo ⇒ 全池懒失效，null 绑定就此重建
                 static int fe=0;if(fe++<8)xbg_logf("【池】id=%d 首次注册且曾被 null 绑定 → bump memo_epoch=%llu（窗口 blit 的源就此接上）",id,(unsigned long long)memo_epoch.load());}}}}
