@@ -33,6 +33,10 @@ OPT, VAL = (os.environ.get(k, d) for k, d in (('SPIRV_OPT', 'spirv-opt'), ('SPIR
 STAGE_NO = {'vs': 0, 'hs': 1, 'ds': 2, 'gs': 3, 'ps': 4, 'cs': 5}
 
 TEX_BASE, SAMP_BASE, IMG_BASE = 0x168, 0x568, 0x120   # 同 dmsh_build.py：c[2] 贴图句柄表、采样器句柄表、图像句柄表 | as dmsh_build.py: the texture handle, sampler handle and image handle tables in c[2]
+# np808: master switch for the cbuf-indirect texture binding (A/B + rollback).
+# DM_TIC0_INDIRECT=0 reproduces the pre-fix behaviour from the SAME exporter, so
+# a byte-level A/B can prove that only the binding table changes, never the SPIR-V.
+TIC0_INDIRECT = os.environ.get('DM_TIC0_INDIRECT', '1') != '0'
 
 
 def compare(ref, got):
@@ -163,6 +167,17 @@ def decode_tex(slots, h, image):
     s = next((slot(x, SAMP_BASE, sb) for x in words if x * 4 >= SAMP_BASE and slot(x, SAMP_BASE, sb) is not None), None)
     return t, s, ty
 
+# np808 / §16②：Ryujinx TextureHandle.UnpackSlots。cbuf_slot 低 16 位 = 纹理常量缓冲
+# 下标，高 16 位 = 采样器下标 + 1（0 表示与纹理同缓冲）；-1 = 用默认缓冲。
+# 默认下标沿用本文件既有口径（decode_tex 的 tb 兜底 = 2，对应 c[2] bank）。
+# TextureHandle.UnpackSlots: low 16 bits = texture constant buffer index,
+# high 16 bits = sampler index + 1 (0 = same buffer); -1 = default buffer.
+def unpack_tex_slots(slots, default=2):
+    if slots < 0: return default, default
+    high = (slots >> 16) & 0xffff
+    tbi = slots & 0xffff
+    return tbi, (high - 1 if high else tbi)
+
 def export(key, stage, c1, spv, res):
     """改写后的 SPIR-V + 翻译器的 res.json → vk.json（字段见 pack_game_shaders.py） | Rewritten SPIR-V + the translator's res.json → vk.json (fields: see pack_game_shaders.py)"""
     caps, exts, deco, types, ptr, var, names, consts = spirv_info(spv)
@@ -212,18 +227,30 @@ def export(key, stage, c1, spv, res):
             vid, tid, sc = by_bind[vbind(t['binding'])]
             img = image_desc(types, tid)
             slot, samp, ty = decode_tex(t['cbuf_slot'], t['handle'], kind == 'image')
-            if slot is None and t['handle'] >> 20 == 0:
-                # np622：**运行时 dump 的句柄**没有 c2 表可解（cbuf_slot=-1），但引擎侧 handle 低 20 位
-                # 就是贴图池里的对象 id（xbg_game.cpp 的 `int id=int(handle&0xfffff)`）——运行时绑定
-                # 按 id 从池里取，不走 c2 偏移。合成包直接把 id 当槽号（纹理槽 / 图像槽同一个池）。
-                # 离线静态包不受影响：它们的 cbuf_slot>=0，仍走 decode_tex。
-                # np622: handles from a runtime dump have no c[2] table to decode (cbuf_slot=-1), but on the engine
-                # side the low 20 bits of a handle ARE the object id in the texture pool (xbg_game.cpp
-                # `int id=int(handle&0xfffff)`) -- runtime binding fetches by id, not by c2 offset. Synthetic
-                # packages use that id as the slot (texture and image share one pool). Offline bundles keep
-                # decode_tex: their cbuf_slot >= 0.
-                slot, samp, ty = t['handle'] & 0xfffff, None, t['handle'] >> 28
+            indirect = None
+            if slot is None:
+                h = t['handle']
+                o0, o1, hty = h & 0x3fff, (h >> 14) & 0x3fff, h >> 28   # TextureHandle.UnpackOffsets
+                if h >> 20 == 0 and kind == 'texture' and hty == 0 and TIC0_INDIRECT:
+                    # np808 / §16②：8/10/12… 是**纹理常量缓冲里的 word offset**，不是 TIC 池 id。
+                    # np755 把 HandleIndex 当槽号采到 1×1 已证伪旧兜底；np738 全量改写绑定表同理。
+                    # 运行期由引擎按 (cbufIndex, wordOffset) 读 32 位 packedId（低 20 位 = TIC id）。
+                    # The immediate is a cbuf WORD OFFSET, not a TIC pool id (np755 disproved the old
+                    # fallback). The engine reads the 32-bit packedId from the guest cbuf at draw time.
+                    tbi, sbi = unpack_tex_slots(t['cbuf_slot'])
+                    indirect = {'tbi': tbi, 'sbi': sbi, 'tex_word': o0, 'samp_word': o1, 'type': hty}
+                    slot, samp, ty = 0, None, hty          # slot 只作旧路径的回退值
+                elif h >> 20 == 0 and kind == 'texture' and hty == 0:
+                    # DM_TIC0_INDIRECT=0：同一导出器的 A/B 基线，走 np622 旧兜底（已被 np755 证伪）。
+                    slot, samp, ty = h & 0xfffff, None, hty
+                elif h >> 20 == 0:
+                    raise ValueError(f'{kind} 槽解不出（仅 type=0 的纹理启用 cbuf 间接）：{t}')
+                else:
+                    # np622：真 32 位句柄（运行时 dump），低 20 位就是池对象 id。
+                    slot, samp, ty = h & 0xfffff, None, h >> 28
             if slot is None: raise ValueError(f'{kind} 槽解不出：{t}')
+            hd = {'type': ty}
+            if indirect: hd['indirect'] = indirect
             if kind == 'texture':
                 typ = 'uniform_texel_buffer' if img['dim'] == 5 else 'combined_image_sampler'
                 nvn = {'kind': 'texture', 'slot': slot, 'sampler_slot': samp if ty else None}
@@ -231,7 +258,7 @@ def export(key, stage, c1, spv, res):
                 typ = 'storage_texel_buffer' if img['dim'] == 5 else 'storage_image'
                 nvn = {'kind': 'image', 'slot': slot}
             descs.append({'name': names.get(vid, ''), 'binding': vbind(t['binding']), 'type': typ, 'count': 1,
-                          'source': {'category': 'nvn', 'nvn': nvn, 'handle_decode': {'type': ty}}, 'image': img})
+                          'source': {'category': 'nvn', 'nvn': nvn, 'handle_decode': hd}, 'image': img})
     descs.sort(key=lambda d: d['binding'])
     inputs = []
     if stage == 'vs':

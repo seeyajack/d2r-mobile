@@ -45,6 +45,14 @@ def pack(path):
         if source in (7,8):
             hd=s['handle_decode']
             if hd['type'] not in (0,1): raise ValueError(f'unsupported handle type {hd}')
+            ind=hd.get('indirect')
+            if ind and source==7:
+                # np808 / §16②: XBG_BIND_TEX_INDIRECT (flags bit24).  sampler_slot is
+                # repurposed as tex_word(14) | cbufIndex(5)<<14 | handleType(3)<<19;
+                # the engine reads the 32-bit packedId from the guest cbuf at draw time.
+                # Old bundles have the bit clear and keep the exact old path (behaviour zero-change).
+                flags|=1<<24
+                sampler=(ind['tex_word']&0x3fff)|((ind['tbi']&0x1f)<<14)|((ind['type']&7)<<19)
         bindings.append(struct.pack('<8I',b['binding'],TYPES[b['type']],b['count'],size,
                                     source,slot or 0,sampler,flags))
     ins=sorted({x['location'] for x in j['interfaces'] if x['storage']=='input' and x['location'] is not None}) if j['stage']=='vs' else []

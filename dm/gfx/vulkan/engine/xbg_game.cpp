@@ -4318,10 +4318,51 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                 if(capture.active){char label[100];snprintf(label,sizeof(label),"st%u-bind%u-el%u-buffer",st,b.binding,element);capture_log("BUFFER label=%s shader=%s nvnStage=%u sourceKind=%u slot=%u guest=%p copied=%zu descriptorBytes=%zu bufferOffset=%zu",label,shader.key.c_str(),ns,b.source,slot,data,copy,n,buffer_offset);capture_data(label,static_cast<const uint8_t*>(buffer->mapped)+buffer_offset,n);}
             }else{
                 DESC_SCOPE(ImageLookup);
+                // np808 / §16②: resolve the REAL texture handle from the guest texture
+                // constant buffer, per Ryujinx TextureHandle.ReadPackedId /
+                // TextureBindingsManager.ReadPackedId.  Only bundles exported with
+                // XBG_BIND_TEX_INDIRECT take this path; old bundles keep the exact old
+                // static-slot behaviour.  Any failure falls back to state.tex (never fatal).
+                bool tex_indirect=false;uint64_t indirect_handle=0;
+                if((b.flags&XBG_BIND_TEX_INDIRECT) && b.source==XBG_SOURCE_TEXTURE){
+                    unsigned w=XBG_TEX_CBUF_WORD(b.sampler_slot),tbi0=XBG_TEX_CBUF_INDEX(b.sampler_slot),hty=XBG_TEX_CBUF_TYPE(b.sampler_slot);
+                    static int env_index=-2;if(env_index==-2){const char *e=getenv("DM_TEX_CBUF_INDEX");env_index=e?atoi(e):-1;}
+                    if(env_index>=0)tbi0=unsigned(env_index);
+                    // np809: the first device run had tbi=2 unbound (ub.addr=0) => all fallbacks.
+                    // Probe the 16 guest UBO slots, require the resulting texture id to be
+                    // REGISTERED, then cache the working index per stage (no per-draw scan).
+                    static int found[6]={-1,-1,-1,-1,-1,-1};static int probe_draws=0;
+                    const NVNbufferRange *ur=nullptr;uint32_t packed=0;int pid=0;unsigned used=16,bound=0;
+                    if(hty==0 && (found[ns]>=0 || probe_draws<256)){
+                        if(found[ns]<0)++probe_draws;
+                        for(int a=0;a<17;a++){
+                            unsigned tbi=found[ns]>=0?unsigned(found[ns]):(a==0?tbi0:unsigned(a-1));
+                            if(tbi>=16)continue;
+                            const NVNbufferRange &r=state.ub[ns][tbi];
+                            if(!r.address)continue;
+                            ++bound;
+                            if(r.size<uint64_t(w+1)*4)continue;
+                            const void *src=reinterpret_cast<const void*>(uintptr_t(r.address+uint64_t(w)*4));
+                            uint32_t pk=0;{evguard::EngineRead er(src,4);memcpy(&pk,src,4);}
+                            int id=int(pk&0xfffff);
+                            if(!id || (state.texture_pool.n>0 && id>=state.texture_pool.n))continue;
+                            bool registered=legacy_textures.find(id)!=legacy_textures.end();
+                            if(!registered)for(auto &kv:textures)if(kv.second.find(id)!=kv.second.end()){registered=true;break;}
+                            if(!registered)continue;
+                            packed=pk;pid=id;used=tbi;ur=&r;indirect_handle=pk;tex_indirect=true;
+                            if(found[ns]<0){found[ns]=int(tbi);xbg_logf("【np809】TIC cbuf 锁定 index=%u stage=%u word=%u packed=%#x id=%d",tbi,ns,w,pk,id);}
+                            break;
+                        }
+                    }
+                    static int nlog=0;if(nlog<12){++nlog;
+                        xbg_logf("【np808】TIC cbuf %s stage=%u tbi=%u word=%u boundUBO=%u packed=%#x id=%d ub.addr=%llx ub.size=%llu",
+                            tex_indirect?"命中":"回退",ns,used,w,bound,packed,pid,
+                            (unsigned long long)(ur?ur->address:0),(unsigned long long)(ur?ur->size:0));}
+                }
                 bool img_fast=false,img_cacheable=false;ImgKey ikey{};
-                if(img_cache_enabled && !capture.active && !provenance_file && b.source==XBG_SOURCE_TEXTURE && (b.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b.type==VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) && b.slot+element<128 && state.texture_pool.pool
+                if(img_cache_enabled && !capture.active && !provenance_file && !tex_indirect && b.source==XBG_SOURCE_TEXTURE && (b.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b.type==VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) && b.slot+element<128 && state.texture_pool.pool
                    && (b.sampler_slot==UINT32_MAX || b.sampler_slot<128)){
-                    uint64_t handle=state.tex[ns][b.slot+element];int id=int(handle&0xfffff);
+                    uint64_t handle=tex_indirect?indirect_handle:state.tex[ns][b.slot+element];int id=int(handle&0xfffff);
                     if(id!=0 && !(state.texture_pool.n>0 && id>=state.texture_pool.n)){
                         uint64_t sh=b.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER?(b.sampler_slot!=UINT32_MAX?state.samp[ns][b.sampler_slot]:handle):0;
                         ikey={handle,sh,uint64_t(uintptr_t(state.texture_pool.pool->mem)),uint64_t(state.texture_pool.off),state.sampler_pool.pool?uint64_t(uintptr_t(state.sampler_pool.pool->mem)):0,uint64_t(state.sampler_pool.off),uint64_t(b.type)|(uint64_t((b.flags>>16)&3)<<8)};img_cacheable=true;
@@ -4344,7 +4385,7 @@ if(g_winbind_logged<8 && state.rt.color[0] && win_serial_match(state.rt.color[0]
                     }
                 }
                 if(!img_fast){
-                need(b.source==XBG_SOURCE_TEXTURE || b.source==XBG_SOURCE_IMAGE,"Unsupported image source");unsigned slot=b.slot+element;need(slot<(b.source==XBG_SOURCE_IMAGE?16u:128u),"Image binding slot out of range");uint64_t handle=b.source==XBG_SOURCE_IMAGE?state.img[ns][slot]:state.tex[ns][slot];int id=int(handle&0xfffff);
+                need(b.source==XBG_SOURCE_TEXTURE || b.source==XBG_SOURCE_IMAGE,"Unsupported image source");unsigned slot=b.slot+element;need(slot<(b.source==XBG_SOURCE_IMAGE?16u:128u),"Image binding slot out of range");uint64_t handle=tex_indirect?indirect_handle:(b.source==XBG_SOURCE_IMAGE?state.img[ns][slot]:state.tex[ns][slot]);int id=int(handle&0xfffff);
                 const RegisteredTexture *record=nullptr;
                 PoolKey pk_used=pool_key(&state.texture_pool);
                 // np727j：池键=(描述符内存,off)，而 off 随游戏往池里追加纹理而移动 ⇒ 注册表键停在
@@ -4376,7 +4417,7 @@ if(g_winbind_logged<8 && state.rt.color[0] && win_serial_match(state.rt.color[0]
                     VkDescriptorImageInfo ii{};
                     Image &im=get_image(&texture,true);provenance_log("BIND shader=%s stage=%u slot=%u id=%d handle=%llu descriptorMem=%p descriptorOff=%lld type=%u",shader.key.c_str(),ns,slot,id,(unsigned long long)handle,state.texture_pool.pool?state.texture_pool.pool->mem:nullptr,(long long)state.texture_pool.off,unsigned(b.type));provenance_image("BIND",&texture,im,registered.has_view?&registered.view:nullptr);DESC_CALL(ImageTransition, prepare_read(im,commands.command));if(desc_memo_recording)desc_memo_images.push_back({&texture,&im,record,record->revision});ii.imageView=DESC_CALL(ImageView, im.view(registered.has_view?&registered.view:nullptr,false,b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE));ii.imageLayout=VK_IMAGE_LAYOUT_GENERAL;
                     if(capture.active){char label[100];snprintf(label,sizeof(label),"st%u-bind%u-el%u-input",st,b.binding,element);out.capture_inputs.push_back({&im,registered.view,registered.has_view,label});capture_log("TEXTURE label=%s shader=%s nvnStage=%u slot=%u handle=%#llx id=%d serial=%llu cachedSerial=%llu image=%p view=%p viewFormat=%u sourceKind=%u",label,shader.key.c_str(),ns,slot,(unsigned long long)handle,id,(unsigned long long)texture.serial,(unsigned long long)im.source.serial,(void*)im.image,(void*)ii.imageView,unsigned(im.view_format(registered.has_view?&registered.view:nullptr)),b.source);}
-                    if(b.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b.type==VK_DESCRIPTOR_TYPE_SAMPLER){DESC_SCOPE(SamplerBind);uint64_t sh=handle;if(b.sampler_slot!=UINT32_MAX){need(b.sampler_slot<128,"Sampler slot out of range");sh=state.samp[ns][b.sampler_slot];}int sid=int(sh>>20);samp_par parameters{};if(sid==0){parameters.ws=parameters.wt=parameters.wr=7;parameters.aniso=1;parameters.cmp_func=1;}
+                    if(b.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b.type==VK_DESCRIPTOR_TYPE_SAMPLER){DESC_SCOPE(SamplerBind);uint64_t sh=handle;if(!(b.flags&XBG_BIND_TEX_INDIRECT) && b.sampler_slot!=UINT32_MAX){need(b.sampler_slot<128,"Sampler slot out of range");sh=state.samp[ns][b.sampler_slot];}int sid=int(sh>>20);samp_par parameters{};if(sid==0){parameters.ws=parameters.wt=parameters.wr=7;parameters.aniso=1;parameters.cmp_func=1;}
                         else{auto sp=samplers.find(pool_key(&state.sampler_pool));auto &table=sp==samplers.end()?legacy_samplers:sp->second;auto sa=table.find(sid);if(sa==table.end())xbg_fatalf("Unregistered sampler id=%d",sid);parameters=sa->second;}ii.sampler=sampler(parameters,im,im.view_format(registered.has_view?&registered.view:nullptr),((b.flags>>16)&3)!=0);if(capture.active)capture_log("SAMPLER st=%u binding=%u sid=%d samplerSlot=%u min=%u mag=%u wrap=%u/%u/%u lod=%g/%g bias=%g",st,b.binding,sid,b.sampler_slot,parameters.minf,parameters.magf,parameters.ws,parameters.wt,parameters.wr,parameters.lod_min,parameters.lod_max,parameters.lod_bias);}
                     if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE){VkFormat viewed=im.view_format(registered.has_view?&registered.view:nullptr);if(!(im.usage&VK_IMAGE_USAGE_STORAGE_BIT))xbg_fatalf("NVN storage image without IMAGE flag serial=%llu format=%#x flags=%#x",(unsigned long long)texture.serial,texture.d.format,texture.d.flags);const VkFormatProperties &fp=format_properties(viewed);need(fp.optimalTilingFeatures&VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT,"Format not usable as storage image");
                         if((b.flags&3) && format_feature_flags2){VkFormatProperties3 extra{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};VkFormatProperties2 all{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};all.pNext=&extra;vkGetPhysicalDeviceFormatProperties2(cfg.physical,viewed,&all);if(b.flags&1)need(extra.optimalTilingFeatures&VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT,"Image format lacks formatless-write support");if(b.flags&2)need(extra.optimalTilingFeatures&VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT,"Image format lacks formatless-read support");}

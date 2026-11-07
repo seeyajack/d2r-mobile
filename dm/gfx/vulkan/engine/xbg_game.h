@@ -92,7 +92,18 @@ typedef struct xbg_shader_header {
 typedef struct xbg_shader_binding {
     uint32_t binding,type,count,bytes,source,slot,sampler_slot,flags;
 } xbg_shader_binding; /* flags: bit0/1 formatless write/read; bit31 image shape present,
-                       * dim in bits8..10, array12, MS13, depth14, scalar16..17 */
+                       * dim in bits8..10, array12, MS13, depth14, scalar16..17;
+                       * bit24 = np808 texture handle resolved at draw time from the guest cbuf */
+/* np808 / §16②: Ryujinx TextureHandle.ReadPackedId.  A bundle with this bit set
+ * carries (cbuf word offset, cbuf index, handle type) in sampler_slot instead of
+ * a NVN sampler slot; the engine reads a 32-bit packedId from
+ * state.ub[stage][cbufIndex].address + wordOffset*4, then uses
+ * packedId & 0xfffff as the TIC pool id and (packedId >> 20) & 0xfff as the
+ * sampler id.  Bundles without the bit keep the old static-slot path exactly. */
+#define XBG_BIND_TEX_INDIRECT   (1u<<24)
+#define XBG_TEX_CBUF_WORD(s)    ((s)&0x3fffu)
+#define XBG_TEX_CBUF_INDEX(s)   (((s)>>14)&0x1fu)
+#define XBG_TEX_CBUF_TYPE(s)    (((s)>>19)&7u)
 #ifdef __cplusplus
 }
 #endif
